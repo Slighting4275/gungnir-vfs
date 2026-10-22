@@ -1,0 +1,7 @@
+[workspace]
+members = ["src/daemon-rust"]
+resolver = "3"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
