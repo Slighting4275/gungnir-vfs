@@ -1,0 +1,12 @@
+/.build/*
+!/.build/tmp/
+/.build/tmp/*
+!/.build/tmp/.gitkeep
+/target/
+/.zig-cache/
+/zig-out/
+*.so
+*.o
+*.a
+*.swp
+*~
