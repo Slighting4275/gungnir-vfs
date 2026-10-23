@@ -9,3 +9,9 @@ publish = false
 blake3 = "1"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[features]
+# Integration-test hooks (milestone 7): GUNGNIR_TEST_FAKE_HUNG_MOUNT=<dir> makes gungnird
+# treat <dir> as a mount whose health probes never return. Off in normal builds; the
+# Zig integration test builds gungnird with it.
+test-hooks = []

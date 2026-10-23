@@ -11,6 +11,10 @@
 //!                                                            then again with the daemon gone
 //!   gungnir-itest <module-dir> daemon-stopped <tmp-dir> <gungnird>  stop gungnird under a
 //!                                                            live connection, then restart it
+//!   gungnir-itest <module-dir> hung-mount <tmp-dir> <gungnird>  gungnird with a fake hung
+//!                                                            mount (test-hooks build): the
+//!                                                            module hears of it and fails
+//!                                                            fast (milestone 7)
 //! <module-dir> contains only libgiogungnir.so and GIO_EXTRA_MODULES is unset, so no
 //! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
 //! directory per run, created under <tmp-dir> (.build/tmp).
@@ -18,6 +22,7 @@ const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
+const health = @import("health.zig");
 const linux = std.os.linux;
 
 /// The GIO calling thread must get its VFS and answer local file queries in this time,
@@ -1009,6 +1014,230 @@ fn checkUiThread(ctx: *Ctx) ?[*:0]const u8 {
     return null;
 }
 
+// ---- milestone 7: hang-proof mounts ---------------------------------------------
+
+/// Calls under a hung mount must return within this, on the calling thread.
+const max_hung_call_ms = 100;
+
+fn unhealthyMounts() c_int {
+    var v: c_int = -1;
+    c.g_object_get(@ptrCast(c.g_vfs_get_default()), "unhealthy-mounts", &v, @as(?*anyopaque, null));
+    return v;
+}
+
+/// gungnird (a test-hooks build) treats <tmp>/fake-hung as a mount whose probes never
+/// return. The module must learn that from the pushed health events alone (no call is
+/// made until then), then answer every GIO call under it within max_hung_call_ms without
+/// asking the daemon; other paths keep their metadata; and the daemon itself refuses
+/// identity requests for the mount at once (a second connection, no health cache).
+const UiHung = struct {
+    hung: ?*c.GFile,
+    ok: ?*c.GFile,
+    loop: ?*c.GMainLoop = null,
+    worst_us: i64 = 0,
+    failed: ?[*:0]const u8 = null,
+
+    fn note(u: *UiHung, t0_us: i64) void {
+        u.worst_us = @max(u.worst_us, c.g_get_monotonic_time() - t0_us);
+    }
+};
+
+fn uiHungIdle(data: c.gpointer) callconv(.c) c.gboolean {
+    const u: *UiHung = @ptrCast(@alignCast(data));
+    u.failed = uiHungCalls(u);
+    c.g_main_loop_quit(u.loop);
+    return 0;
+}
+
+fn uiHungCalls(u: *UiHung) ?[*:0]const u8 {
+    var err: [*c]c.GError = null;
+    for (0..5) |_| {
+        var t0 = c.g_get_monotonic_time();
+        const info = c.g_file_query_info(u.hung, "standard::name,metadata::*", c.G_FILE_QUERY_INFO_NONE, null, &err);
+        u.note(t0);
+        const i = info orelse {
+            logError("ui query under the hung mount", err);
+            return "query_info under the hung mount failed on the UI thread";
+        };
+        defer c.g_object_unref(i);
+        if (hasMetadata(i)) return "metadata came back for a hung mount on the UI thread";
+        t0 = c.g_get_monotonic_time();
+        const set = c.g_file_set_attribute_string(u.hung, "metadata::k", "v", c.G_FILE_QUERY_INFO_NONE, null, &err);
+        u.note(t0);
+        if (set != 0) return "a set under the hung mount succeeded on the UI thread";
+        defer {
+            c.g_error_free(err);
+            err = null;
+        }
+        if (!contains(err.*.message, "health monitor")) {
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: UI-thread set said: %s", err.*.message);
+            return "a set under the hung mount on the UI thread was not failed from the health cache";
+        }
+    }
+    // No quiet period was started: the file next to it still gets its metadata here.
+    const t0 = c.g_get_monotonic_time();
+    const info = c.g_file_query_info(u.ok, "metadata::k", c.G_FILE_QUERY_INFO_NONE, null, &err);
+    u.note(t0);
+    const i = info orelse {
+        logError("ui query next to the hung mount", err);
+        return "query_info next to the hung mount failed on the UI thread";
+    };
+    defer c.g_object_unref(i);
+    if (!stringAttr(i, "metadata::k", "v")) return "the UI thread lost the metadata next to the hung mount";
+    return null;
+}
+
+fn checkHungMount(ctx: *Ctx) ?[*:0]const u8 {
+    const dir = tmpPath(ctx.tmp_dir, "fake-hung");
+    defer c.g_free(dir);
+    if (linux.errno(linux.mkdirat(linux.AT.FDCWD, dir, 0o700)) != .SUCCESS) return "could not create the fake mount dir";
+    defer _ = linux.rmdir(dir);
+    const path = tmpPath(dir, "f");
+    defer c.g_free(path);
+    if (!createFile(path)) return "could not create the file under the fake mount";
+    defer removeFile(path);
+    const ok_path = tmpPath(ctx.tmp_dir, "ok-file");
+    defer c.g_free(ok_path);
+    if (!createFile(ok_path)) return "could not create the control file";
+    defer removeFile(ok_path);
+    // Restart the daemon with the hook (nothing has talked to it yet).
+    if (c.g_setenv("GUNGNIR_TEST_FAKE_HUNG_MOUNT", dir, 1) == 0) return "g_setenv GUNGNIR_TEST_FAKE_HUNG_MOUNT";
+    ctx.stopDaemon();
+    if (ctx.startDaemon()) |what| return what;
+    c.g_unsetenv("GUNGNIR_TEST_FAKE_HUNG_MOUNT");
+
+    if (checkGungnirFast()) |what| return what;
+    if (expectState(1, 5_000, 0)) |what| return what;
+    // The probe deadline is 1 s; the event reaches the idle module through its event
+    // thread. No GIO call is made meanwhile.
+    const t0 = nowMs();
+    while (unhealthyMounts() < 1) {
+        if (nowMs() - t0 > 5_000) return "no mount-health event reached the module";
+        c.g_usleep(10 * 1000);
+    }
+    if (unhealthyMounts() != 1) return "the module counts the wrong number of hung mounts";
+
+    const file = c.g_file_new_for_path(path);
+    defer c.g_object_unref(file);
+    var err: [*c]c.GError = null;
+    {
+        const t = nowMs();
+        const info = c.g_file_query_info(file, "standard::*,metadata::*", c.G_FILE_QUERY_INFO_NONE, null, &err);
+        if (nowMs() - t > max_hung_call_ms) return "query_info under a hung mount was slow";
+        if (info == null) {
+            logError("query_info", err);
+            return "query_info under a hung mount failed";
+        }
+        defer c.g_object_unref(info);
+        if (hasMetadata(info)) return "metadata came back for a hung mount";
+        if (c.g_file_info_get_file_type(info) != c.G_FILE_TYPE_REGULAR) return "standard::type is wrong under the hung mount";
+    }
+    {
+        const t = nowMs();
+        if (c.g_file_set_attribute_string(file, "metadata::k", "v", c.G_FILE_QUERY_INFO_NONE, null, &err) != 0)
+            return "a metadata set on a hung mount succeeded";
+        if (nowMs() - t > max_hung_call_ms) return "a metadata set on a hung mount was slow";
+        defer c.g_error_free(err);
+        if (c.g_error_matches(err, c.g_io_error_quark(), c.G_IO_ERROR_TIMED_OUT) == 0) {
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: set said: %s", err.*.message);
+            return "a metadata set on a hung mount gave the wrong error";
+        }
+        // Failed by the module's own cache, not by a round trip to the resolver.
+        if (!contains(err.*.message, "health monitor")) {
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: set said: %s", err.*.message);
+            return "a metadata set on a hung mount was not failed from the health cache";
+        }
+    }
+    err = null;
+    {
+        const dfile = c.g_file_new_for_path(dir);
+        defer c.g_object_unref(dfile);
+        const t = nowMs();
+        const en = c.g_file_enumerate_children(dfile, "standard::name,metadata::*", c.G_FILE_QUERY_INFO_NONE, null, &err);
+        if (en == null) {
+            logError("enumerate_children", err);
+            return "enumerating the hung mount failed";
+        }
+        defer c.g_object_unref(en);
+        var n: usize = 0;
+        while (c.g_file_enumerator_next_file(en, null, null)) |info| {
+            defer c.g_object_unref(info);
+            if (hasMetadata(info)) return "an enumerated child of a hung mount has metadata";
+            n += 1;
+        }
+        if (n != 1) return "enumerating the hung mount saw the wrong children";
+        if (nowMs() - t > max_hung_call_ms) return "enumerating the hung mount was slow";
+    }
+    {
+        var q: AsyncQuery = .{};
+        const t = nowMs();
+        c.g_file_query_info_async(file, "metadata::k", c.G_FILE_QUERY_INFO_NONE, c.G_PRIORITY_DEFAULT, null, &asyncQueried, &q);
+        while (!q.done and nowMs() - t < 5_000) {
+            if (c.g_main_context_iteration(null, 0) == 0) c.g_usleep(1000);
+        }
+        if (!q.done) return "query_info_async under a hung mount did not complete";
+        if (nowMs() - t > max_hung_call_ms) return "query_info_async under a hung mount was slow";
+        const info = q.info orelse return "query_info_async under a hung mount failed";
+        defer c.g_object_unref(info);
+        if (hasMetadata(info)) return "query_info_async returned metadata for a hung mount";
+    }
+
+    // Everything else still has its metadata.
+    const ok = c.g_file_new_for_path(ok_path);
+    defer c.g_object_unref(ok);
+    if (c.g_file_set_attribute_string(ok, "metadata::k", "v", c.G_FILE_QUERY_INFO_NONE, null, &err) == 0) {
+        logError("set", err);
+        return "a metadata set next to the hung mount failed";
+    }
+    {
+        var slow = false;
+        const info = queryTimed(ok, "metadata::k", &slow) orelse return "query_info next to the hung mount failed";
+        defer c.g_object_unref(info);
+        if (!stringAttr(info, "metadata::k", "v")) return "metadata next to the hung mount did not come back";
+        if (slow) return "a query next to the hung mount was slow";
+    }
+    // On the UI thread (milestone 6 review: 3 ms budget, quiet period after a timeout):
+    // the health cache answers before any of that, within the SLO, and failing a call
+    // under the hung mount never starts the quiet period for the paths next to it.
+    {
+        var u: UiHung = .{ .hung = file, .ok = ok };
+        u.loop = c.g_main_loop_new(null, 0);
+        defer c.g_main_loop_unref(u.loop);
+        _ = c.g_idle_add(&uiHungIdle, &u);
+        c.g_main_loop_run(u.loop);
+        c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: hung-mount on the UI thread: worst %ld us (SLO %d ms)", @as(c_long, @intCast(u.worst_us)), @as(c_int, ui_slo_ms));
+        if (u.failed) |w| return w;
+        if (u.worst_us > ui_assert_ms * 1000) return "a call under the hung mount blocked the UI thread";
+    }
+
+    // The daemon's own view, over a second connection without the module's cache.
+    const sock_path = ipc.resolveSocketPath(std.mem.span(ctx.sock), null, null) catch return "bad socket path";
+    var conn = ipc.connectAndPing(&sock_path, 2_000) catch return "second connection failed";
+    defer conn.close();
+    var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
+    {
+        const t = nowMs();
+        if (cl.identify(std.mem.span(path))) |_| return "the daemon identified a file on a hung mount" else |e| {
+            if (e != error.SuspectMount) {
+                c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: identify: %s", @errorName(e).ptr);
+                return "identify on a hung mount gave the wrong error";
+            }
+        }
+        if (nowMs() - t > max_hung_call_ms) return "identify on a hung mount was slow";
+    }
+    const info = health.queryPath(&cl, std.mem.span(path)) catch return "health query by path failed";
+    if (info.state != health.hung or !std.mem.eql(u8, info.mountPoint(), std.mem.span(dir))) return "the daemon does not report the fake mount hung";
+    const by_id = health.queryId(&cl, info.mnt_id) catch return "health query by id failed";
+    if (by_id.state != health.hung) return "health query by id disagrees";
+    const root = health.queryPath(&cl, "/") catch return "health query of / failed";
+    if (root.state != health.healthy) return "/ is not healthy";
+    if (health.queryId(&cl, 0xdead_beef_dead)) |_| return "an unknown mount id was found" else |e| {
+        if (e != error.NotFound) return "an unknown mount id gave the wrong error";
+    }
+    if (checkGungnirFast()) |what| return what;
+    return null;
+}
+
 fn runHung(tmp_arg: [*c]u8) c_int {
     const tmp_dir = privateDir(tmp_arg, "hung") orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
@@ -1069,5 +1298,6 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "gio-cli") and argc == 5) return runDaemon(argv[3], argv[4], "gio-cli", &checkGioCli);
     if (std.mem.eql(u8, mode, "daemon-stopped") and argc == 5) return runDaemon(argv[3], argv[4], "daemon-stopped", &checkDaemonStopped);
     if (std.mem.eql(u8, mode, "ui-thread") and argc == 5) return runDaemon(argv[3], argv[4], "ui-thread", &checkUiThread);
+    if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
     return fail("unknown mode or wrong argument count");
 }

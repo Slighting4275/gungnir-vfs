@@ -6,6 +6,8 @@ const link = @import("link.zig");
 pub const md = @import("md.zig");
 /// GIO metadata::* attributes on top of it (milestone 6).
 const gmeta = @import("gmeta.zig");
+/// Mount health events from the daemon (milestone 7).
+const health = @import("health.zig");
 
 /// Root panic handler: log through GLib, then terminate the whole process.
 pub const panic = std.debug.FullPanic(gungnirPanic);
@@ -145,11 +147,13 @@ fn localFileMoved(vfs: [*c]c.GVfs, source: [*c]const u8, dest: [*c]const u8) cal
 }
 
 const prop_daemon_state: c.guint = 1;
+const prop_unhealthy_mounts: c.guint = 2;
 
 fn getProperty(object: [*c]c.GObject, prop_id: c.guint, value: [*c]c.GValue, pspec: [*c]c.GParamSpec) callconv(.c) void {
     _ = object;
     _ = pspec;
     if (prop_id == prop_daemon_state) c.g_value_set_int(value, link.state());
+    if (prop_id == prop_unhealthy_mounts) c.g_value_set_int(value, health.unhealthyCount());
 }
 
 fn instanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callconv(.c) void {
@@ -182,6 +186,15 @@ fn classInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
         state_connecting,
         state_unavailable,
         state_connecting,
+        c.G_PARAM_READABLE | c.G_PARAM_STATIC_STRINGS,
+    ));
+    c.g_object_class_install_property(object_class, prop_unhealthy_mounts, c.g_param_spec_int(
+        "unhealthy-mounts",
+        "Unhealthy mounts",
+        "Mounts gungnird last reported hung or gone (calls on them fail fast)",
+        0,
+        health.max_entries,
+        0,
         c.G_PARAM_READABLE | c.G_PARAM_STATIC_STRINGS,
     ));
 }
@@ -246,6 +259,7 @@ test {
     _ = md;
     _ = link;
     _ = gmeta;
+    _ = health;
 }
 
 test "daemon state starts as connecting" {

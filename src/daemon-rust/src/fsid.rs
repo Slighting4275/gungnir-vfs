@@ -1151,6 +1151,14 @@ impl<B: Backend> Resolver<B> {
         spawn_worker(&self.shared);
         Err(FsidError::Timeout(self.cfg.deadline))
     }
+
+    /// Mark a mount suspect from outside, for `span` from now (capped at a day), so
+    /// requests for it fail fast with [`FsidError::SuspectMount`] without a worker ever
+    /// touching it (milestone 7: the mount health monitor, which also clears it again).
+    pub fn mark_suspect(&self, hint: MountHint, span: Duration) {
+        let until = Instant::now() + span.min(Duration::from_secs(86_400));
+        lock(&self.suspects).insert(hint, Some(until));
+    }
 }
 
 #[cfg(test)]

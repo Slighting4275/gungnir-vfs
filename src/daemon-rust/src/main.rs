@@ -3,6 +3,7 @@ use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 use gungnird::{
     Result,
     fsid::{Resolver, ResolverConfig, SysBackend},
+    health::{self, FakeHung, Gated, HealthConfig, HealthHandler, Monitor, StatfsProber},
     ipc, mdsvc,
     store::{self, DbConfig, Store, StoreConfig},
 };
@@ -26,11 +27,22 @@ fn run() -> Result<()> {
         DbConfig::default(),
     )?;
     eprintln!("gungnird: metadata db ready at {}", path.display());
+    // Mount health (milestone 7): hung or dead network/FUSE mounts fail fast, never block.
+    let fake = health::fake_hung_from_env();
+    let monitor = Monitor::start(
+        HealthConfig::default(),
+        Arc::new(FakeHung::new(StatfsProber, fake.clone())),
+        health::Source::Proc,
+        health::fake_entries(&fake),
+    )?;
     let resolver = Arc::new(Resolver::new(
-        SysBackend::new()?,
+        Gated::new(SysBackend::new()?, Arc::clone(&monitor)),
         ResolverConfig::default(),
     )?);
-    let handler: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db));
+    let sink: Arc<dyn health::SuspectSink> = resolver.clone();
+    monitor.set_sink(Arc::downgrade(&sink));
+    let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db));
+    let handler: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
     let sock = ipc::socket_path_from_env()?;
     let listener = ipc::bind(&sock)?;
     eprintln!("gungnird: listening on {}", sock.display());

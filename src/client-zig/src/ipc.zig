@@ -156,6 +156,11 @@ pub const Shm = struct {
         return @ptrCast(@alignCast(s.mem[off..][0..slot_size]));
     }
 
+    /// The producer's head counter of `ring`, for a futex wait on it (link.zig).
+    pub fn headWord(s: Shm, ring: Ring) *u32 {
+        return s.word(ring.head);
+    }
+
     pub fn headerOk(s: Shm) bool {
         return @atomicLoad(u32, s.word(0), .acquire) == magic and
             @atomicLoad(u32, s.word(4), .monotonic) == version and

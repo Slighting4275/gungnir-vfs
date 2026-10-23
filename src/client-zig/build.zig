@@ -57,11 +57,13 @@ pub fn build(b: *std.Build) void {
     // Sockets and test databases live in the repo's .build/tmp (AGENTS.md §3), each itest
     // run in a fresh private (0700) directory of its own that itest.zig creates there.
     const repo_tmp = b.path("../../.build/tmp");
-    // The daemon test starts the real gungnird, built by cargo into .build/target.
-    const cargo_build = b.addSystemCommand(&.{ "cargo", "build", "--release", "--quiet", "--bin", "gungnird" });
+    // The daemon test starts the real gungnird with the test-hooks feature (hung-mount sets
+    // GUNGNIR_TEST_FAKE_HUNG_MOUNT, milestone 7), built by cargo into its own target dir,
+    // .build/target-hooks: never over the release gungnird in .build/target.
+    const cargo_build = b.addSystemCommand(&.{ "cargo", "build", "--release", "--quiet", "--bin", "gungnird", "--features", "test-hooks", "--target-dir", ".build/target-hooks" });
     cargo_build.setCwd(b.path("../.."));
     cargo_build.has_side_effects = true;
-    const gungnird_bin = b.path("../../.build/target/release/gungnird");
+    const gungnird_bin = b.path("../../.build/target-hooks/release/gungnird");
 
     const itest = b.step("itest", "Load libgiogungnir.so through GIO, check GungnirVfs, the daemon handshake and metadata");
     // opt-in: GIO_USE_VFS=gungnir, nothing at the socket: GungnirVfs with local fallback.
@@ -71,8 +73,10 @@ pub fn build(b: *std.Build) void {
     // gio-metadata, gio-cli, daemon-stopped: metadata::* through GIO (milestone 6), in
     // process and with the `gio` tool, and with the daemon stopped and restarted.
     // ui-thread: hooks called from the main loop, daemon answering and SIGSTOPped.
-    const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread" }) |mode| {
+    // hung-mount: gungnird with a fake hung mount; the module learns it from the health
+    // events and fails GIO calls under it within 100 ms (milestone 7).
+    const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount" };
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());
