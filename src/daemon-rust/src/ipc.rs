@@ -942,7 +942,15 @@ pub fn recv_with_fd(stream: &UnixStream) -> Result<(Frame, Option<OwnedFd>)> {
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.0.as_mut_ptr().cast();
     msg.msg_controllen = cbuf.0.len() as _;
-    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+    // EINTR is retried: with a receive timeout set the kernel does not restart the call
+    // itself, and a thread that closed an io_uring is interrupted once shortly afterwards
+    // (the ring's teardown queues task work on it) without any signal.
+    let n = loop {
+        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break n;
+        }
+    };
     if n < 0 {
         return os_err();
     }

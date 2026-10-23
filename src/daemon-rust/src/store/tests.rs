@@ -632,3 +632,147 @@ fn milestone_5_database_gains_the_link_count() -> Result<()> {
     drop(t.open()?); // and opens again with the column present
     Ok(())
 }
+
+// ---- milestone 8: metadata follows file-op copies and recursive deletes ------------
+
+#[test]
+fn copy_meta_duplicates_rows_and_optionally_forgets_the_source() -> Result<()> {
+    let t = TestStore::new("copy")?;
+    let mut s = t.open()?;
+    let (a, b, c) = (id(10), id(11), id(12));
+    let v = enc(&Value::String("x".into()));
+    s.set(&a, "k1", &v, Some(b"/d/a"))?;
+    s.set(&a, "k2", &v, Some(b"/d/a"))?;
+    // Stale rows of a recycled inode at the copy's identity are replaced.
+    s.set(&b, "old", &v, Some(b"/d/old"))?;
+    assert_eq!(s.copy_meta(&a, &b, b"/d/b", false)?, 2);
+    assert_eq!(
+        s.list(&b, "", 100)?.0,
+        vec!["k1".to_owned(), "k2".to_owned()]
+    );
+    assert_eq!(s.path_hint(&b)?, Some(b"/d/b".to_vec()));
+    assert_eq!(
+        s.list(&a, "", 100)?.0.len(),
+        2,
+        "a copy keeps the source's rows"
+    );
+    // A move across filesystems: the source's rows go.
+    assert_eq!(s.copy_meta(&a, &c, b"/e/c", true)?, 2);
+    assert!(s.list(&a, "", 100)?.0.is_empty());
+    assert_eq!(s.path_hint(&a)?, None);
+    assert_eq!(s.list(&c, "", 100)?.0.len(), 2);
+    // Same key, or nothing to copy: no rows.
+    assert_eq!(s.copy_meta(&c, &c, b"/e/c", false)?, 0);
+    assert_eq!(s.copy_meta(&id(99), &id(98), b"/x", false)?, 0);
+    assert_eq!(s.path_hint(&id(98))?, None);
+    Ok(())
+}
+
+#[test]
+fn removed_tree_drops_the_path_and_everything_below_only() -> Result<()> {
+    let t = TestStore::new("tree")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    s.set(&id(1), "k", &v, Some(b"/t/dir"))?;
+    s.set(&id(2), "k", &v, Some(b"/t/dir/f"))?;
+    s.set(&id(3), "k", &v, Some(b"/t/dir/sub/g"))?;
+    s.set(&id(4), "k", &v, Some(b"/t/dir2/f"))?; // a sibling with the same prefix
+    s.set(&id(5), "k", &v, Some(b"/t/dir0"))?;
+    assert_eq!(s.removed_tree(b"/t/dir")?, 3);
+    for gone in [1, 2, 3] {
+        assert!(s.get(&id(gone), "k")?.is_none());
+    }
+    for kept in [4, 5] {
+        assert!(s.get(&id(kept), "k")?.is_some());
+    }
+    assert_eq!(s.removed_tree(b"/t/dir")?, 0);
+    Ok(())
+}
+
+/// Review: a recursive delete follows the hard link rule (a file in the tree with another
+/// link outside keeps its metadata) and has no cap (every row below goes, in one call).
+#[test]
+fn removed_tree_follows_the_hard_link_rule_without_a_cap() -> Result<()> {
+    const N: u64 = 5000;
+    let t = TestStore::new("treelinks")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    for i in 0..N {
+        let p = format!("/t/big/sub/f{i}");
+        s.set(&id(1000 + i), "k", &v, Some(p.as_bytes()))?;
+    }
+    s.set_linked(&id(7), "k", &v, Some((b"/t/big/linked", 2)))?;
+    assert_eq!(
+        s.removed_tree(b"/t/big")?,
+        u32::try_from(N).unwrap_or(0),
+        "every row below the deleted tree, beyond 4096 too"
+    );
+    for i in [0, 4095, 4096, N - 1] {
+        assert_eq!(s.get(&id(1000 + i), "k")?, None);
+    }
+    assert!(
+        s.get(&id(7), "k")?.is_some(),
+        "the other link lost its metadata"
+    );
+    assert_eq!(s.path_hint(&id(7))?, None, "the outdated hint goes");
+    Ok(())
+}
+
+/// Review: what a failed recursive delete reports, in one transaction: trees, single
+/// entries, the hard link rule; a survivor's metadata stays.
+#[test]
+fn removed_paths_drops_exactly_the_reported_paths() -> Result<()> {
+    let t = TestStore::new("paths")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    s.set(&id(1), "k", &v, Some(b"/r/a"))?;
+    s.set(&id(2), "k", &v, Some(b"/r/d/x"))?;
+    s.set(&id(3), "k", &v, Some(b"/r/d/y/z"))?;
+    s.set(&id(4), "k", &v, Some(b"/r/survivor"))?;
+    s.set_linked(&id(5), "k", &v, Some((b"/r/b", 3)))?;
+    let paths = [
+        (b"/r/a".to_vec(), false),
+        (b"/r/d".to_vec(), true),
+        (b"/r/b".to_vec(), false),
+    ];
+    assert_eq!(s.removed_paths(&paths)?, 3);
+    for gone in [1, 2, 3] {
+        assert_eq!(s.get(&id(gone), "k")?, None);
+    }
+    assert!(s.get(&id(4), "k")?.is_some());
+    assert!(s.get(&id(5), "k")?.is_some());
+    assert_eq!(s.removed_paths(&paths)?, 0);
+    Ok(())
+}
+
+/// Review: a copy that replaces a file (OVERWRITE) takes its name: the replaced file's
+/// rows go, unless it has other links; a move across filesystems of a file with other
+/// links keeps the source's metadata (it still exists under them).
+#[test]
+fn copy_meta_follows_the_hard_link_rule() -> Result<()> {
+    let t = TestStore::new("copylinks")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    s.set(&id(1), "k", &v, Some(b"/c/src"))?;
+    s.set(&id(2), "old", &v, Some(b"/c/dest"))?; // replaced by the copy
+    s.set_linked(&id(3), "old", &v, Some((b"/c/dest2", 2)))?; // replaced, other link
+    assert_eq!(s.copy_meta(&id(1), &id(10), b"/c/dest", false)?, 1);
+    assert_eq!(
+        s.get(&id(2), "old")?,
+        None,
+        "the replaced file's rows stayed"
+    );
+    assert_eq!(s.copy_meta(&id(1), &id(11), b"/c/dest2", false)?, 1);
+    assert!(s.get(&id(3), "old")?.is_some());
+    assert_eq!(s.path_hint(&id(3))?, None);
+    // Cross-filesystem move of a file with two links: the source's rows stay.
+    s.set_linked(&id(4), "k", &v, Some((b"/c/m", 2)))?;
+    assert_eq!(s.copy_meta(&id(4), &id(12), b"/e/m", true)?, 1);
+    assert!(s.get(&id(4), "k")?.is_some());
+    assert_eq!(s.path_hint(&id(4))?, None);
+    assert_eq!(s.path_hint(&id(12))?, Some(b"/e/m".to_vec()));
+    // With one link: gone.
+    assert_eq!(s.copy_meta(&id(12), &id(13), b"/f/m", true)?, 1);
+    assert_eq!(s.get(&id(12), "k")?, None);
+    Ok(())
+}

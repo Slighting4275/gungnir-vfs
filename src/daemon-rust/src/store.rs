@@ -652,6 +652,159 @@ impl Store {
         })
     }
 
+    /// `to` is a new copy of the file `from` (milestone 8 file ops), now at `hint`: its
+    /// metadata rows are duplicated to `to` (whatever `to` had before is dropped: a new
+    /// file, or a recycled inode) and `to`'s path hint becomes `hint` (one link). Files
+    /// last seen at `hint` were replaced by the copy and lose their name there (the
+    /// [`Self::removed`] rule: dropped, unless they had other hard links). With
+    /// `forget_from` (a move across filesystems: `from`'s name was unlinked) `from` follows
+    /// the same rule. Returns how many keys were copied.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn copy_meta(
+        &mut self,
+        from: &Ident,
+        to: &Ident,
+        hint: &[u8],
+        forget_from: bool,
+    ) -> std::result::Result<u32, MdError> {
+        if same_key(from, to) {
+            return Ok(0);
+        }
+        let now = unix_now();
+        self.write(|tx| {
+            if Self::is_stale(tx, from)? {
+                Self::forget(tx, from)?;
+            }
+            Self::forget(tx, to)?;
+            for (other, links) in Self::hinted_at(tx, hint)? {
+                if !same_key(&other, from) {
+                    Self::unlinked(tx, &other, links)?;
+                }
+            }
+            let rows: Vec<(String, Option<Vec<u8>>)> = {
+                let mut st = tx.prepare_cached(&format!(
+                    "SELECT key, value FROM metadata WHERE {ID_WHERE} ORDER BY key LIMIT ?5"
+                ))?;
+                let (u, s, i, g) = Self::id_params(from);
+                st.query_map(params![u, s, i, g, MAX_KEYS_PER_FILE as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let (u, s, i, g) = Self::id_params(to);
+            let (bs, bn) = (to.btime_sec, i64::from(to.btime_nsec));
+            for (k, v) in &rows {
+                tx.prepare_cached(
+                    "INSERT INTO metadata \
+                     (fs_uuid, subvol_id, inode_num, generation, key, btime_sec, btime_nsec, value) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?
+                .execute(params![u, s, i, g, k, bs, bn, v])?;
+            }
+            if !rows.is_empty() {
+                tx.prepare_cached(
+                    "INSERT INTO path_hint \
+                     (fs_uuid, subvol_id, inode_num, generation, path, updated, links) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1) \
+                     ON CONFLICT (fs_uuid, subvol_id, inode_num, generation) \
+                     DO UPDATE SET path = excluded.path, updated = excluded.updated, links = 1",
+                )?
+                .execute(params![u, s, i, g, hint, now])?;
+            }
+            if forget_from {
+                let links: Option<i64> = tx
+                    .prepare_cached(&format!("SELECT links FROM path_hint WHERE {ID_WHERE}"))?
+                    .query_row(Self::id_params(from), |r| r.get(0))
+                    .optional()?;
+                Self::unlinked(tx, from, links.unwrap_or(1))?;
+            }
+            Ok(u32::try_from(rows.len()).unwrap_or(u32::MAX))
+        })
+    }
+
+    /// Identities last seen at `path` or anywhere below `path/` (byte ranges: '0'
+    /// follows '/'), with their hard link count then. All of them: no cap (a capped
+    /// list would leave rows whose files are gone).
+    fn hinted_in_tree(tx: &Connection, path: &[u8]) -> rusqlite::Result<Vec<(Ident, i64)>> {
+        let lo = [path, b"/"].concat();
+        let hi = [path, b"0"].concat();
+        let mut st = tx.prepare_cached(
+            "SELECT fs_uuid, subvol_id, inode_num, generation, links FROM path_hint \
+             WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+        )?;
+        st.query_map(params![path, lo, hi], |r| {
+            Ok((
+                Ident {
+                    fs_uuid: r.get(0)?,
+                    subvol_id: r.get::<_, i64>(1)? as u64,
+                    inode_num: r.get::<_, i64>(2)? as u64,
+                    generation: r.get::<_, i64>(3)? as u64,
+                    btime_sec: 0,
+                    btime_nsec: 0,
+                },
+                r.get(4)?,
+            ))
+        })?
+        .collect()
+    }
+
+    /// `path` was deleted with everything below it (milestone 8 recursive delete): every
+    /// identity last seen at `path` or below `path/` lost that name (the
+    /// [`Self::removed`] rule: dropped, unless it had other hard links). One
+    /// transaction, however many. Returns how many identities were dropped.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn removed_tree(&mut self, path: &[u8]) -> std::result::Result<u32, MdError> {
+        self.removed_paths(&[(path.to_vec(), true)])
+    }
+
+    /// Paths a recursive delete removed (milestone 8): `(path, true)` a directory with
+    /// everything below it, `(path, false)` one entry; each identity last seen there
+    /// follows the [`Self::removed`] rule. In one transaction. Returns how many
+    /// identities were dropped.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn removed_paths(
+        &mut self,
+        paths: &[(Vec<u8>, bool)],
+    ) -> std::result::Result<u32, MdError> {
+        // Most deleted trees never had metadata: look before taking the write lock.
+        let any = self.read(|c| {
+            for (path, tree) in paths {
+                let found = if *tree {
+                    Self::hinted_in_tree(c, path)?
+                } else {
+                    Self::hinted_at(c, path)?
+                };
+                if !found.is_empty() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if !any {
+            return Ok(0);
+        }
+        self.write(|tx| {
+            let mut n = 0u32;
+            for (path, tree) in paths {
+                let found = if *tree {
+                    Self::hinted_in_tree(tx, path)?
+                } else {
+                    Self::hinted_at(tx, path)?
+                };
+                for (id, links) in found {
+                    n += u32::from(Self::unlinked(tx, &id, links)?);
+                }
+            }
+            Ok(n)
+        })
+    }
+
     /// The last path a value was set through (diagnostics, later moves and GC).
     ///
     /// # Errors
@@ -685,6 +838,12 @@ pub enum DbReq {
     Removed(Vec<u8>, Option<Ident>),
     /// Source path, destination path, identity of the renamed file.
     Moved(Vec<u8>, Vec<u8>, Ident),
+    /// Milestone 8: source identity, copy's identity, copy's path, drop the source's rows.
+    Copied(Ident, Ident, Vec<u8>, bool),
+    /// Milestone 8: a directory tree deleted at this path.
+    RemovedTree(Vec<u8>),
+    /// Milestone 8: what a failed recursive delete removed (`true`: with its subtree).
+    RemovedPaths(Vec<(Vec<u8>, bool)>),
 }
 
 /// Reply body on success (see `md` for the layouts), or the failure status.
@@ -763,6 +922,11 @@ pub fn execute(store: &mut Store, req: &DbReq) -> DbResult {
             b.extend_from_slice(&f.to_le_bytes());
             b
         }),
+        DbReq::Copied(from, to, hint, forget) => store
+            .copy_meta(from, to, hint, *forget)
+            .map(|n| n.to_le_bytes().to_vec()),
+        DbReq::RemovedTree(path) => store.removed_tree(path).map(|n| n.to_le_bytes().to_vec()),
+        DbReq::RemovedPaths(paths) => store.removed_paths(paths).map(|n| n.to_le_bytes().to_vec()),
     }
 }
 

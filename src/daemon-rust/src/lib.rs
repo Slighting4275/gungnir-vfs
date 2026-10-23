@@ -5,6 +5,8 @@ pub mod health;
 pub mod ipc;
 pub mod md;
 pub mod mdsvc;
+pub mod ops;
+pub mod opsvc;
 pub mod store;
 
 pub use store::open_db;
