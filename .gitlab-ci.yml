@@ -1,0 +1,203 @@
+# GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
+# Mirrors the gates in AGENTS.md §4, plus `cargo fmt --check` and `zig fmt --check`. All
+# output stays under .build/ (AGENTS.md §3).
+#
+# Reproducible base: the archlinux image is pinned by tag AND digest, and pacman installs
+# from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT), so every run gets
+# the same packages. To move forward, bump both together (tags: hub.docker.com/_/archlinux).
+# Set ARCH_SNAPSHOT to "" (e.g. as a pipeline variable) to use the live mirrors instead.
+#
+# Zig is the current master tarball from ziglang.org, accepted only if its minisign
+# signature verifies against Zig's pinned public key, the signed trusted comment names
+# exactly that file, the sha256 matches index.json, and it is not older than
+# build.zig.zon's minimum_zig_version (Zig itself does not enforce that field).
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - lint
+  - build
+  - test
+
+variables:
+  ARCH_SNAPSHOT: "2026/10/18"
+  CARGO_HOME: "$CI_PROJECT_DIR/.build/cargo-home"
+  CARGO_TERM_COLOR: "never"
+  ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.build/zig-global-cache"
+  ZIG_INDEX_URL: "https://ziglang.org/download/index.json"
+  # Zig's published minisign key (https://ziglang.org/download/).
+  ZIG_PUBKEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+
+default:
+  # archlinux:base-20261018.0.612668, pinned by digest (the tag alone can be re-pushed).
+  image: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+  interruptible: true
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+# Cargo registry + target dir, keyed on Cargo.lock. Only rust:build uploads it; every
+# other job only downloads, so parallel jobs never race to overwrite the same cache.
+.cargo-cache: &cargo-cache
+  key:
+    files: [Cargo.lock]
+    prefix: cargo-release
+  paths:
+    - .build/cargo-home/registry/index/
+    - .build/cargo-home/registry/cache/
+    - .build/cargo-home/git/db/
+    - .build/target/
+  policy: pull
+
+# The verified Zig tarball and its signature (re-verified on every use).
+.zig-cache: &zig-cache
+  key: zig-master-x86_64-linux
+  paths:
+    - .build/zig-dl/cache/
+  policy: pull
+
+.pacman: &pacman
+  - |
+    if [ -n "$ARCH_SNAPSHOT" ]; then
+      printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist
+    fi
+    cat /etc/pacman.d/mirrorlist | grep -v '^#' | grep . || true
+
+.rust:
+  cache:
+    - *cargo-cache
+  before_script:
+    - *pacman
+    - pacman -Syuu --noconfirm --needed rust gcc pkgconf
+    - rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
+
+# Zig jobs also need Rust: the Zig integration test builds and starts gungnird.
+.zig:
+  cache:
+    - *cargo-cache
+    - *zig-cache
+  before_script:
+    - *pacman
+    - pacman -Syuu --noconfirm --needed rust gcc glib2 pkgconf binutils minisign jq curl xz tar
+    - |
+      # Install Zig master from ziglang.org; fail unless minisign verifies the tarball.
+      set -eo pipefail
+      dl=.build/zig-dl
+      mkdir -p "$dl/cache"
+      curl -fsSL --retry 3 "$ZIG_INDEX_URL" -o "$dl/index.json"
+      ZIG_VERSION=$(jq -er '.master.version' "$dl/index.json")
+      ZIG_URL=$(jq -er '.master["x86_64-linux"].tarball' "$dl/index.json")
+      ZIG_SHA=$(jq -er '.master["x86_64-linux"].shasum' "$dl/index.json")
+      ZIG_TARBALL=${ZIG_URL##*/}
+      [ "$ZIG_TARBALL" = "zig-x86_64-linux-$ZIG_VERSION.tar.xz" ] \
+        || { echo "unexpected Zig tarball name: $ZIG_TARBALL (master is $ZIG_VERSION)" >&2; exit 1; }
+      # Reuse the cached download only if it is this exact tarball; it is verified anyway.
+      if [ "$(cat "$dl/cache/name" 2>/dev/null)" != "$ZIG_TARBALL" ]; then
+        curl -fsSL --retry 3 "$ZIG_URL" -o "$dl/cache/zig.tar.xz"
+        curl -fsSL --retry 3 "$ZIG_URL.minisig" -o "$dl/cache/zig.tar.xz.minisig"
+        echo "$ZIG_TARBALL" > "$dl/cache/name"
+      fi
+      minisign -Vm "$dl/cache/zig.tar.xz" -P "$ZIG_PUBKEY" > "$dl/minisign.out" \
+        || { cat "$dl/minisign.out"; echo "Zig tarball signature verification FAILED" >&2; exit 1; }
+      cat "$dl/minisign.out"
+      # The signed trusted comment is "timestamp:<n>\tfile:<name>\thashed": require the
+      # exact file field, so a validly signed but different tarball is rejected.
+      awk -F'\t' -v want="file:$ZIG_TARBALL" '
+        /^Trusted comment: / { for (i = 1; i <= NF; i++) if ($i == want) ok = 1 }
+        END { exit !ok }' "$dl/minisign.out" \
+        || { echo "signed file name does not match $ZIG_TARBALL" >&2; exit 1; }
+      echo "$ZIG_SHA  $dl/cache/zig.tar.xz" | sha256sum -c -
+      rm -rf "$dl/zig" && mkdir -p "$dl/zig"
+      tar -xJf "$dl/cache/zig.tar.xz" -C "$dl/zig" --strip-components=1
+      export PATH="$CI_PROJECT_DIR/$dl/zig:$PATH"
+      [ "$(zig version)" = "$ZIG_VERSION" ] || { echo "zig version mismatch" >&2; exit 1; }
+      # Refuse a master older than the oldest nightly the project is verified on.
+      min=$(sed -n 's/^ *\.minimum_zig_version = "\(.*\)",$/\1/p' src/client-zig/build.zig.zon)
+      [ -n "$min" ] || { echo "no minimum_zig_version in build.zig.zon" >&2; exit 1; }
+      oldest=$(printf '%s\n%s\n' "$min" "$ZIG_VERSION" | sort -V | head -n1)
+      [ "$oldest" = "$min" ] || { echo "Zig master $ZIG_VERSION is older than minimum_zig_version $min" >&2; exit 1; }
+    - zig version
+    - rustc --version && pkg-config --modversion gio-2.0
+
+# ---- lint -------------------------------------------------------------------
+
+rust:lint:
+  stage: lint
+  extends: .rust
+  script:
+    - cargo fmt --all --check
+    - RUSTFLAGS="-D warnings" cargo check --release
+    - cargo clippy --release -- -D warnings
+
+zig:lint:
+  stage: lint
+  extends: .zig
+  cache:
+    - *cargo-cache
+    - <<: *zig-cache
+      policy: pull-push
+  script:
+    - zig fmt --check src/client-zig
+    - find src/client-zig -name '*.zig' -not -path '*/.zig-cache/*' -print0 | xargs -0 -n1 zig ast-check
+
+# ---- build ------------------------------------------------------------------
+
+rust:build:
+  stage: build
+  extends: .rust
+  needs: ["rust:lint"]
+  cache:
+    - <<: *cargo-cache
+      policy: pull-push
+  script:
+    - cargo build --release
+    - test -x .build/target/release/gungnird
+  artifacts:
+    name: gungnird
+    paths: [.build/target/release/gungnird]
+    expire_in: 1 week
+
+zig:build:
+  stage: build
+  extends: .zig
+  needs: ["zig:lint"]
+  script:
+    - ./zb
+    - |
+      # Exactly the three GIO module entry points may be exported.
+      syms=$(nm -D --defined-only .build/zig-out/lib/libgiogungnir.so | awk '{print $3}' | sort | tr '\n' ' ')
+      echo "exported: $syms"
+      test "$syms" = "g_io_module_load g_io_module_query g_io_module_unload "
+    - |
+      rm -rf .build/gio-querymodules && mkdir -p .build/gio-querymodules
+      cp .build/zig-out/lib/libgiogungnir.so .build/gio-querymodules/
+      gio-querymodules .build/gio-querymodules
+      cat .build/gio-querymodules/giomodule.cache
+      grep -qx 'libgiogungnir.so: gio-vfs' .build/gio-querymodules/giomodule.cache
+  artifacts:
+    name: libgiogungnir
+    paths: [.build/zig-out/lib/libgiogungnir.so]
+    expire_in: 1 week
+
+# ---- test -------------------------------------------------------------------
+
+rust:test:
+  stage: test
+  extends: .rust
+  needs: ["rust:build"]
+  script:
+    - cargo test --release
+
+zig:test:
+  stage: test
+  extends: .zig
+  # rust:build's gungnird artifact + the cargo cache keep the itest's cargo build incremental.
+  needs: ["zig:build", "rust:build"]
+  script:
+    - ./zb test --summary all

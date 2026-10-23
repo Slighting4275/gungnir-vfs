@@ -33,11 +33,9 @@ The full rules are in [AGENTS.md](AGENTS.md).
 ## Build and test
 
 ```sh
-# Zig GIO module
-cd src/client-zig
-zig build
-zig build test --summary all
-cd ../..
+# Zig GIO module (./zb runs zig build with every output under .build/)
+./zb
+./zb test --summary all
 
 # Rust daemon
 cargo build --release
@@ -55,6 +53,17 @@ picked by default:
 ```sh
 GIO_USE_VFS=gungnir gio info .
 ```
+
+## CI
+
+Every push and merge request runs [`.gitlab-ci.yml`](.gitlab-ci.yml) on GitLab in a pinned
+`archlinux` image (tag and digest) that installs packages from the Arch Linux Archive snapshot
+of the same day, so runs are reproducible. Lint checks formatting (`cargo fmt --check`,
+`zig fmt --check`), `cargo check` with `-D warnings` and `cargo clippy -- -D warnings`. Build
+runs `cargo build --release` and `./zb` with the exported-symbol and `gio-querymodules` checks.
+Test runs `cargo test --release` and `./zb test --summary all`. CI uses the current Zig master
+tarball from ziglang.org and rejects it unless its minisign signature, signed file name and
+sha256 verify, and it is not older than `minimum_zig_version` in `build.zig.zon`.
 
 ## Contributing
 
