@@ -54,7 +54,8 @@ pub fn build(b: *std.Build) void {
     const module_dir = b.addWriteFiles();
     _ = module_dir.addCopyFile(lib.getEmittedBin(), "libgiogungnir.so");
 
-    // Sockets and test databases live in the repo's .build/tmp (AGENTS.md §3).
+    // Sockets and test databases live in the repo's .build/tmp (AGENTS.md §3), each itest
+    // run in a fresh private (0700) directory of its own that itest.zig creates there.
     const repo_tmp = b.path("../../.build/tmp");
     // The daemon test starts the real gungnird, built by cargo into .build/target.
     const cargo_build = b.addSystemCommand(&.{ "cargo", "build", "--release", "--quiet", "--bin", "gungnird" });

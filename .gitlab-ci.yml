@@ -69,10 +69,21 @@ default:
     fi
     cat /etc/pacman.d/mirrorlist | grep -v '^#' | grep . || true
 
+# GitLab runners check the repo out with umask 0000, so .build/tmp arrives 0777 (and it is
+# in no cache or artifact: those only hold cargo-home, target, zig-dl and the two build
+# outputs). The tests already create a private 0700 directory per test under .build/tmp
+# and gungnird refuses any socket dir others can write to; this is only belt and braces.
+.private-tmp: &private-tmp
+  - |
+    umask 0022
+    mkdir -p .build/tmp
+    chmod go-w .build .build/tmp
+
 .rust:
   cache:
     - *cargo-cache
   before_script:
+    - *private-tmp
     - *pacman
     - pacman -Syuu --noconfirm --needed rust gcc pkgconf
     - rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
@@ -83,6 +94,7 @@ default:
     - *cargo-cache
     - *zig-cache
   before_script:
+    - *private-tmp
     - *pacman
     - pacman -Syuu --noconfirm --needed rust gcc glib2 pkgconf binutils minisign jq curl xz tar
     - |

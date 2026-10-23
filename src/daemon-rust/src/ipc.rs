@@ -820,23 +820,16 @@ pub fn recv_with_fd(stream: &UnixStream) -> Result<(Frame, Option<OwnedFd>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TestDir;
 
-    /// Socket under <repo>/.build/tmp (never /tmp), removed on drop.
-    struct TestSock(PathBuf);
+    /// Socket path in a fresh private (0700) directory of its own under <repo>/.build/tmp
+    /// (never /tmp); the directory, socket and lock file are removed on drop.
+    struct TestSock(PathBuf, #[allow(dead_code)] TestDir);
 
     impl TestSock {
-        fn new(name: &str) -> Self {
-            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build/tmp");
-            Self(dir.join(format!("gd-{name}-{}.sock", std::process::id())))
-        }
-    }
-
-    impl Drop for TestSock {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-            let mut lock = self.0.clone().into_os_string();
-            lock.push(".lock");
-            let _ = fs::remove_file(lock);
+        fn new(name: &str) -> Result<Self> {
+            let dir = TestDir::new(&format!("gd-{name}"))?;
+            Ok(Self(dir.join("gungnird.sock"), dir))
         }
     }
 
@@ -1021,7 +1014,7 @@ mod tests {
 
     #[test]
     fn handshake_and_ping_roundtrip() -> Result<()> {
-        let sock = TestSock::new("ping");
+        let sock = TestSock::new("ping")?;
         start_server(&sock, Config::default())?;
         let mut s = UnixStream::connect(&sock.0)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1042,7 +1035,7 @@ mod tests {
 
     #[test]
     fn bad_version_is_rejected_without_fd() -> Result<()> {
-        let sock = TestSock::new("badver");
+        let sock = TestSock::new("badver")?;
         start_server(&sock, Config::default())?;
         let mut s = UnixStream::connect(&sock.0)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1063,7 +1056,7 @@ mod tests {
 
     #[test]
     fn silent_client_is_dropped_in_bounded_time() -> Result<()> {
-        let sock = TestSock::new("silent");
+        let sock = TestSock::new("silent")?;
         let cfg = Config {
             handshake_timeout: Duration::from_millis(100),
             ..Config::default()
@@ -1085,7 +1078,7 @@ mod tests {
 
     #[test]
     fn stale_socket_is_replaced_and_live_one_refused() -> Result<()> {
-        let sock = TestSock::new("stale");
+        let sock = TestSock::new("stale")?;
         drop(bind(&sock.0)?); // listener closed, socket file stays: stale
         let live = bind(&sock.0)?;
         assert!(matches!(bind(&sock.0), Err(Error::AlreadyRunning(_))));
@@ -1097,7 +1090,7 @@ mod tests {
 
     #[test]
     fn concurrent_starts_never_orphan_a_listener() -> Result<()> {
-        let sock = TestSock::new("race");
+        let sock = TestSock::new("race")?;
         for _ in 0..50 {
             drop(bind(&sock.0)?); // leave a stale socket behind
             let a = sock.0.clone();
@@ -1116,7 +1109,7 @@ mod tests {
 
     #[test]
     fn live_listener_with_full_backlog_is_refused_without_hanging() -> Result<()> {
-        let sock = TestSock::new("backlog");
+        let sock = TestSock::new("backlog")?;
         drop(bind(&sock.0)?);
         fs::remove_file(&sock.0)?;
         // A listener that never accepts, its backlog filled up: a hung daemon.
@@ -1140,22 +1133,19 @@ mod tests {
 
     #[test]
     fn insecure_socket_dir_is_refused() -> Result<()> {
-        let sock = TestSock::new("dir");
-        let dir = sock.0.with_extension("d");
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))?;
+        let tmp = TestDir::new("gd-dir")?;
+        let dir = tmp.join("d");
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let path = dir.join("s.sock");
+        // World-writable (what a umask-0000 checkout produces): refused, nothing created.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))?;
+        assert!(matches!(bind(&path), Err(Error::InsecureSocketDir(_))));
+        assert!(fs::read_dir(&dir)?.next().is_none());
+        // Sticky + world-writable (a /tmp lookalike) is refused too.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777))?;
         assert!(matches!(bind(&path), Err(Error::InsecureSocketDir(_))));
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         drop(bind(&path)?);
-        fs::remove_file(&path)?;
-        let mut lock = path.into_os_string();
-        lock.push(".lock");
-        fs::remove_file(&lock)?;
-        fs::remove_dir(&dir)?;
         Ok(())
     }
 
@@ -1168,7 +1158,7 @@ mod tests {
 
     #[test]
     fn trickling_hello_is_dropped_by_the_total_deadline() -> Result<()> {
-        let sock = TestSock::new("trickle");
+        let sock = TestSock::new("trickle")?;
         let cfg = Config {
             handshake_timeout: Duration::from_millis(300),
             ..Config::default()
@@ -1202,7 +1192,7 @@ mod tests {
     #[test]
     fn extra_passed_fds_are_closed() -> Result<()> {
         let (a, b) = UnixStream::pair()?;
-        let target = TestSock::new("fdleak");
+        let target = TestSock::new("fdleak")?;
         fs::write(&target.0, b"")?;
         let target_path = fs::canonicalize(&target.0)?;
         let x = fs::File::open(&target_path)?;

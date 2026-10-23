@@ -4,7 +4,8 @@
 //!   gungnir-itest <module-dir> daemon <tmp-dir> <gungnird>   starts gungnird, expects a ping round trip
 //!   gungnir-itest <module-dir> hung <tmp-dir>                a socket that never answers
 //! <module-dir> contains only libgiogungnir.so and GIO_EXTRA_MODULES is unset, so no
-//! system or user gvfs modules load. Sockets and databases go in <tmp-dir> (.build/tmp).
+//! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
+//! directory per run, created under <tmp-dir> (.build/tmp).
 const std = @import("std");
 const c = @import("c");
 const linux = std.os.linux;
@@ -140,8 +141,74 @@ fn canConnect(path: [*:0]const u8) bool {
     return linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) == .SUCCESS;
 }
 
-fn tmpPath(dir: [*c]u8, what: [*:0]const u8, ext: [*:0]const u8) [*c]u8 {
-    return c.g_strdup_printf("%s/itest-%s-%d%s", dir, what, @as(c_int, linux.getpid()), ext);
+fn tmpPath(dir: [*:0]const u8, file: [*:0]const u8) [*c]u8 {
+    return c.g_strdup_printf("%s/%s", dir, file);
+}
+
+/// Creates a fresh directory that only we can enter (0700) under `tmp_arg`, whatever the
+/// umask: CI runners check the repo out with umask 0000, which leaves .build/tmp 0777, and
+/// gungnird (rightly) refuses a socket directory that others can write to. `tmp_arg` must
+/// be our own directory; it is made not group- or world-writable, so nobody else can swap
+/// the new directory out from under us. Returns a g_malloc'd path (g_free it), or null.
+fn privateDir(tmp_arg: [*c]u8, mode: [*:0]const u8) ?[*:0]u8 {
+    const base = c.g_canonicalize_filename(tmp_arg, null); // drop "..": sun_path is short
+    defer c.g_free(base);
+    // Every check and chmod below goes through an fd opened O_NOFOLLOW, never the path, so
+    // a symlink (refused) or a directory swapped in after the check cannot redirect them.
+    const base_fd = openOwnDir(linux.AT.FDCWD, base) orelse {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: %s is not a directory owned by us (symlinks are refused)", base);
+        return null;
+    };
+    defer _ = linux.close(base_fd.fd);
+    if (base_fd.mode & 0o022 != 0 and linux.errno(linux.fchmod(base_fd.fd, base_fd.mode & 0o7755)) != .SUCCESS) {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: cannot remove group/world write from %s", base);
+        return null;
+    }
+    var n: c_int = 0;
+    while (n < 1000) : (n += 1) {
+        const leaf = c.g_strdup_printf("itest-%s-%d-%d", mode, @as(c_int, linux.getpid()), n);
+        defer c.g_free(leaf);
+        // mkdirat in the directory we checked, never adopt an existing one: a leftover just
+        // gets the next name.
+        switch (linux.errno(linux.mkdirat(base_fd.fd, leaf, 0o700))) {
+            .SUCCESS => {},
+            .EXIST => continue,
+            else => {
+                c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: cannot create %s/%s", base, leaf);
+                return null;
+            },
+        }
+        // The umask may have stripped bits from 0700, never added any; fchmod makes it exact.
+        const made = openOwnDir(base_fd.fd, leaf);
+        const ok = if (made) |d| linux.errno(linux.fchmod(d.fd, 0o700)) == .SUCCESS else false;
+        if (made) |d| _ = linux.close(d.fd);
+        if (!ok) {
+            _ = linux.unlinkat(base_fd.fd, leaf, linux.AT.REMOVEDIR);
+            return null;
+        }
+        return @ptrCast(c.g_strdup_printf("%s/%s", base, leaf));
+    }
+    return null;
+}
+
+const OwnDir = struct { fd: linux.fd_t, mode: u32 };
+
+/// Open `path` (relative to `dirfd`) as a directory without following a symlink in its
+/// last component, and check with fstat (the object opened, not whatever the path names
+/// now) that it is a directory owned by us.
+fn openOwnDir(dirfd: linux.fd_t, path: [*:0]const u8) ?OwnDir {
+    const rc = linux.openat(dirfd, path, .{ .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &st)) != .SUCCESS or
+        st.mode & 0o170000 != 0o040000 or st.uid != linux.geteuid())
+    {
+        _ = linux.close(fd);
+        return null;
+    }
+    return .{ .fd = fd, .mode = st.mode };
 }
 
 fn removeFile(path: [*c]const u8) void {
@@ -149,13 +216,14 @@ fn removeFile(path: [*c]const u8) void {
 }
 
 fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
-    const tmp_dir = c.g_canonicalize_filename(tmp_arg, null); // drop "..": sun_path is short
+    const tmp_dir = privateDir(tmp_arg, "daemon") orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
-    const sock = tmpPath(tmp_dir, "daemon", ".sock");
+    defer _ = linux.rmdir(tmp_dir); // after the files below; a kept log keeps the dir too
+    const sock = tmpPath(tmp_dir, "gungnird.sock");
     defer c.g_free(sock);
-    const db = tmpPath(tmp_dir, "daemon", ".db");
+    const db = tmpPath(tmp_dir, "metadata.db");
     defer c.g_free(db);
-    const log = tmpPath(tmp_dir, "daemon", ".log");
+    const log = tmpPath(tmp_dir, "gungnird.log");
     defer c.g_free(log);
     if (c.g_setenv("GUNGNIR_SOCKET", sock, 1) == 0) return fail("g_setenv GUNGNIR_SOCKET");
 
@@ -173,13 +241,17 @@ fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
             c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: spawn gungnird: %s", err.*.message);
             c.g_error_free(err);
         }
+        removeFile(log); // the cleanup below is not armed yet
         return fail("could not start gungnird");
     }
     var rc: c_int = 1;
+    var reaped = false;
     defer {
-        _ = linux.kill(pid, .TERM);
-        var status: i32 = 0;
-        _ = linux.waitpid(pid, &status, 0);
+        if (!reaped) {
+            _ = linux.kill(pid, .TERM);
+            var status: i32 = 0;
+            _ = linux.waitpid(pid, &status, 0);
+        }
         removeFile(sock);
         const lock = c.g_strdup_printf("%s.lock", sock);
         removeFile(lock);
@@ -189,11 +261,28 @@ fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
             removeFile(f);
             c.g_free(f);
         }
-        if (rc == 0) removeFile(log) else c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: daemon log kept at %s", log);
+        if (rc == 0) removeFile(log) else {
+            // Show the daemon's own error in the test output (CI keeps no files).
+            // Only the tail, so a runaway daemon cannot flood the job log.
+            var text: [*c]u8 = null;
+            var len: c.gsize = 0;
+            if (c.g_file_get_contents(log, &text, &len, null) != 0) {
+                const cap: c.gsize = 16 * 1024;
+                const skip = if (len > cap) len - cap else 0;
+                c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: gungnird output%s:\n%s", @as([*:0]const u8, if (skip > 0) " (last 16 KiB)" else ""), text + skip);
+                c.g_free(text);
+            }
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: daemon log kept at %s", log);
+        }
     }
     // Wait (bounded) until the daemon accepts connections, before the module tries.
     const t0 = nowMs();
     while (!canConnect(sock)) {
+        var status: i32 = 0;
+        if (linux.waitpid(pid, &status, linux.W.NOHANG) == @as(usize, @intCast(pid))) {
+            reaped = true;
+            return fail("gungnird exited before it started listening");
+        }
         if (nowMs() - t0 > 10_000) return fail("gungnird did not start listening within 10 s");
         c.g_usleep(10 * 1000);
     }
@@ -204,9 +293,10 @@ fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
 }
 
 fn runHung(tmp_arg: [*c]u8) c_int {
-    const tmp_dir = c.g_canonicalize_filename(tmp_arg, null);
+    const tmp_dir = privateDir(tmp_arg, "hung") orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
-    const sock = tmpPath(tmp_dir, "hung", ".sock");
+    defer _ = linux.rmdir(tmp_dir);
+    const sock = tmpPath(tmp_dir, "gungnird.sock");
     defer c.g_free(sock);
     removeFile(sock);
     const fd = listenHung(sock) orelse return fail("could not create the hung listener");
@@ -222,9 +312,10 @@ fn runHung(tmp_arg: [*c]u8) c_int {
 }
 
 fn runMissing(tmp_arg: [*c]u8) c_int {
-    const tmp_dir = c.g_canonicalize_filename(tmp_arg, null);
+    const tmp_dir = privateDir(tmp_arg, "opt-in") orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
-    const sock = tmpPath(tmp_dir, "missing", ".sock");
+    defer _ = linux.rmdir(tmp_dir);
+    const sock = tmpPath(tmp_dir, "gungnird.sock");
     defer c.g_free(sock);
     removeFile(sock);
     if (c.g_setenv("GUNGNIR_SOCKET", sock, 1) == 0) return fail("g_setenv GUNGNIR_SOCKET");
