@@ -38,9 +38,15 @@ default:
   # archlinux:base-20261018.0.612668, pinned by digest (the tag alone can be re-pushed).
   image: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
   interruptible: true
+  # No `timeout:` here: GitLab accepts it under `default:` but never applies it (only a
+  # job's own or extended `timeout:` counts; gitlab-org/gitlab#213634), so it is set in
+  # .rust and .zig below instead.
+  # job_execution_timeout is what a job hitting `timeout:` fails with; it is not covered
+  # by stuck_or_timeout_failure (pending/no-updates jobs). Since GitLab 19.1 a runner
+  # restart or host reclaim mid-job reports runner_interrupted, not runner_system_failure.
   retry:
     max: 1
-    when: [runner_system_failure, stuck_or_timeout_failure]
+    when: [runner_system_failure, runner_interrupted, stuck_or_timeout_failure, job_execution_timeout]
 
 # Cargo registry + target dir, keyed on Cargo.lock. Only rust:build uploads it; every
 # other job only downloads, so parallel jobs never race to overwrite the same cache.
@@ -79,7 +85,10 @@ default:
     mkdir -p .build/tmp
     chmod go-w .build .build/tmp
 
+# Every job normally finishes in under 4 minutes, so a stalled runner or a hung step
+# fails at 20 minutes instead of the project's (by default 1 hour). Test jobs: 25.
 .rust:
+  timeout: 20 minutes
   cache:
     - *cargo-cache
   before_script:
@@ -90,6 +99,7 @@ default:
 
 # Zig jobs also need Rust: the Zig integration test builds and starts gungnird.
 .zig:
+  timeout: 20 minutes
   cache:
     - *cargo-cache
     - *zig-cache
@@ -99,10 +109,13 @@ default:
     - pacman -Syuu --noconfirm --needed rust gcc glib2 pkgconf binutils minisign jq curl xz tar
     - |
       # Install Zig master from ziglang.org; fail unless minisign verifies the tarball.
+      # Each curl attempt is time-boxed, and one that stalls (under 10 kB/s for 60 s) is
+      # aborted and retried at once instead of sitting out --max-time (pacman already
+      # aborts transfers that stall, via its default download timeout).
       set -eo pipefail
       dl=.build/zig-dl
       mkdir -p "$dl/cache"
-      curl -fsSL --retry 3 "$ZIG_INDEX_URL" -o "$dl/index.json"
+      curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_INDEX_URL" -o "$dl/index.json"
       ZIG_VERSION=$(jq -er '.master.version' "$dl/index.json")
       ZIG_URL=$(jq -er '.master["x86_64-linux"].tarball' "$dl/index.json")
       ZIG_SHA=$(jq -er '.master["x86_64-linux"].shasum' "$dl/index.json")
@@ -111,8 +124,8 @@ default:
         || { echo "unexpected Zig tarball name: $ZIG_TARBALL (master is $ZIG_VERSION)" >&2; exit 1; }
       # Reuse the cached download only if it is this exact tarball; it is verified anyway.
       if [ "$(cat "$dl/cache/name" 2>/dev/null)" != "$ZIG_TARBALL" ]; then
-        curl -fsSL --retry 3 "$ZIG_URL" -o "$dl/cache/zig.tar.xz"
-        curl -fsSL --retry 3 "$ZIG_URL.minisig" -o "$dl/cache/zig.tar.xz.minisig"
+        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 600 "$ZIG_URL" -o "$dl/cache/zig.tar.xz"
+        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_URL.minisig" -o "$dl/cache/zig.tar.xz.minisig"
         echo "$ZIG_TARBALL" > "$dl/cache/name"
       fi
       minisign -Vm "$dl/cache/zig.tar.xz" -P "$ZIG_PUBKEY" > "$dl/minisign.out" \
@@ -202,6 +215,7 @@ zig:build:
 rust:test:
   stage: test
   extends: .rust
+  timeout: 25 minutes
   needs: ["rust:build"]
   script:
     - cargo test --release
@@ -210,6 +224,7 @@ zig:test:
   stage: test
   extends: .zig
   # rust:build's gungnird artifact + the cargo cache keep the itest's cargo build incremental.
+  timeout: 25 minutes
   needs: ["zig:build", "rust:build"]
   script:
     - ./zb test --summary all
