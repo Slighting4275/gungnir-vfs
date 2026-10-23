@@ -1,2 +1,7 @@
+[build]
+# All cargo output under ./.build (AGENTS.md §3). Config-relative, so it applies
+# from the repo root and from src/daemon-rust alike.
+target-dir = ".build/target"
+
 [env]
 TMPDIR = { value = ".build/tmp", relative = true }

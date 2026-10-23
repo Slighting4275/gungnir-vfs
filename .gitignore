@@ -1,7 +1,10 @@
+# All build output lives under ./.build (AGENTS.md §3):
+# cargo -> .build/target, zig (via ./zb) -> .build/zig-out + .build/zig-cache.
 /.build/*
 !/.build/tmp/
 /.build/tmp/*
 !/.build/tmp/.gitkeep
+# Stray output from a bare `cargo` or `zig build` outside the configured paths.
 /target/
 .zig-cache/
 zig-out/

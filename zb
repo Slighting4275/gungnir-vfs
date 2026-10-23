@@ -1,0 +1,8 @@
+#!/bin/sh
+# zig build for src/client-zig with every output under ./.build (AGENTS.md §3):
+#   ./zb            build, install to .build/zig-out/lib/libgiogungnir.so
+#   ./zb test       unit + integration tests
+# The local cache dir and install prefix cannot be set from build.zig, hence this wrapper.
+root=$(cd "$(dirname "$0")" && pwd) || exit 1
+cd "$root/src/client-zig" || exit 1
+exec zig build --prefix "$root/.build/zig-out" --cache-dir "$root/.build/zig-cache" "$@"

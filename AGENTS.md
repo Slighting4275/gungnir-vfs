@@ -16,11 +16,19 @@ Autonomous agents must strictly adhere to this two-language architecture:
   - `pub export fn g_io_module_unload(module: *c.GIOModule) void`
   - `pub export fn g_io_module_query() [*c][*c]u8` (returns a `g_strdupv` copy of a NULL-terminated array; GIO frees it with `g_strfreev`, so never return static memory)
   - Must register the extension under `G_VFS_EXTENSION_POINT_NAME` (`"gio-vfs"`).
+  - Export ONLY these three symbols. Check with `nm -D --defined-only .build/zig-out/lib/libgiogungnir.so`; keep `bundle_ubsan_rt = false` on every artifact.
+- **GungnirVfs Type & VFS Selection (opt-in only):**
+  - `g_io_module_load` registers `GungnirVfs` (subclass of `GVfs`) with `g_type_module_register_type`, passing the `GIOModule` as the `GTypeModule`, so it is a dynamic type that survives module unload/reload. Never use `g_type_register_static` in the module.
+  - It then calls `g_io_extension_point_implement(G_VFS_EXTENSION_POINT_NAME, type, "gungnir", -100)`.
+  - Priority MUST stay below GLib's `local` (0) and gvfs's `gvfs` (10) (verified in GLib 2.84.4 and 2.90.1). GIO picks the highest-priority active VFS, so a priority >= 0 would silently make GungnirVfs the default VFS for every GIO app once the module is installed.
+  - Selection is opt-in per process: `GIO_USE_VFS=gungnir` (GIO looks the extension up by name, regardless of priority). The integration test checks both cases: with the variable it gets `GungnirVfs`, without it `GLocalVfs`.
+  - Until the daemon path exists, the `GVfsClass` vfuncs `get_file_for_path`, `get_file_for_uri` and `parse_name` delegate to `g_vfs_get_local()` (transfer none: never unref it), never to `g_vfs_get_default()` (that is GungnirVfs itself and would recurse). Their results are transfer full and are returned as is. `is_active` returns TRUE.
+  - `get_supported_uri_schemes` returns GungnirVfs's own static, NULL-terminated class list (`{ "file", NULL }`, the same as GLocalVfs's class vfunc). Never return `g_vfs_get_supported_uri_schemes(g_vfs_get_local())`: GVfs caches the element pointers, which point into the local VFS's private scheme table (freed by `g_vfs_unregister_uri_scheme`: use-after-free), and the base class would list `resource` twice.
 - **C Linkage & VTable Definitions:**
   - Link `libc` and `libgio-2.0` (mandatory; host GTK processes already link glibc).
   - Consume GLib/GIO headers exclusively through the build graph: `b.addTranslateC` on a header generated in `build.zig` (`#include <gio/gio.h>`), imported as module `c` (`const c = @import("c");`). `@cImport` no longer exists on Zig master.
   - Variadic C macros (e.g. `g_critical`, `g_warning`) cannot be translated; call the underlying function (`c.g_log`) directly.
-  - Implement GObject virtual tables (`GVfsClass`, `GFileIface`) as Zig `extern struct` types containing typed function pointers matching C ABI prototypes. Untyped `*anyopaque` or `void*` casts for vtables are forbidden.
+  - Implement GObject virtual tables (`GVfsClass`, `GFileIface`) as Zig `extern struct` types containing typed function pointers matching C ABI prototypes. Untyped `*anyopaque` or `void*` casts for vtables are forbidden. Class structs embed the translated parent class (`extern struct { parent_class: c.GVfsClass }`) and `class_init` assigns typed `callconv(.c)` functions to its slots; the only pointer casts allowed are GObject's own: `class_init`'s `gpointer` class argument to the class struct, and instance upcasts such as `*GIOModule` to `*GTypeModule`.
 - **Panic Prevention & C-ABI Safety:**
   - Zig's root panic handler (`pub const panic = std.debug.FullPanic(fn)` on the current master; re-check in the installed std after updates) is `noreturn` and cannot resume execution. Code paths handling external input must NEVER trigger panics.
   - Ban `@panic`, `unreachable`, and implicit slicing/arithmetic assertions on untrusted paths. Use explicit error-returning forms (`std.math.add`, bounds-checked slicing with error returns).
@@ -93,7 +101,10 @@ Autonomous agents must strictly adhere to this two-language architecture:
 
 ## 3. HOST ENVIRONMENT CONSTRAINTS (Arch Linux host)
 - Hardened mount rule: `/tmp` is mounted `noexec`. Never build, link, or execute binaries from `/tmp`.
-- All temporary sockets, test roots, and build artifacts MUST reside in `./.build/` or `$HOME/.cache/gungnir/`.
+- All temporary sockets, test roots, and build artifacts MUST reside in `./.build/` or `$HOME/.cache/gungnir/`:
+  - Cargo: `.cargo/config.toml` sets `[build] target-dir = ".build/target"` (applies from the repo root and from `src/daemon-rust`).
+  - Zig: build through the repo-root wrapper `./zb` (`zig build --prefix .build/zig-out --cache-dir .build/zig-cache`, run inside `src/client-zig`); neither directory can be set from `build.zig`. Do not run a bare `zig build` in `src/client-zig`: it creates `src/client-zig/.zig-cache` and `zig-out`. The global cache stays in `~/.cache/zig`.
+  - The integration test's module dir is a build-cache directory under `.build/zig-cache`.
 - Safe command execution: Never emit destructive commands (`git reset --hard`, `git clean -fdx`, or commands closing active terminal sessions).
 - Compilation failure circuit breaker: If an analyzer or compiler fails twice with the same diagnostic, stop and output the exact error trace.
 - No personal names, emails, or other personal details in code, metadata (`authors` fields), or commits.
@@ -101,8 +112,10 @@ Autonomous agents must strictly adhere to this two-language architecture:
 ## 4. CONCRETE VERIFICATION TARGETS & SLOs
 Before declaring any task complete, agents must verify the following:
 
-1. **Zig Test Suite** (from `src/client-zig`):
-   - `zig build` and `zig build test --summary all` must pass on the installed nightly, with zero memory leaks under `std.testing.allocator`.
+1. **Zig Test Suite** (from the repo root):
+   - `./zb` and `./zb test --summary all` must pass on the installed nightly, with zero memory leaks under `std.testing.allocator`. `test` runs the unit tests and the integration test (`./zb itest`): a child process loads `libgiogungnir.so` through GIO (`GIO_MODULE_DIR` = a dir containing only this module, `GIO_EXTRA_MODULES` unset) and asserts the default VFS is `GungnirVfs` with `GIO_USE_VFS=gungnir` and `GLocalVfs` without it, and that `g_file_new_for_path("/")`, `g_file_new_for_uri("file:///")` and `g_file_parse_name("/")` query `standard::type` as a directory, and that the supported URI schemes contain `file` with no duplicates.
+   - `nm -D --defined-only .build/zig-out/lib/libgiogungnir.so` lists exactly `g_io_module_load`, `g_io_module_query`, `g_io_module_unload`.
+   - `gio-querymodules` on a dir holding a copy of the `.so` writes `libgiogungnir.so: gio-vfs` to `giomodule.cache`.
 2. **Rust Test Suite** (from the repo root):
    - `cargo test --release` must exit code 0.
    - `RUSTFLAGS="-D warnings" cargo check --release` and `cargo clippy --release -- -D warnings` must exit code 0.
