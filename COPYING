@@ -1,0 +1,23 @@
+Gungnir (gungnir-vfs)
+Copyright (C) 2026 The Gungnir contributors
+
+SPDX-License-Identifier: GPL-3.0-or-later AND AGPL-3.0-or-later
+
+This program is licensed under BOTH of the following licenses, combined.
+This is not a choice between them: every copy and every modified version
+must comply with both at the same time.
+
+  - GNU General Public License, version 3 or (at your option) any later
+    version: LICENSES/GPL-3.0-or-later.txt
+  - GNU Affero General Public License, version 3 or (at your option) any
+    later version: LICENSES/AGPL-3.0-or-later.txt
+
+Section 13 of each license expressly permits combining works under the
+GNU GPL v3 and the GNU AGPL v3. In practice this means that if you modify
+this program and let users interact with it over a network, you must
+offer those users the Corresponding Source of your version, as required
+by section 13 of the GNU AGPL.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the full license texts for details.

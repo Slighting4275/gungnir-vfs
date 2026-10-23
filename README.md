@@ -63,4 +63,6 @@ for the daemon, nothing else) and the build and test gates every change must pas
 
 ## License
 
-Not yet chosen.
+Gungnir is licensed under the GNU GPL v3.0 or later **and** the GNU AGPL v3.0 or later, combined
+(SPDX: `GPL-3.0-or-later AND AGPL-3.0-or-later`). Both apply at once; it is not a choice
+between them. See [COPYING](COPYING) and the full texts in [LICENSES/](LICENSES).
