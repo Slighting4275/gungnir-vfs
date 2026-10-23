@@ -128,7 +128,7 @@ pub export fn g_io_module_unload(module: *c.GIOModule) void {
 /// GIO takes ownership of the result and frees it with g_strfreev(),
 /// so return a g_strdupv() copy, never the static array itself.
 pub export fn g_io_module_query() [*c][*c]u8 {
-    return c.g_strdupv(@constCast(@ptrCast(&extension_points)));
+    return c.g_strdupv(@ptrCast(@constCast(&extension_points)));
 }
 
 test "query lists gio-vfs" {

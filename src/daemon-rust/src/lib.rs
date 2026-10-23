@@ -36,7 +36,10 @@ impl fmt::Display for Error {
             Error::Sqlite(e) => write!(f, "sqlite: {e}"),
             Error::NoHome => write!(f, "HOME is not set and no database path was given"),
             Error::WalUnavailable(mode) => {
-                write!(f, "sqlite refused WAL journal mode (still in '{mode}' mode)")
+                write!(
+                    f,
+                    "sqlite refused WAL journal mode (still in '{mode}' mode)"
+                )
             }
         }
     }
