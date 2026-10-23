@@ -44,7 +44,7 @@ impl<B: Backend> Handler for Service<B> {
 struct MdSession<B: Backend> {
     resolver: Arc<Resolver<B>>,
     db: DbHandle,
-    hints: HashMap<Ident, Vec<u8>>,
+    hints: HashMap<Ident, (Vec<u8>, u32)>,
 }
 
 /// Map an identity lookup failure to a reply status.
@@ -78,12 +78,18 @@ fn hint_key(id: &Ident) -> Ident {
 }
 
 impl<B: Backend> MdSession<B> {
-    fn identify(&mut self, path: Vec<u8>) -> Result<Vec<u8>, MdError> {
+    /// Identify `path` through the resolver (bounded by its deadline): the identity and
+    /// the file's hard link count.
+    fn resolve(&self, path: &[u8]) -> Result<(Ident, u32), MdError> {
         let fi = self
             .resolver
-            .resolve(Target::Path(PathBuf::from(OsStr::from_bytes(&path))))
+            .resolve(Target::Path(PathBuf::from(OsStr::from_bytes(path))))
             .map_err(|e| fsid_status(&e))?;
-        let id = Ident::from(&fi);
+        Ok((Ident::from(&fi), fi.nlink))
+    }
+
+    fn identify(&mut self, path: Vec<u8>) -> Result<Vec<u8>, MdError> {
+        let (id, nlink) = self.resolve(&path)?;
         // The one place the daemon knows the file's current btime: rows of an earlier file
         // on this inode are dropped here (queued ahead of every later request of this
         // connection), never on the btime a client sends with get/set.
@@ -99,7 +105,7 @@ impl<B: Backend> MdSession<B> {
         if self.hints.len() >= HINT_CACHE {
             self.hints.clear();
         }
-        self.hints.insert(hint_key(&id), path);
+        self.hints.insert(hint_key(&id), (path, nlink));
         Ok(body)
     }
 
@@ -112,6 +118,20 @@ impl<B: Backend> MdSession<B> {
             }
             Request::Unset(id, k) => DbReq::Unset(id, k),
             Request::List(id, cursor) => DbReq::List(id, cursor),
+            // What is at the deleted path now: nothing (the usual case), or a file that
+            // must keep its metadata. Any other failure (a hung mount) drops nothing.
+            Request::Removed(path) => {
+                let alive = match self.resolve(&path) {
+                    Ok((id, _)) => Some(id),
+                    Err(MdError::NoSuchFile) => None,
+                    Err(e) => return Err(e),
+                };
+                DbReq::Removed(path, alive)
+            }
+            Request::Moved(src, dest) => {
+                let (id, _) = self.resolve(&dest)?;
+                DbReq::Moved(src, dest, id)
+            }
             Request::Identify(_) => return Err(MdError::BadRequest),
         })
     }

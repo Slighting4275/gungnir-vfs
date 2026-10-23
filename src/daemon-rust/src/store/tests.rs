@@ -250,7 +250,7 @@ fn locked_database_answers_busy_quickly() -> Result<()> {
     s.set(&a, "before", &v, None)?;
     let other = Connection::open(&t.path)?;
     other
-        .execute_batch("BEGIN IMMEDIATE; INSERT INTO path_hint VALUES ('x', 0, 0, 0, x'00', 0);")?;
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) VALUES ('x', 0, 0, 0, x'00', 0);")?;
     let t0 = Instant::now();
     assert_eq!(s.set(&a, "k", &v, None), Err(MdError::Busy));
     assert_eq!(s.unset(&a, "before"), Err(MdError::Busy));
@@ -313,7 +313,7 @@ fn db_thread_runs_jobs_and_sheds_load() -> Result<()> {
             a.clone(),
             "k".into(),
             enc(&Value::String("v".into())),
-            Some(b"/p".to_vec()),
+            Some((b"/p".to_vec(), 1)),
         ),
         DbReq::Get(a.clone(), "k".into()),
         DbReq::List(a.clone(), String::new()),
@@ -444,7 +444,7 @@ fn open_waits_out_a_brief_lock() -> Result<()> {
     drop(t.open()?);
     let other = Connection::open(&t.path)?;
     other
-        .execute_batch("BEGIN EXCLUSIVE; INSERT INTO path_hint VALUES ('x', 0, 0, 0, x'00', 0);")?;
+        .execute_batch("BEGIN EXCLUSIVE; INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) VALUES ('x', 0, 0, 0, x'00', 0);")?;
     let path = t.path.clone();
     let h = thread::spawn(move || Store::open(&path, StoreConfig::default()).map(drop));
     thread::sleep(Duration::from_millis(200));
@@ -468,5 +468,167 @@ fn concurrent_first_opens_all_succeed() -> Result<()> {
             h.join().map_err(|_| Error::Protocol("open panicked"))??;
         }
     }
+    Ok(())
+}
+
+#[test]
+fn removed_drops_the_files_last_seen_at_the_path() -> Result<()> {
+    let t = TestStore::new("removed")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    let (a, b, c) = (id(10), id(11), id(12));
+    s.set(&a, "k", &v, Some(b"/d/a"))?;
+    s.set(&b, "k", &v, Some(b"/d/b"))?;
+    s.set(&c, "k", &v, None)?; // no hint: cannot be found by path
+    assert_eq!(s.removed(b"/d/nothing-here", None)?, 0);
+    assert_eq!(s.removed(b"/d/a", None)?, 1);
+    assert_eq!(s.get(&a, "k")?, None);
+    assert_eq!(s.path_hint(&a)?, None);
+    assert!(s.get(&b, "k")?.is_some(), "other files keep their metadata");
+    // The same file still at the path (e.g. another hard link removed): kept, even
+    // with another btime in the request (btime is not part of the key).
+    let mut b_now = b.clone();
+    b_now.btime_nsec = 0;
+    assert_eq!(s.removed(b"/d/b", Some(&b_now))?, 0);
+    assert!(s.get(&b, "k")?.is_some());
+    // A new file at the path: the old one is dropped, the new one is not touched.
+    assert_eq!(s.removed(b"/d/b", Some(&c))?, 1);
+    assert_eq!(s.get(&b, "k")?, None);
+    assert!(s.get(&c, "k")?.is_some());
+    Ok(())
+}
+
+#[test]
+fn moved_rewrites_hints_and_drops_replaced_files() -> Result<()> {
+    let t = TestStore::new("moved")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    let (file, dir, child, deep, sibling, target) = (id(1), id(2), id(3), id(4), id(5), id(6));
+    s.set(&file, "k", &v, Some(b"/a/file"))?;
+    s.set(&dir, "k", &v, Some(b"/a/dir"))?;
+    s.set(&child, "k", &v, Some(b"/a/dir/child"))?;
+    s.set(&deep, "k", &v, Some(b"/a/dir/sub/deep"))?;
+    s.set(&sibling, "k", &v, Some(b"/a/dir2/x"))?; // shares the prefix, not below dir/
+    s.set(&target, "k", &v, Some(b"/b/file"))?;
+    // A file renamed over another one: its hint moves, the replaced file is dropped.
+    assert_eq!(s.moved(b"/a/file", b"/b/file", &file)?, (1, 1));
+    assert_eq!(s.path_hint(&file)?, Some(b"/b/file".to_vec()));
+    assert!(
+        s.get(&file, "k")?.is_some(),
+        "metadata follows the identity"
+    );
+    assert_eq!(s.get(&target, "k")?, None);
+    // A directory: itself and everything below it, nothing beside it.
+    assert_eq!(s.moved(b"/a/dir", b"/c/renamed", &dir)?, (3, 0));
+    assert_eq!(s.path_hint(&dir)?, Some(b"/c/renamed".to_vec()));
+    assert_eq!(s.path_hint(&child)?, Some(b"/c/renamed/child".to_vec()));
+    assert_eq!(s.path_hint(&deep)?, Some(b"/c/renamed/sub/deep".to_vec()));
+    assert_eq!(s.path_hint(&sibling)?, Some(b"/a/dir2/x".to_vec()));
+    // A file without metadata gets no hint row.
+    assert_eq!(s.moved(b"/x/plain", b"/y/plain", &id(99))?, (0, 0));
+    assert_eq!(s.path_hint(&id(99))?, None);
+    // Then a delete at the new path finds it.
+    assert_eq!(s.removed(b"/c/renamed/child", None)?, 1);
+    assert_eq!(s.get(&child, "k")?, None);
+    Ok(())
+}
+
+#[test]
+fn hint_paths_are_bytes_not_text() -> Result<()> {
+    let t = TestStore::new("bytes")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    let a = id(7);
+    s.set(&a, "k", &v, Some(b"/d/\xff\xfe/f"))?;
+    assert_eq!(s.moved(b"/d/\xff\xfe", b"/e/\xc3", &id(8))?, (1, 0));
+    assert_eq!(s.path_hint(&a)?, Some(b"/e/\xc3/f".to_vec()));
+    assert_eq!(s.removed(b"/e/\xc3/f", None)?, 1);
+    Ok(())
+}
+
+/// Review: the key is the inode, not the name. Deleting (or renaming over) one of several
+/// hard links must not drop the metadata the other links still show.
+#[test]
+fn deleting_one_of_several_hard_links_keeps_the_metadata() -> Result<()> {
+    let t = TestStore::new("hardlink")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    let (linked, single, over) = (id(20), id(21), id(22));
+    s.set_linked(&linked, "k", &v, Some((b"/d/a", 2)))?;
+    s.set_linked(&single, "k", &v, Some((b"/d/b", 1)))?;
+    s.set_linked(&over, "k", &v, Some((b"/d/c", 3)))?;
+    assert_eq!(s.removed(b"/d/a", None)?, 0);
+    assert!(
+        s.get(&linked, "k")?.is_some(),
+        "the other link lost its metadata"
+    );
+    assert_eq!(s.path_hint(&linked)?, None, "the outdated hint stays");
+    assert_eq!(s.removed(b"/d/b", None)?, 1);
+    assert_eq!(s.get(&single, "k")?, None);
+    // Renamed over: same rule.
+    assert_eq!(s.moved(b"/d/new", b"/d/c", &id(23))?, (0, 0));
+    assert!(s.get(&over, "k")?.is_some());
+    assert_eq!(s.path_hint(&over)?, None);
+    Ok(())
+}
+
+/// Review: a directory with more than 4096 hinted files below it. Every hint follows the
+/// rename (a stale one would let a later delete at the old path drop the moved file's
+/// metadata), in one transaction, and the paths stay BLOBs (byte ranges still match).
+#[test]
+fn moved_rewrites_every_hint_below_a_large_directory() -> Result<()> {
+    const N: u64 = 5000;
+    let t = TestStore::new("bigmove")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    for i in 0..N {
+        let p = format!("/big/dir/sub/f{i}\u{e9}");
+        s.set(&id(1000 + i), "k", &v, Some(p.as_bytes()))?;
+    }
+    let t0 = Instant::now();
+    let (rewritten, forgotten) = s.moved(b"/big/dir", b"/big/moved", &id(1))?;
+    let took = t0.elapsed();
+    eprintln!("moved {N} hints in {took:?}");
+    assert_eq!((rewritten, forgotten), (u32::try_from(N).unwrap_or(0), 0));
+    for i in [0, 4095, 4096, N - 1] {
+        let want = format!("/big/moved/sub/f{i}\u{e9}");
+        assert_eq!(s.path_hint(&id(1000 + i))?, Some(want.into_bytes()));
+    }
+    // Still found by the byte-range and equality lookups.
+    assert_eq!(
+        s.moved(b"/big/moved", b"/big/again", &id(1))?.0,
+        u32::try_from(N).unwrap_or(0)
+    );
+    let last = format!("/big/again/sub/f{}\u{e9}", N - 1);
+    assert_eq!(s.removed(last.as_bytes(), None)?, 1);
+    Ok(())
+}
+
+/// A milestone 5 database (path_hint without `links`) opens and gains the column.
+#[test]
+fn milestone_5_database_gains_the_link_count() -> Result<()> {
+    let t = TestStore::new("m5schema")?;
+    if let Some(dir) = t.path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    }
+    {
+        let c = Connection::open(&t.path)?;
+        c.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE path_hint (fs_uuid TEXT NOT NULL, subvol_id INTEGER NOT NULL,
+               inode_num INTEGER NOT NULL, generation INTEGER NOT NULL, path BLOB NOT NULL,
+               updated INTEGER NOT NULL,
+               PRIMARY KEY (fs_uuid, subvol_id, inode_num, generation)) WITHOUT ROWID;
+             INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) VALUES ('0123abcd-0000-4000-8000-00000000beef', 256, 30, 3,
+               x'2f642f6f6c64', 0);",
+        )?;
+    }
+    let mut s = t.open()?;
+    let v = enc(&Value::String("x".into()));
+    s.set(&id(30), "k", &v, None)?;
+    assert_eq!(s.removed(b"/d/old", None)?, 1, "old rows count as one link");
+    drop(s);
+    drop(t.open()?); // and opens again with the column present
     Ok(())
 }

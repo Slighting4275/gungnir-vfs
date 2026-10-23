@@ -12,10 +12,18 @@
 //!
 //! Requests (client -> daemon, slot `kind`): identify `path bytes` | get `identity key` |
 //! set `identity key value` | unset `identity key` | list `identity cursor-key` (the
-//! cursor may be empty: keys strictly after it, in byte order). A payload must be consumed
-//! exactly. Every request gets one [`MSG_MD_REPLY`] with the request's `seq`:
-//! `status u32 | body`; bodies on [`ST_OK`]: identify -> identity, get -> value,
-//! list -> `more u8 | count u16 | count x key`, set and unset -> empty.
+//! cursor may be empty: keys strictly after it, in byte order) | removed `path bytes` |
+//! moved `src path16 | dest path16` (milestone 6; a `path16` is `len u16 | bytes`). A
+//! payload must be consumed exactly. Every request gets one [`MSG_MD_REPLY`] with the
+//! request's `seq`: `status u32 | body`; bodies on [`ST_OK`]: identify -> identity, get ->
+//! value, list -> `more u8 | count u16 | count x key`, set and unset -> empty, removed ->
+//! `forgotten u32`, moved -> `rewritten u32 | forgotten u32`.
+//!
+//! removed and moved report a deletion or rename that already happened (GIO's
+//! `local_file_removed` / `local_file_moved`). Metadata is keyed by identity, so a rename
+//! keeps it; these only maintain `path_hint` and drop the rows of files that are gone.
+//! They are new message kinds, not a layout change: protocol v2 stays, and an M5 daemon
+//! answers them with [`ST_UNSUPPORTED`].
 
 use std::{
     io::{self, Write},
@@ -35,6 +43,8 @@ pub const MSG_MD_GET: u32 = 17;
 pub const MSG_MD_SET: u32 = 18;
 pub const MSG_MD_UNSET: u32 = 19;
 pub const MSG_MD_LIST: u32 = 20;
+pub const MSG_MD_REMOVED: u32 = 21;
+pub const MSG_MD_MOVED: u32 = 22;
 pub const MSG_MD_REPLY: u32 = 32;
 
 pub const ST_OK: u32 = 0;
@@ -402,6 +412,18 @@ pub enum Request {
     Unset(Ident, String),
     /// Keys strictly after the cursor (empty: from the start).
     List(Ident, String),
+    /// The file at this path was deleted.
+    Removed(Vec<u8>),
+    /// The file at `src` was renamed to `dest`.
+    Moved(Vec<u8>, Vec<u8>),
+}
+
+/// An absolute path without NUL.
+fn check_path(p: &[u8]) -> std::result::Result<(), MdError> {
+    if p.first() != Some(&b'/') || p.contains(&0) {
+        return Err(MdError::BadRequest);
+    }
+    Ok(())
 }
 
 impl Request {
@@ -412,12 +434,24 @@ impl Request {
     pub fn parse(kind: u32, payload: &[u8]) -> std::result::Result<Self, MdError> {
         let mut r = Reader(payload);
         let req = match kind {
-            MSG_MD_IDENTIFY => {
+            MSG_MD_IDENTIFY | MSG_MD_REMOVED => {
                 let p = r.rest();
-                if p.first() != Some(&b'/') || p.contains(&0) {
+                check_path(p)?;
+                if kind == MSG_MD_IDENTIFY {
+                    Request::Identify(p.to_vec())
+                } else {
+                    Request::Removed(p.to_vec())
+                }
+            }
+            MSG_MD_MOVED => {
+                let src = r.blob16()?;
+                let dest = r.blob16()?;
+                check_path(src)?;
+                check_path(dest)?;
+                if src == dest {
                     return Err(MdError::BadRequest);
                 }
-                Request::Identify(p.to_vec())
+                Request::Moved(src.to_vec(), dest.to_vec())
             }
             MSG_MD_GET => Request::Get(r.ident()?, r.key()?),
             MSG_MD_SET => {
@@ -477,6 +511,23 @@ impl Request {
                 put_ident(&mut out, id)?;
                 put_key(&mut out, cursor)?;
                 MSG_MD_LIST
+            }
+            Request::Removed(p) => {
+                if p.len() > PAYLOAD_MAX {
+                    return Err(MdError::BadRequest);
+                }
+                out.extend_from_slice(p);
+                MSG_MD_REMOVED
+            }
+            Request::Moved(src, dest) => {
+                if 4 + src.len() + dest.len() > PAYLOAD_MAX {
+                    return Err(MdError::BadRequest);
+                }
+                for p in [src, dest] {
+                    out.extend_from_slice(&(p.len() as u16).to_le_bytes());
+                    out.extend_from_slice(p);
+                }
+                MSG_MD_MOVED
             }
         };
         Ok((kind, out))
@@ -698,6 +749,35 @@ impl Client {
             .map(drop)
     }
 
+    /// Report a deleted file; returns how many identities' metadata was dropped.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn removed(&mut self, path: &Path) -> ClientResult<u32> {
+        use std::os::unix::ffi::OsStrExt;
+        let body = self.call(&Request::Removed(path.as_os_str().as_bytes().to_vec()))?;
+        let mut r = Reader(&body);
+        let n = r.u32()?;
+        r.end()?;
+        Ok(n)
+    }
+
+    /// Report a rename; returns `(path hints rewritten, identities dropped)`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn moved(&mut self, src: &Path, dest: &Path) -> ClientResult<(u32, u32)> {
+        use std::os::unix::ffi::OsStrExt;
+        let body = self.call(&Request::Moved(
+            src.as_os_str().as_bytes().to_vec(),
+            dest.as_os_str().as_bytes().to_vec(),
+        ))?;
+        let mut r = Reader(&body);
+        let v = (r.u32()?, r.u32()?);
+        r.end()?;
+        Ok(v)
+    }
+
     /// Every key of the file, following the pagination.
     ///
     /// # Errors
@@ -753,6 +833,8 @@ mod tests {
             Request::Unset(id(), "k".into()),
             Request::List(id(), String::new()),
             Request::List(id(), "after".into()),
+            Request::Removed(b"/gone".to_vec()),
+            Request::Moved(b"/a/old".to_vec(), b"/b/new".to_vec()),
         ];
         for r in reqs {
             let (kind, p) = r.encode()?;
@@ -790,6 +872,22 @@ mod tests {
             Request::parse(MSG_MD_IDENTIFY, b"relative"),
             Err(MdError::BadRequest)
         );
+        assert_eq!(
+            Request::parse(MSG_MD_REMOVED, b"/a\0b"),
+            Err(MdError::BadRequest)
+        );
+        let moved = |s: &[u8], d: &[u8]| {
+            Request::Moved(s.to_vec(), d.to_vec())
+                .encode()
+                .map(|(k, p)| Request::parse(k, &p))
+        };
+        assert_eq!(moved(b"/same", b"/same")?, Err(MdError::BadRequest));
+        assert_eq!(moved(b"rel", b"/d")?, Err(MdError::BadRequest));
+        assert_eq!(moved(b"/s", b"")?, Err(MdError::BadRequest));
+        assert_eq!(
+            Request::Moved(vec![b'/'; PAYLOAD_MAX / 2], vec![b'/'; PAYLOAD_MAX / 2]).encode(),
+            Err(MdError::BadRequest)
+        );
         let (k, mut p) = Request::Get(id(), "k".into()).encode()?;
         p.push(0);
         assert_eq!(Request::parse(k, &p), Err(MdError::BadRequest));
@@ -812,6 +910,10 @@ mod tests {
         .encode()?;
         for n in 0..p.len() {
             assert!(Request::parse(kind, &p[..n]).is_err(), "prefix {n}");
+        }
+        let (kind, p) = Request::Moved(b"/a".to_vec(), b"/b/c".to_vec()).encode()?;
+        for n in 0..p.len() {
+            assert!(Request::parse(kind, &p[..n]).is_err(), "moved prefix {n}");
         }
         Ok(())
     }

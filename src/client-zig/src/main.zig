@@ -1,8 +1,11 @@
 const std = @import("std");
 const c = @import("c"); // translated GIO headers, see build.zig
 const ipc = @import("ipc.zig");
-/// Metadata client API (milestone 5); GIO metadata::* wiring follows in milestone 6.
+const link = @import("link.zig");
+/// Metadata client API (milestone 5).
 pub const md = @import("md.zig");
+/// GIO metadata::* attributes on top of it (milestone 6).
+const gmeta = @import("gmeta.zig");
 
 /// Root panic handler: log through GLib, then terminate the whole process.
 pub const panic = std.debug.FullPanic(gungnirPanic);
@@ -32,68 +35,13 @@ const extension_points = [_][*c]const u8{ c.G_VFS_EXTENSION_POINT_NAME, null };
 
 // ---- GungnirVfs: dynamic GVfs subclass --------------------------------------
 
-// ---- daemon connection (milestone 3) ----------------------------------------
-// The first GungnirVfs instance starts one "gungnir-connect" GThread that connects to
-// gungnird, exchanges hellos, maps the ring pair and round-trips a ping, all bounded by
-// connect_timeout_ms. The GIO calling thread never touches the socket, so a missing or
-// hung daemon cannot block it; every vfunc keeps delegating to the local VFS meanwhile.
-
-/// Budget for connect + hello + ring setup + first ping, on the connector thread.
-pub const connect_timeout_ms: u32 = 500;
-
-/// Values of the read-only GungnirVfs:daemon-state property. Plain integers, not an
-/// enum: the enum<->int builtins are being renamed on Zig master.
-pub const state_connecting: c_int = 0;
-pub const state_connected: c_int = 1;
-pub const state_unavailable: c_int = 2;
-
-var daemon_state: c_int = state_connecting;
-var connector_started: u32 = 0;
-var connector_thread: ?*c.GThread = null;
-var daemon_conn: ?ipc.Conn = null;
-var socket_path: ipc.SocketPath = .{};
-
-fn setState(state: c_int) void {
-    @atomicStore(c_int, &daemon_state, state, .release);
-}
-
-fn envValue(name: [*:0]const u8) ?[]const u8 {
-    const v = c.g_getenv(name);
-    return if (v == null) null else std.mem.span(v);
-}
-
-fn connectorMain(data: c.gpointer) callconv(.c) c.gpointer {
-    _ = data;
-    if (ipc.connectAndPing(&socket_path, connect_timeout_ms)) |conn| {
-        daemon_conn = conn; // published by the release store in setState
-        setState(state_connected);
-        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon handshake ok on %s", &socket_path.buf);
-    } else |err| {
-        setState(state_unavailable);
-        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon unavailable (%s), using the local VFS", @errorName(err).ptr);
-    }
-    return null;
-}
-
-/// Called from instance_init on the GIO calling thread: reads the environment (cheap,
-/// never blocks), then hands everything else to the connector thread. Starts at most once.
-fn startConnector() void {
-    if (@cmpxchgStrong(u32, &connector_started, 0, 1, .acq_rel, .monotonic) != null) return;
-    socket_path = ipc.resolveSocketPath(envValue("GUNGNIR_SOCKET"), envValue("XDG_RUNTIME_DIR"), envValue("HOME")) catch |err| {
-        setState(state_unavailable);
-        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: no daemon socket path (%s)", @errorName(err).ptr);
-        return;
-    };
-    var err: [*c]c.GError = null;
-    connector_thread = c.g_thread_try_new("gungnir-connect", &connectorMain, null, &err);
-    if (connector_thread == null) {
-        setState(state_unavailable);
-        if (err != null) {
-            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir: cannot start connector thread: %s", err.*.message);
-            c.g_error_free(err);
-        }
-    }
-}
+// Daemon connection (milestone 3, shared by the metadata hooks since milestone 6): see
+// link.zig. The vfuncs below keep delegating files to the local VFS whatever the daemon
+// does; only the metadata::* hooks (gmeta.zig) talk to it, each within a short deadline.
+pub const connect_timeout_ms = link.connect_timeout_ms;
+pub const state_connecting = link.state_connecting;
+pub const state_connected = link.state_connected;
+pub const state_unavailable = link.state_unavailable;
 
 /// Instance struct. No private state yet.
 const GungnirVfs = extern struct {
@@ -143,18 +91,71 @@ fn parseName(vfs: [*c]c.GVfs, parse_name: [*c]const u8) callconv(.c) ?*c.GFile {
     return c.g_vfs_parse_name(c.g_vfs_get_local(), parse_name);
 }
 
+// The private GVfsClass hooks GLocalFile calls on the default VFS (glocalfileinfo.c,
+// glocalfile.c; the same ones gvfs's GDaemonVfs implements). Only called while
+// GungnirVfs is the default VFS, i.e. with GIO_USE_VFS=gungnir.
+
+/// Allocator for the hooks' own temporaries (GLib copies whatever it keeps).
+const hook_gpa = std.heap.c_allocator;
+
+fn localFileAddInfo(
+    vfs: [*c]c.GVfs,
+    filename: [*c]const u8,
+    device: c.guint64,
+    matcher: ?*c.GFileAttributeMatcher,
+    info: ?*c.GFileInfo,
+    cancellable: [*c]c.GCancellable,
+    extra_data: [*c]c.gpointer,
+    free_extra_data: [*c]c.GDestroyNotify,
+) callconv(.c) void {
+    _ = vfs;
+    _ = device;
+    _ = cancellable;
+    _ = extra_data; // per-directory cache slot during enumeration; unused
+    _ = free_extra_data;
+    gmeta.addInfo(hook_gpa, filename, matcher, info);
+}
+
+fn addWritableNamespaces(vfs: [*c]c.GVfs, list: [*c]c.GFileAttributeInfoList) callconv(.c) void {
+    _ = vfs;
+    gmeta.addWritableNamespaces(list);
+}
+
+fn localFileSetAttributes(
+    vfs: [*c]c.GVfs,
+    filename: [*c]const u8,
+    info: ?*c.GFileInfo,
+    flags: c.GFileQueryInfoFlags,
+    cancellable: [*c]c.GCancellable,
+    err: [*c][*c]c.GError,
+) callconv(.c) c.gboolean {
+    _ = vfs;
+    _ = flags; // a symlink is always identified as itself (as gvfs keys it by its path)
+    return gmeta.setAttributes(filename, info, cancellable, err);
+}
+
+fn localFileRemoved(vfs: [*c]c.GVfs, filename: [*c]const u8) callconv(.c) void {
+    _ = vfs;
+    gmeta.fileRemoved(filename);
+}
+
+fn localFileMoved(vfs: [*c]c.GVfs, source: [*c]const u8, dest: [*c]const u8) callconv(.c) void {
+    _ = vfs;
+    gmeta.fileMoved(source, dest);
+}
+
 const prop_daemon_state: c.guint = 1;
 
 fn getProperty(object: [*c]c.GObject, prop_id: c.guint, value: [*c]c.GValue, pspec: [*c]c.GParamSpec) callconv(.c) void {
     _ = object;
     _ = pspec;
-    if (prop_id == prop_daemon_state) c.g_value_set_int(value, @atomicLoad(c_int, &daemon_state, .acquire));
+    if (prop_id == prop_daemon_state) c.g_value_set_int(value, link.state());
 }
 
 fn instanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callconv(.c) void {
     _ = instance;
     _ = g_class;
-    startConnector();
+    link.start();
 }
 
 fn classInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
@@ -167,6 +168,11 @@ fn classInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
     vfs_class.get_file_for_uri = &getFileForUri;
     vfs_class.get_supported_uri_schemes = &getSupportedUriSchemes;
     vfs_class.parse_name = &parseName;
+    vfs_class.local_file_add_info = &localFileAddInfo;
+    vfs_class.add_writable_namespaces = &addWritableNamespaces;
+    vfs_class.local_file_set_attributes = &localFileSetAttributes;
+    vfs_class.local_file_removed = &localFileRemoved;
+    vfs_class.local_file_moved = &localFileMoved;
     const object_class: *c.GObjectClass = &vfs_class.parent_class;
     object_class.get_property = &getProperty;
     c.g_object_class_install_property(object_class, prop_daemon_state, c.g_param_spec_int(
@@ -215,14 +221,7 @@ pub export fn g_io_module_load(module: *c.GIOModule) void {
 
 pub export fn g_io_module_unload(module: *c.GIOModule) void {
     _ = module;
-    // Only reached once no GungnirVfs instance is alive. The join is bounded by
-    // connect_timeout_ms, and the thread must not outlive the module's code.
-    if (connector_thread) |t| _ = c.g_thread_join(t);
-    connector_thread = null;
-    if (daemon_conn) |*conn| conn.close();
-    daemon_conn = null;
-    setState(state_connecting);
-    @atomicStore(u32, &connector_started, 0, .release);
+    link.shutdown();
 }
 
 /// GIO takes ownership of the result and frees it with g_strfreev(),
@@ -245,10 +244,12 @@ test "priority stays below local (0) and gvfs (10)" {
 test {
     _ = ipc;
     _ = md;
+    _ = link;
+    _ = gmeta;
 }
 
 test "daemon state starts as connecting" {
-    try std.testing.expectEqual(state_connecting, @atomicLoad(c_int, &daemon_state, .acquire));
+    try std.testing.expectEqual(state_connecting, link.state());
 }
 
 test "allocator-backed structures do not leak" {

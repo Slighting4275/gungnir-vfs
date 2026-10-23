@@ -557,6 +557,7 @@ impl Backend for Stall {
             generation: 0,
             btime_sec: 0,
             btime_nsec: 0,
+            nlink: 1,
             fs_uuid_source: UuidSource::Synthetic,
         })
     }

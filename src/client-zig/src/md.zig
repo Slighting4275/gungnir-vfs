@@ -1,7 +1,8 @@
-//! Metadata client API (protocol v2, milestone 5). Mirrors src/daemon-rust/src/md.rs;
+//! Metadata client API (protocol v2, milestones 5 and 6). Mirrors src/daemon-rust/src/md.rs;
 //! keep both in sync. Requests travel in ring slots; every call waits for its reply on
-//! the daemon->client ring with a deadline, never longer. GIO attribute wiring (the
-//! metadata::* namespace) comes in milestone 6; this is the transport underneath it.
+//! the daemon->client ring with a deadline, never longer, and notices a stopped daemon
+//! (closed control socket) within `liveness_slice_ms`. The GIO metadata::* wiring on top
+//! of it is gmeta.zig.
 //!
 //! A Client is not thread-safe: one request at a time per connection.
 //! error.NoSuchFile from set or unset (and nothing from get) can also mean the identity is
@@ -16,6 +17,8 @@ pub const msg_get: u32 = 17;
 pub const msg_set: u32 = 18;
 pub const msg_unset: u32 = 19;
 pub const msg_list: u32 = 20;
+pub const msg_removed: u32 = 21;
+pub const msg_moved: u32 = 22;
 pub const msg_reply: u32 = 32;
 
 pub const st_ok: u32 = 0;
@@ -249,23 +252,41 @@ fn decodeValue(gpa: Allocator, body: []const u8) Error!Value {
 
 // ---- client -----------------------------------------------------------------
 
+/// While waiting for a reply, the control socket is re-checked this often, so a daemon
+/// that stops mid-request costs at most this long, not the whole deadline.
+pub const liveness_slice_ms: u64 = 20;
+
 pub const Client = struct {
     /// Borrowed; the connection must outlive the client.
     conn: *ipc.Conn,
     seq: u64 = 1 << 32, // clear of the handshake ping's seq
     /// Upper bound for one request's round trip.
     timeout_ms: u32 = 1000,
+    /// Absolute CLOCK_MONOTONIC deadline (ns) shared by a series of requests, e.g. all the
+    /// round trips of one GIO call; 0 for none. The earlier of this and `timeout_ms` wins.
+    deadline_ns: u64 = 0,
 
     /// Send one request and wait for its reply. Returns the body (a slice of `reply`)
     /// on st_ok, else the status as an error. Replies to earlier, timed-out requests
-    /// are skipped.
+    /// are skipped. error.DaemonAbsent: the daemon closed the connection.
     fn call(c: *Client, kind: u32, payload: []const u8, reply: *ipc.Msg) Error![]const u8 {
+        const own = nowNs() + @as(u64, c.timeout_ms) * std.time.ns_per_ms;
+        const deadline = if (c.deadline_ns != 0) @min(own, c.deadline_ns) else own;
+        if (nowNs() >= deadline) return error.Timeout;
+        if (!c.conn.alive()) return error.DaemonAbsent;
         c.seq +%= 1;
         const seq = c.seq;
-        const deadline = nowNs() + @as(u64, c.timeout_ms) * std.time.ns_per_ms;
         try c.conn.shm.push(ipc.ring_c2d, kind, seq, payload);
         while (true) {
-            try c.conn.shm.waitReadable(ipc.ring_d2c, deadline);
+            const slice_end = @min(deadline, nowNs() + liveness_slice_ms * std.time.ns_per_ms);
+            c.conn.shm.waitReadable(ipc.ring_d2c, slice_end) catch |err| switch (err) {
+                error.Timeout => {
+                    if (nowNs() >= deadline) return error.Timeout;
+                    if (!c.conn.alive()) return error.DaemonAbsent;
+                    continue;
+                },
+                else => return err,
+            };
             while (try c.conn.shm.pop(ipc.ring_d2c)) |m| {
                 if (m.seq != seq) continue;
                 if (m.kind != msg_reply) return error.Protocol;
@@ -280,7 +301,7 @@ pub const Client = struct {
 
     /// Identify an absolute path (a symlink is identified as itself).
     pub fn identify(c: *Client, path: []const u8) Error!Identity {
-        if (path.len == 0 or path[0] != '/' or std.mem.findScalar(u8, path, 0) != null) return error.BadRequest;
+        try checkPath(path);
         if (path.len > ipc.payload_max) return error.PathTooLong;
         var reply: ipc.Msg = undefined;
         var r: Reader = .{ .rest = try c.call(msg_identify, path, &reply) };
@@ -341,6 +362,36 @@ pub const Client = struct {
         _ = try c.call(msg_unset, w.slice(), &reply);
     }
 
+    /// Report that the file at `path` was deleted (GIO's local_file_removed); the daemon
+    /// drops the metadata of the files last seen there. Returns how many it dropped.
+    pub fn removed(c: *Client, path: []const u8) Error!u32 {
+        try checkPath(path);
+        if (path.len > ipc.payload_max) return error.PathTooLong;
+        var reply: ipc.Msg = undefined;
+        var r: Reader = .{ .rest = try c.call(msg_removed, path, &reply) };
+        const n = try r.int(u32);
+        try r.end();
+        return n;
+    }
+
+    pub const Moved = struct { rewritten: u32, forgotten: u32 };
+
+    /// Report that `src` was renamed to `dest` (GIO's local_file_moved). Metadata is keyed
+    /// by identity and stays with the file; the daemon updates its path hints.
+    pub fn moved(c: *Client, src: []const u8, dest: []const u8) Error!Moved {
+        try checkPath(src);
+        try checkPath(dest);
+        if (std.mem.eql(u8, src, dest)) return error.BadRequest;
+        var w: Writer = .{};
+        w.blob16(src) catch return error.PathTooLong;
+        w.blob16(dest) catch return error.PathTooLong;
+        var reply: ipc.Msg = undefined;
+        var r: Reader = .{ .rest = try c.call(msg_moved, w.slice(), &reply) };
+        const out: Moved = .{ .rewritten = try r.int(u32), .forgotten = try r.int(u32) };
+        try r.end();
+        return out;
+    }
+
     /// Every key of the file in byte order, following the daemon's pagination. Free the
     /// result with freeKeys.
     pub fn listKeys(c: *Client, gpa: Allocator, id: *const Identity) Error![][]u8 {
@@ -377,7 +428,12 @@ pub const Client = struct {
     }
 };
 
-fn nowNs() u64 {
+/// An absolute path without NUL.
+fn checkPath(path: []const u8) Error!void {
+    if (path.len == 0 or path[0] != '/' or std.mem.findScalar(u8, path, 0) != null) return error.BadRequest;
+}
+
+pub fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
     if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -430,6 +486,43 @@ test "client-side limits" {
     try std.testing.expectEqual(st_unsupported, @as(u32, 13));
     try std.testing.expectEqual(error.Busy, statusError(st_busy));
     try std.testing.expectEqual(error.Protocol, statusError(1000));
+}
+
+test "moved and removed requests" {
+    var buf: [ipc.shm_size]u8 align(4096) = undefined;
+    const shm: ipc.Shm = .{ .mem = &buf };
+    shm.initHeader();
+    var fds: [2]i32 = undefined;
+    const linux = std.os.linux;
+    try std.testing.expectEqual(@as(usize, 0), linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var conn: ipc.Conn = .{ .fd = fds[0], .shm = shm };
+    var client: Client = .{ .conn = &conn, .timeout_ms = 30 };
+    // Refused before anything is sent.
+    try std.testing.expectError(error.BadRequest, client.removed("relative"));
+    try std.testing.expectError(error.BadRequest, client.moved("/a", "/a"));
+    try std.testing.expectError(error.BadRequest, client.moved("/a", "b"));
+    const long: [ipc.payload_max]u8 = @splat('/');
+    try std.testing.expectError(error.PathTooLong, client.moved(&long, "/b"));
+    try std.testing.expect((try shm.pop(ipc.ring_c2d)) == null);
+    // Sent with the documented layout; nobody answers: a bounded timeout.
+    try std.testing.expectError(error.Timeout, client.moved("/a", "/bc"));
+    const m = (try shm.pop(ipc.ring_c2d)).?;
+    try std.testing.expectEqual(msg_moved, m.kind);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, '/', 'a', 3, 0, '/', 'b', 'c' }, m.payload());
+    // A spent shared deadline fails at once, without sending.
+    client.deadline_ns = 1;
+    try std.testing.expectError(error.Timeout, client.removed("/x"));
+    try std.testing.expect((try shm.pop(ipc.ring_c2d)) == null);
+    // The daemon hangs up: noticed without waiting for the deadline.
+    client.deadline_ns = 0;
+    client.timeout_ms = 10_000;
+    _ = linux.close(fds[1]);
+    fds[1] = -1;
+    const t0 = nowNs();
+    try std.testing.expectError(error.DaemonAbsent, client.removed("/x"));
+    try std.testing.expect(nowNs() - t0 < 100 * std.time.ns_per_ms);
 }
 
 test "a maximal set request fits one slot" {

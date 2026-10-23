@@ -387,3 +387,81 @@ fn only_identify_drops_stale_rows() -> R {
     );
     Ok(())
 }
+
+/// Milestone 6: GIO reports renames and deletes after the fact (`local_file_moved`,
+/// `local_file_removed`); metadata stays keyed by identity, the hints follow.
+#[test]
+fn moved_and_removed_over_the_wire() -> R {
+    let d = Daemon::start("mv")?;
+    let mut c = d.client()?;
+    let src = d.file("before")?;
+    let id = c.identify(&src)?;
+    let s = Value::String("spear".into());
+    c.set(&id, "k", &s)?;
+
+    let dest = d.dir.0.join("after");
+    fs::rename(&src, &dest)?;
+    assert_eq!(c.moved(&src, &dest)?, (1, 0));
+    assert_eq!(c.identify(&dest)?, id, "a rename keeps the identity");
+    assert_eq!(c.get(&id, "k")?, Some(s));
+    let store = Store::open(&d.db, StoreConfig::default())?;
+    assert_eq!(
+        store.path_hint(&id)?.as_deref(),
+        Some(dest.as_os_str().as_encoded_bytes())
+    );
+
+    // A rename whose destination is gone by now: a clean error, nothing changes.
+    let gone = d.dir.0.join("gone");
+    assert_eq!(status(c.moved(&dest, &gone)), Some(MdError::NoSuchFile));
+
+    // Delete reported while the file still exists (not really deleted): kept.
+    assert_eq!(c.removed(&dest)?, 0);
+    assert!(c.get(&id, "k")?.is_some());
+    fs::remove_file(&dest)?;
+    assert_eq!(c.removed(&dest)?, 1);
+    assert_eq!(c.get(&id, "k")?, None);
+    assert_eq!(store.path_hint(&id)?, None);
+    // Malformed: relative path, same source and destination.
+    assert_eq!(
+        status(c.raw_call(md::MSG_MD_REMOVED, b"relative")),
+        Some(MdError::BadRequest)
+    );
+    let mut p = Vec::new();
+    for _ in 0..2 {
+        p.extend_from_slice(&2u16.to_le_bytes());
+        p.extend_from_slice(b"/x");
+    }
+    assert_eq!(
+        status(c.raw_call(md::MSG_MD_MOVED, &p)),
+        Some(MdError::BadRequest)
+    );
+    Ok(())
+}
+
+/// Review: the key is the inode. Deleting one of two hard links through GIO must keep the
+/// metadata that the other link still shows (the remove used to go by path only).
+#[test]
+fn deleting_one_hard_link_keeps_the_metadata_of_the_other() -> R {
+    let d = Daemon::start("hardlink")?;
+    let mut c = d.client()?;
+    let a = d.file("a")?;
+    let b = d.dir.0.join("b");
+    fs::hard_link(&a, &b)?;
+    let id = c.identify(&a)?;
+    let s = Value::String("spear".into());
+    c.set(&id, "k", &s)?;
+    fs::remove_file(&a)?;
+    assert_eq!(c.removed(&a)?, 0);
+    assert_eq!(c.identify(&b)?, id, "the other link is the same file");
+    assert_eq!(
+        c.get(&id, "k")?,
+        Some(s),
+        "metadata of a live file was dropped"
+    );
+    // The last link: gone with it (set again through b, which has one link now).
+    c.set(&id, "k", &Value::String("again".into()))?;
+    fs::remove_file(&b)?;
+    assert_eq!(c.removed(&b)?, 1);
+    assert_eq!(c.get(&id, "k")?, None);
+    Ok(())
+}
