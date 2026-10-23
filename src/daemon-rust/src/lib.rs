@@ -5,6 +5,7 @@ use std::{
 
 use rusqlite::Connection;
 
+pub mod fsid;
 pub mod ipc;
 
 /// Scratch directories for tests, under `<repo>/.build/tmp` (AGENTS.md §3: never /tmp).
@@ -191,6 +192,7 @@ pub enum Error {
     InsecureSocketDir(PathBuf),
     Protocol(&'static str),
     RingFull,
+    Fsid(fsid::FsidError),
 }
 
 impl fmt::Display for Error {
@@ -216,6 +218,7 @@ impl fmt::Display for Error {
             ),
             Error::Protocol(what) => write!(f, "protocol: {what}"),
             Error::RingFull => write!(f, "ring full"),
+            Error::Fsid(e) => write!(f, "fsid: {e}"),
         }
     }
 }
@@ -225,6 +228,12 @@ impl std::error::Error for Error {}
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+impl From<fsid::FsidError> for Error {
+    fn from(e: fsid::FsidError) -> Self {
+        Error::Fsid(e)
     }
 }
 
