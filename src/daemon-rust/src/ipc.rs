@@ -1,6 +1,7 @@
-//! Control plane, protocol v1 (AGENTS.md §1.B "Handshake protocol v1"): an `AF_UNIX`
+//! Control plane, protocol v2 (AGENTS.md §1.B "Handshake protocol"): an `AF_UNIX`
 //! stream socket for setup, one memfd holding an SPSC ring pair, process-shared futex
 //! wakeups. The layout is mirrored in `src/client-zig/src/ipc.zig`; keep both in sync.
+//! v2 (milestone 5) widened the slots to carry metadata requests (`md.rs`).
 
 use std::{
     ffi::OsStr,
@@ -19,8 +20,8 @@ use std::{
     path::{Path, PathBuf},
     ptr::{self, NonNull},
     sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -30,7 +31,9 @@ use crate::{Error, Result};
 
 /// `b"GNGR"` read as a little-endian u32. Starts every frame and the shared-memory header.
 pub const MAGIC: u32 = 0x5247_4E47;
-pub const VERSION: u16 = 1;
+/// Bumped for every layout change; a client speaking another version gets a reject
+/// frame with [`STATUS_BAD_VERSION`] and no ring.
+pub const VERSION: u16 = 2;
 pub const KIND_HELLO: u16 = 1;
 pub const KIND_ACK: u16 = 2;
 pub const KIND_REJECT: u16 = 3;
@@ -40,9 +43,11 @@ pub const STATUS_BAD_VERSION: u32 = 2;
 pub const STATUS_BAD_KIND: u32 = 3;
 pub const FRAME_LEN: usize = 16;
 
-pub const SLOT_COUNT: u32 = 64;
-pub const SLOT_SIZE: usize = 64;
-pub const PAYLOAD_MAX: usize = 48;
+pub const SLOT_COUNT: u32 = 32;
+pub const SLOT_SIZE: usize = 4096;
+/// Slot header: kind u32 | len u32 | seq u64.
+pub const SLOT_HEADER: usize = 16;
+pub const PAYLOAD_MAX: usize = SLOT_SIZE - SLOT_HEADER;
 pub const SHM_SIZE: usize = 4096 + 2 * SLOT_COUNT as usize * SLOT_SIZE;
 pub const MSG_PING: u32 = 1;
 pub const MSG_PONG: u32 = 2;
@@ -191,7 +196,7 @@ fn futex_wake(word: &AtomicU32) {
     }
 }
 
-/// One message slot: kind u32 | len u32 | seq u64 | payload[48].
+/// One message slot: kind u32 | len u32 | seq u64 | payload[`PAYLOAD_MAX`].
 #[derive(Clone, Copy, Debug)]
 pub struct Msg {
     pub kind: u32,
@@ -253,7 +258,7 @@ impl Shm {
     /// Client side: check size, seals and header of a received memfd, then map it.
     ///
     /// # Errors
-    /// [`Error::Protocol`] if the memfd is not a sealed v1 ring region.
+    /// [`Error::Protocol`] if the memfd is not a sealed ring region of this version.
     pub fn map(fd: RawFd) -> Result<Self> {
         let mut st: libc::stat = unsafe { mem::zeroed() };
         if unsafe { libc::fstat(fd, &raw mut st) } < 0 {
@@ -303,7 +308,7 @@ impl Shm {
         unsafe { &*self.ptr.as_ptr().add(off).cast::<AtomicU32>() }
     }
 
-    /// One 64-byte slot as eight atomic words. The peer is another process that may write
+    /// One slot as `SLOT_SIZE / 8` atomic words. The peer is another process that may write
     /// the slot at any time (a buggy or hostile client), so slot bytes are only ever
     /// accessed atomically: a racing write yields garbage that is then validated, never UB.
     fn slot(&self, ring: Ring, index: u32) -> &[AtomicU64; SLOT_SIZE / 8] {
@@ -340,8 +345,10 @@ impl Shm {
         slot[0..4].copy_from_slice(&kind.to_le_bytes());
         slot[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         slot[8..16].copy_from_slice(&seq.to_le_bytes());
-        slot[16..16 + payload.len()].copy_from_slice(payload);
-        for (i, w) in self.slot(ring, head).iter().enumerate() {
+        slot[SLOT_HEADER..SLOT_HEADER + payload.len()].copy_from_slice(payload);
+        // Only the words that hold the header and payload are written.
+        let words = (SLOT_HEADER + payload.len()).div_ceil(8);
+        for (i, w) in self.slot(ring, head).iter().take(words).enumerate() {
             w.store(
                 u64::from_le_bytes(std::array::from_fn(|j| slot[i * 8 + j])),
                 Ordering::Relaxed,
@@ -369,16 +376,22 @@ impl Shm {
         if used == 0 {
             return Ok(None);
         }
+        let words = self.slot(ring, tail);
         let mut slot = [0u8; SLOT_SIZE];
-        for (i, w) in self.slot(ring, tail).iter().enumerate() {
+        for (i, w) in words.iter().take(SLOT_HEADER / 8).enumerate() {
             slot[i * 8..i * 8 + 8].copy_from_slice(&w.load(Ordering::Relaxed).to_le_bytes());
         }
+        // Validate the length (read once, from the local copy) before copying the payload.
         let len = u32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]) as usize;
         if len > PAYLOAD_MAX {
             return Err(Error::Protocol("message length out of range"));
         }
+        let n = (SLOT_HEADER + len).div_ceil(8);
+        for (i, w) in words.iter().enumerate().take(n).skip(SLOT_HEADER / 8) {
+            slot[i * 8..i * 8 + 8].copy_from_slice(&w.load(Ordering::Relaxed).to_le_bytes());
+        }
         let mut buf = [0u8; PAYLOAD_MAX];
-        buf.copy_from_slice(&slot[16..16 + PAYLOAD_MAX]);
+        buf.copy_from_slice(&slot[SLOT_HEADER..]);
         tail_w.store(tail.wrapping_add(1), Ordering::Release);
         Ok(Some(Msg {
             kind: u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]),
@@ -412,6 +425,104 @@ impl Shm {
 impl Drop for Shm {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.ptr.as_ptr().cast(), SHM_SIZE) };
+    }
+}
+
+/// The daemon side of one connection's reply ring. The ring is single-producer as far as
+/// the shared memory is concerned; inside the daemon the ring thread and the database
+/// thread both answer, so every push goes through `lock` (held for one slot copy only,
+/// never across SQLite or a syscall that can block).
+pub struct Port {
+    shm: Shm,
+    lock: Mutex<()>,
+    /// Set when a reply did not fit: the client stopped reading. The ring thread then
+    /// drops the connection.
+    broken: AtomicBool,
+    /// Requests handed to another thread and not answered yet.
+    inflight: AtomicUsize,
+}
+
+/// Most requests a connection may have queued on other threads; the ring thread stops
+/// reading requests at this many. Below `SLOT_COUNT`, so their replies always fit.
+pub const MAX_INFLIGHT: usize = SLOT_COUNT as usize / 2;
+
+impl Port {
+    fn new(shm: Shm) -> Self {
+        Self {
+            shm,
+            lock: Mutex::new(()),
+            broken: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push one reply; a full or corrupt ring marks the connection broken.
+    pub fn reply(&self, kind: u32, seq: u64, payload: &[u8]) {
+        let _g = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.shm.push(RING_D2C, kind, seq, payload).is_err() {
+            self.broken.store(true, Ordering::Release);
+        }
+    }
+
+    /// Count a request handed to another thread; the guard un-counts it when dropped
+    /// (after the reply is pushed, or if the job is dropped unanswered).
+    #[must_use]
+    pub fn begin(self: &Arc<Self>) -> Inflight {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        Inflight(Arc::clone(self))
+    }
+
+    fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Acquire)
+    }
+}
+
+/// See [`Port::begin`].
+pub struct Inflight(Arc<Port>);
+
+impl Inflight {
+    #[must_use]
+    pub fn port(&self) -> &Port {
+        &self.0
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serves the requests of one connection other than ping, on its ring thread. Must not
+/// block on anything unbounded: hand slow work to another thread and answer from there
+/// through the [`Port`].
+pub trait Session: Send {
+    fn request(&mut self, port: &Arc<Port>, msg: &Msg);
+}
+
+/// Creates a [`Session`] per connection.
+pub trait Handler: Send + Sync + 'static {
+    fn session(&self) -> Box<dyn Session>;
+}
+
+/// Answers every request with [`crate::md::ST_UNSUPPORTED`] (pings still work).
+pub struct NoService;
+
+struct NoSession;
+
+impl Session for NoSession {
+    fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
+        port.reply(
+            crate::md::MSG_MD_REPLY,
+            msg.seq,
+            &crate::md::reply_payload(crate::md::ST_UNSUPPORTED, &[]),
+        );
+    }
+}
+
+impl Handler for NoService {
+    fn session(&self) -> Box<dyn Session> {
+        Box::new(NoSession)
     }
 }
 
@@ -573,7 +684,7 @@ impl Drop for ClientSlot {
 ///
 /// # Errors
 /// Never returns on its own; accept errors are logged and retried.
-pub fn serve(listener: &UnixListener, cfg: Config) -> Result<()> {
+pub fn serve(listener: &UnixListener, cfg: Config, handler: &Arc<dyn Handler>) -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
@@ -584,12 +695,13 @@ pub fn serve(listener: &UnixListener, cfg: Config) -> Result<()> {
                     continue;
                 }
                 let slot = ClientSlot(Arc::clone(&active));
+                let handler = Arc::clone(handler);
                 let spawned =
                     thread::Builder::new()
                         .name("gungnird-client".into())
                         .spawn(move || {
                             let _slot = slot;
-                            if let Err(e) = handle_client(stream, cfg) {
+                            if let Err(e) = handle_client(stream, cfg, handler.as_ref()) {
                                 eprintln!("gungnird: client: {e}");
                             }
                         });
@@ -660,12 +772,13 @@ fn read_hello(stream: &mut UnixStream, timeout: Duration) -> Result<Option<[u8; 
     Ok(Some(buf))
 }
 
-/// One client: hello, ring setup (memfd via `SCM_RIGHTS`), then answer pings until the
-/// client closes the socket.
+/// One client: hello, ring setup (memfd via `SCM_RIGHTS`), then answer pings and hand
+/// every other request to the handler's session, until the client closes the socket.
 ///
 /// # Errors
-/// Handshake timeout, a rejected hello, ring corruption, or I/O errors.
-pub fn handle_client(mut stream: UnixStream, cfg: Config) -> Result<()> {
+/// Handshake timeout, a rejected hello, ring corruption, a client that stopped reading
+/// replies, or I/O errors.
+pub fn handle_client(mut stream: UnixStream, cfg: Config, handler: &dyn Handler) -> Result<()> {
     // Only our own user gets a ring: the socket mode and directory are the first line of
     // defence, this is the one that does not depend on umask or a pre-existing directory.
     if peer_uid(&stream)? != euid() {
@@ -704,11 +817,23 @@ pub fn handle_client(mut stream: UnixStream, cfg: Config) -> Result<()> {
     drop(memfd);
 
     stream.set_nonblocking(true)?;
+    let port = Arc::new(Port::new(shm));
+    let mut session = handler.session();
     loop {
-        if shm.wait_readable(RING_C2D, cfg.idle_poll) {
-            while let Some(msg) = shm.pop(RING_C2D)? {
+        if port.broken.load(Ordering::Acquire) {
+            return Err(Error::Protocol("client stopped reading replies"));
+        }
+        if port.inflight() >= MAX_INFLIGHT {
+            // Back-pressure: leave requests in the ring until answers drain.
+            thread::sleep(Duration::from_millis(1));
+        } else if port.shm.wait_readable(RING_C2D, cfg.idle_poll) {
+            while port.inflight() < MAX_INFLIGHT
+                && let Some(msg) = port.shm.pop(RING_C2D)?
+            {
                 if msg.kind == MSG_PING {
-                    shm.push(RING_D2C, MSG_PONG, msg.seq, msg.payload())?;
+                    port.reply(MSG_PONG, msg.seq, msg.payload());
+                } else {
+                    session.request(&port, &msg);
                 }
             }
         }
@@ -835,7 +960,8 @@ mod tests {
 
     fn start_server(sock: &TestSock, cfg: Config) -> Result<()> {
         let listener = bind(&sock.0)?;
-        thread::spawn(move || serve(&listener.socket, cfg));
+        let handler: Arc<dyn Handler> = Arc::new(NoService);
+        thread::spawn(move || serve(&listener.socket, cfg, &handler));
         Ok(())
     }
 
@@ -996,6 +1122,26 @@ mod tests {
             Err(Error::RingFull)
         ));
         assert!(shm.word(RING_C2D.head).load(Ordering::Acquire) < start);
+        Ok(())
+    }
+
+    #[test]
+    fn full_size_payload_round_trips_and_lying_len_is_refused() -> Result<()> {
+        let (shm, fd) = Shm::create()?;
+        let peer = Shm::map(fd.as_raw_fd())?;
+        let big: Vec<u8> = (0..PAYLOAD_MAX).map(|i| (i * 31) as u8).collect();
+        shm.push(RING_C2D, 18, 7, &big)?;
+        let m = peer.pop(RING_C2D)?.ok_or(Error::Protocol("empty"))?;
+        assert_eq!((m.kind, m.seq, m.payload()), (18, 7, &big[..]));
+        shm.push(RING_C2D, 18, 8, b"x")?;
+        // Rewrite the queued slot's len (low half of its first word) past PAYLOAD_MAX.
+        let w = &shm.slot(RING_C2D, 1)[0];
+        let v = w.load(Ordering::Relaxed);
+        w.store(
+            (v & 0xffff_ffff) | ((PAYLOAD_MAX as u64 + 1) << 32),
+            Ordering::Relaxed,
+        );
+        assert!(matches!(peer.pop(RING_C2D), Err(Error::Protocol(_))));
         Ok(())
     }
 
