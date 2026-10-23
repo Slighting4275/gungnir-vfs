@@ -13,10 +13,16 @@
 //! GIO call (query_info_async runs query_info on a GTask worker); link.zig serialises them.
 //! On the UI thread every hook gets link.ui_budget_ms instead and skips a daemon that just
 //! timed out (see link.zig): a query there carries no metadata rather than stall the UI.
+//!
+//! Hung mounts (milestone 7): before any of that, a path on a mount gungnird reported
+//! hung or gone (health.zig, a lookup in memory) fails at once: no metadata in a query,
+//! G_IO_ERROR_TIMED_OUT for a set, no removed/moved notification. Neither the daemon's
+//! resolver nor the path itself is touched.
 const std = @import("std");
 const c = @import("c");
 const md = @import("md.zig");
 const link = @import("link.zig");
+const health = @import("health.zig");
 const Allocator = std.mem.Allocator;
 
 pub const namespace = "metadata";
@@ -27,7 +33,7 @@ pub const query_budget_ms: u64 = 200;
 /// Whole budget of one set_attribute(s), removed or moved notification.
 pub const update_budget_ms: u64 = 300;
 
-pub const Error = md.Error || link.AcquireError || error{WrongType};
+pub const Error = md.Error || link.AcquireError || error{ WrongType, MountHung };
 
 fn errOf(r: anytype) ?anyerror {
     return if (r) |_| null else |err| err;
@@ -46,7 +52,7 @@ pub fn ioErrorCode(err: Error) c_int {
     return switch (err) {
         error.Unavailable, error.DaemonAbsent, error.NoSocketPath, error.VersionMismatch, error.Rejected, error.ForeignPeer, error.Unsupported => c.G_IO_ERROR_NOT_SUPPORTED,
         error.Busy, error.RingFull => c.G_IO_ERROR_BUSY,
-        error.Timeout, error.SuspectMount => c.G_IO_ERROR_TIMED_OUT,
+        error.Timeout, error.SuspectMount, error.MountHung => c.G_IO_ERROR_TIMED_OUT,
         error.NoSuchFile => c.G_IO_ERROR_NOT_FOUND,
         error.PathTooLong => c.G_IO_ERROR_FILENAME_TOO_LONG,
         error.BadRequest, error.KeyTooLong, error.ValueTooLarge, error.BadUtf8, error.WrongType => c.G_IO_ERROR_INVALID_ARGUMENT,
@@ -61,6 +67,7 @@ fn reason(err: Error) [*:0]const u8 {
         error.Busy, error.RingFull => "the metadata daemon is busy",
         error.Timeout => "the metadata daemon did not answer in time",
         error.SuspectMount => "the file's mount is not responding",
+        error.MountHung => "the file's mount is hung or gone (reported by the gungnird mount health monitor)",
         error.WrongType => "values must be string or list of strings",
         else => @errorName(err).ptr,
     };
@@ -147,6 +154,10 @@ pub fn addInfo(gpa: Allocator, filename: [*c]const u8, matcher: ?*c.GFileAttribu
         }
         if (wanted.items.len == 0) return;
     }
+    if (health.blocks(std.mem.span(filename))) {
+        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: no metadata for %s: its mount is hung", filename);
+        return;
+    }
     var entries = query(gpa, std.mem.span(filename), if (all) null else wanted.items, link.budget(query_budget_ms)) catch |err| {
         c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: no metadata for %s: %s", filename, @errorName(err).ptr);
         return;
@@ -218,6 +229,11 @@ pub fn setAttributes(filename: [*c]const u8, info: ?*c.GFileInfo, cancellable: [
         markAll(inf, attrs, c.G_FILE_ATTRIBUTE_STATUS_ERROR_SETTING);
         return 0;
     }
+    if (health.blocks(std.mem.span(filename))) {
+        markAll(inf, attrs, c.G_FILE_ATTRIBUTE_STATUS_ERROR_SETTING);
+        setError(err_out, error.MountHung, attrs[0]);
+        return 0;
+    }
     const cl = link.acquire(link.budget(update_budget_ms)) catch |err| {
         markAll(inf, attrs, c.G_FILE_ATTRIBUTE_STATUS_ERROR_SETTING);
         setError(err_out, err, attrs[0]);
@@ -271,6 +287,15 @@ pub fn fileMoved(source: [*c]const u8, dest: [*c]const u8) void {
 const Notice = union(enum) { removed: []const u8, moved: [2][]const u8 };
 
 fn notify(n: Notice) void {
+    // The daemon would identify what is at the path now (removed) or at the destination.
+    const target = switch (n) {
+        .removed => |p| p,
+        .moved => |p| p[1],
+    };
+    if (health.blocks(target)) {
+        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: metadata not updated for a %s: the mount is hung", @tagName(n).ptr);
+        return;
+    }
     const cl = link.acquire(link.budget(update_budget_ms)) catch |err| {
         c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: metadata not updated for a %s: %s", @tagName(n).ptr, @errorName(err).ptr);
         return;
@@ -352,6 +377,48 @@ test "setting without a daemon fails fast with a GIO error, every attribute mark
     defer c.g_object_unref(plain);
     c.g_file_info_set_attribute_string(plain, "standard::name", "x");
     try std.testing.expectEqual(@as(c.gboolean, 1), setAttributes("/nonexistent", plain, null, null));
+}
+
+test "a mount known to be hung fails at once, without the daemon" {
+    health.reset();
+    defer health.reset();
+    var buf: [64]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], 1, .little);
+    buf[8] = health.ev_first | health.ev_last;
+    std.mem.writeInt(u16, buf[9..11], 1, .little);
+    std.mem.writeInt(u64, buf[11..19], 40, .little);
+    buf[19] = health.hung;
+    std.mem.writeInt(u16, buf[20..22], 7, .little);
+    @memcpy(buf[22..29], "/hung-m");
+    health.onEvent(buf[0..29]);
+    const info = c.g_file_info_new() orelse return error.OutOfMemory;
+    defer c.g_object_unref(info);
+    c.g_file_info_set_attribute_string(info, "metadata::a", "x");
+    var err: [*c]c.GError = null;
+    const t0 = md.nowNs();
+    // The link is still "connecting" in the unit tests: a set that asked it would wait
+    // out its whole budget. This one does not even try.
+    try std.testing.expectEqual(@as(c.gboolean, 0), setAttributes("/hung-m/f", info, null, &err));
+    try std.testing.expect(md.nowNs() - t0 < 50 * std.time.ns_per_ms);
+    try std.testing.expect(err != null);
+    defer c.g_error_free(err);
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), err.*.code);
+    try std.testing.expect(std.mem.find(u8, std.mem.span(err.*.message), "health monitor") != null);
+    try std.testing.expectEqual(@as(c.GFileAttributeStatus, c.G_FILE_ATTRIBUTE_STATUS_ERROR_SETTING), c.g_file_info_get_attribute_status(info, "metadata::a"));
+    // A query just has no metadata, at once.
+    const m = c.g_file_attribute_matcher_new("metadata::*");
+    defer c.g_file_attribute_matcher_unref(m);
+    const q = c.g_file_info_new() orelse return error.OutOfMemory;
+    defer c.g_object_unref(q);
+    const t1 = md.nowNs();
+    addInfo(std.testing.allocator, "/hung-m/f", m, q);
+    try std.testing.expect(md.nowNs() - t1 < 50 * std.time.ns_per_ms);
+    try std.testing.expect(c.g_file_info_has_namespace(q, namespace) == 0);
+    // Notifications are skipped (they would wait for the link otherwise).
+    const t2 = md.nowNs();
+    fileRemoved("/hung-m/f");
+    fileMoved("/elsewhere", "/hung-m/g");
+    try std.testing.expect(md.nowNs() - t2 < 50 * std.time.ns_per_ms);
 }
 
 test "namespace is listed as writable and copied with the file" {

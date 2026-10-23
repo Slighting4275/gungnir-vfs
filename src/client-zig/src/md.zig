@@ -20,6 +20,8 @@ pub const msg_list: u32 = 20;
 pub const msg_removed: u32 = 21;
 pub const msg_moved: u32 = 22;
 pub const msg_reply: u32 = 32;
+/// Unsolicited daemon -> client slot (milestone 7, health.zig): never a reply.
+pub const msg_health_event: u32 = 33;
 
 pub const st_ok: u32 = 0;
 pub const st_not_found: u32 = 1;
@@ -265,6 +267,9 @@ pub const Client = struct {
     /// Absolute CLOCK_MONOTONIC deadline (ns) shared by a series of requests, e.g. all the
     /// round trips of one GIO call; 0 for none. The earlier of this and `timeout_ms` wins.
     deadline_ns: u64 = 0,
+    /// Gets the payload of every health event met while waiting for a reply (milestone
+    /// 7); null drops them.
+    on_event: ?*const fn (payload: []const u8) void = null,
 
     /// Send one request and wait for its reply. Returns the body (a slice of `reply`)
     /// on st_ok, else the status as an error. Replies to earlier, timed-out requests
@@ -288,6 +293,10 @@ pub const Client = struct {
                 else => return err,
             };
             while (try c.conn.shm.pop(ipc.ring_d2c)) |m| {
+                if (m.kind == msg_health_event) {
+                    if (c.on_event) |f| f(m.payload());
+                    continue;
+                }
                 if (m.seq != seq) continue;
                 if (m.kind != msg_reply) return error.Protocol;
                 reply.* = m;
@@ -297,6 +306,12 @@ pub const Client = struct {
                 return r.rest;
             }
         }
+    }
+
+    /// One raw request (other protocol modules, e.g. health.zig): the reply body on
+    /// st_ok, a slice of `reply`; else the status as an error.
+    pub fn request(c: *Client, kind: u32, payload: []const u8, reply: *ipc.Msg) Error![]const u8 {
+        return c.call(kind, payload, reply);
     }
 
     /// Identify an absolute path (a symlink is identified as itself).

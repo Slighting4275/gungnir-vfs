@@ -20,10 +20,18 @@
 //! daemon (SIGSTOP, ring thread waiting out a hung mount) costs one bounded probe per
 //! ui_quiet_ms instead of a full budget per file. Worker threads keep their full budget;
 //! any answered request ends the quiet period at once.
+//!
+//! Mount health (milestone 7): after the ping the connector subscribes to health events
+//! (within subscribe_timeout_ms; an M6 daemon answers "unsupported" and the link works
+//! as before). Events ride the reply ring. A request meets them while it waits for its
+//! reply (md.Client.on_event) and `release` drains what is left; while the link is idle
+//! one "gungnir-health" GThread waits on the ring's head futex (bounded) and drains them
+//! under the lock. It only reads shared memory: it never touches a file path.
 const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
+const health = @import("health.zig");
 const linux = std.os.linux;
 
 /// Budget for connect + hello + ring setup + first ping, on the connector thread.
@@ -38,6 +46,12 @@ pub const ui_quiet_ms: u64 = 1000;
 /// When a hook must be done (absolute CLOCK_MONOTONIC ns), and whether it runs on the
 /// UI thread. Made by `budget`.
 pub const Budget = struct { deadline: u64, ui: bool };
+/// Budget of the health subscription, after the handshake, on the connector thread.
+pub const subscribe_timeout_ms: u32 = 200;
+/// Longest wait of the event thread before it re-checks for shutdown and liveness.
+pub const event_wait_ms: u64 = 2000;
+/// Request seqs of the connector's subscription (clear of the requests' 1 << 32 range).
+const subscribe_seq: u64 = 1 << 31;
 
 /// Values of the read-only GungnirVfs:daemon-state property. Plain integers, not an
 /// enum: the enum<->int builtins are being renamed on Zig master.
@@ -90,6 +104,14 @@ pub fn budget(ms: u64) Budget {
     return .{ .deadline = md.nowNs() + use * std.time.ns_per_ms, .ui = ui };
 }
 
+/// 1 while the current connection is subscribed to health events (set by the connector
+/// before it publishes "connected", cleared under `lock` when the connection closes).
+var health_subscribed: u32 = 0;
+var events_thread: ?*c.GThread = null;
+var events_stop: u32 = 0;
+/// Address of the head word the event thread waits on (0: none), for wake-ups.
+var events_head: usize = 0;
+
 pub fn state() c_int {
     return @atomicLoad(c_int, &daemon_state, .acquire);
 }
@@ -106,7 +128,21 @@ fn envValue(name: [*:0]const u8) ?[]const u8 {
 
 fn connectorMain(data: c.gpointer) callconv(.c) c.gpointer {
     _ = data;
-    if (ipc.connectAndPing(&socket_path, connect_timeout_ms)) |cn| {
+    if (ipc.connectAndPing(&socket_path, connect_timeout_ms)) |connected| {
+        var cn = connected;
+        // Still exclusively ours: subscribe before anyone else can use the rings.
+        var sub: md.Client = .{ .conn = &cn, .seq = subscribe_seq, .timeout_ms = subscribe_timeout_ms };
+        const subscribed = if (health.subscribe(&sub)) |_| true else |err| blk: {
+            if (isFatal(err)) {
+                cn.close();
+                setState(state_unavailable);
+                c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon lost during the health subscription (%s)", @errorName(err).ptr);
+                return null;
+            }
+            c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: no mount health events (%s)", @errorName(err).ptr);
+            break :blk false;
+        };
+        @atomicStore(u32, &health_subscribed, @intFromBool(subscribed), .release);
         pending_conn = cn; // published by the release store in setState
         setState(state_connected);
         c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon handshake ok on %s", &socket_path.buf);
@@ -144,6 +180,14 @@ pub fn start() void {
     c.g_mutex_lock(&lock);
     defer c.g_mutex_unlock(&lock);
     spawnConnector();
+    @atomicStore(u32, &events_stop, 0, .release);
+    var err: [*c]c.GError = null;
+    events_thread = c.g_thread_try_new("gungnir-health", &eventsMain, null, &err);
+    if (events_thread == null and err != null) {
+        // Not fatal: events are still read by every request.
+        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: cannot start the health event thread: %s", err.*.message);
+        c.g_error_free(err);
+    }
 }
 
 /// Wait (futex, bounded by `deadline`) while the connector is still working.
@@ -202,16 +246,97 @@ pub fn acquire(b: Budget) AcquireError!*md.Client {
         unlock();
         return error.Unavailable;
     }
-    if (!have_conn) {
-        conn = pending_conn orelse {
-            unlock();
-            return error.Unavailable;
-        };
-        pending_conn = null;
-        have_conn = true;
+    if (!adoptLocked()) {
+        unlock();
+        return error.Unavailable;
     }
-    client = .{ .conn = &conn, .seq = next_seq, .timeout_ms = std.math.maxInt(u32), .deadline_ns = b.deadline };
+    client = .{ .conn = &conn, .seq = next_seq, .timeout_ms = std.math.maxInt(u32), .deadline_ns = b.deadline, .on_event = &health.onEvent };
     return &client;
+}
+
+/// Under `lock`: take over the connector's connection if it has published one.
+fn adoptLocked() bool {
+    if (have_conn) return true;
+    if (state() != state_connected) return false;
+    conn = pending_conn orelse return false;
+    pending_conn = null;
+    have_conn = true;
+    return true;
+}
+
+/// Under `lock`: apply the health events waiting on the reply ring; anything else there
+/// is a late reply to a timed-out request and is dropped, as md.Client does.
+fn drainLocked() void {
+    var n: u32 = 0;
+    while (n < ipc.slot_count) : (n += 1) {
+        const m = (conn.shm.pop(ipc.ring_d2c) catch return) orelse return;
+        if (m.kind == md.msg_health_event) health.onEvent(m.payload());
+    }
+}
+
+fn wakeShared(addr: usize) void {
+    if (addr == 0) return;
+    _ = linux.futex_3arg(@ptrFromInt(addr), .{ .cmd = .WAKE, .private = false }, std.math.maxInt(i32));
+}
+
+/// Under `lock`: close the connection (the daemon is gone or the rings are out of step).
+fn closeLocked() void {
+    // Wake the event thread off this ring before it is unmapped.
+    wakeShared(@atomicLoad(usize, &events_head, .acquire));
+    conn.close();
+    have_conn = false;
+    @atomicStore(u32, &health_subscribed, 0, .release);
+    health.reset(); // nothing is known to be hung any more
+    last_attempt_ns = md.nowNs();
+    setState(state_unavailable);
+    c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon connection lost");
+}
+
+/// Wait (futex) while daemon_state is still `seen`, at most `ms`.
+fn waitStateChange(seen: c_int, ms: u64) void {
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.futex_4arg(@ptrCast(&daemon_state), .{ .cmd = .WAIT, .private = true }, @bitCast(seen), &ts);
+}
+
+/// The "gungnir-health" thread: keeps the health table current while no request is
+/// reading the ring. Every wait is bounded (event_wait_ms); it holds `lock` only to
+/// drain the ring (memory copies, no syscall on any path).
+fn eventsMain(data: c.gpointer) callconv(.c) c.gpointer {
+    _ = data;
+    while (@atomicLoad(u32, &events_stop, .acquire) == 0) {
+        const st = state();
+        if (st != state_connected or @atomicLoad(u32, &health_subscribed, .acquire) == 0) {
+            waitStateChange(st, event_wait_ms);
+            continue;
+        }
+        // A request holds the link: it reads the events itself (and release drains).
+        if (c.g_mutex_trylock(&lock) == 0) {
+            c.g_usleep(5 * 1000);
+            continue;
+        }
+        // Held like any caller's (see lockUntil), so a UI-thread caller can tell it is short.
+        @atomicStore(u64, &held_since_ns, @max(md.nowNs(), 1), .monotonic);
+        if (!adoptLocked()) {
+            unlock();
+            waitStateChange(st, 10);
+            continue;
+        }
+        if (!conn.alive()) {
+            closeLocked();
+            unlock();
+            continue;
+        }
+        drainLocked();
+        const head_p = conn.shm.headWord(ipc.ring_d2c);
+        const head = @atomicLoad(u32, head_p, .acquire);
+        @atomicStore(usize, &events_head, @intFromPtr(head_p), .release);
+        unlock();
+        // Until the daemon pushes (it wakes every waiter), shutdown, or a close (both wake
+        // it too). The mapping may go away meanwhile: then the kernel just returns.
+        const ts: linux.timespec = .{ .sec = @intCast(event_wait_ms / 1000), .nsec = @intCast((event_wait_ms % 1000) * std.time.ns_per_ms) };
+        _ = linux.futex_4arg(head_p, .{ .cmd = .WAIT, .private = false }, head, &ts);
+    }
+    return null;
 }
 
 /// Errors after which the connection cannot be trusted any more (the daemon is gone or
@@ -233,11 +358,9 @@ pub fn release(cl: *md.Client, err: ?anyerror) void {
     } else @atomicStore(u64, &quiet_until_ns, 0, .monotonic);
     const fatal = if (err) |e| isFatal(e) else false;
     if (fatal and have_conn) {
-        conn.close();
-        have_conn = false;
-        last_attempt_ns = md.nowNs();
-        setState(state_unavailable);
-        c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon connection lost");
+        closeLocked();
+    } else if (have_conn) {
+        drainLocked(); // events that came in behind our reply
     }
     unlock();
 }
@@ -245,6 +368,16 @@ pub fn release(cl: *md.Client, err: ?anyerror) void {
 /// Module unload: only reached once no GungnirVfs instance is alive. The join is bounded
 /// by connect_timeout_ms, and the thread must not outlive the module's code.
 pub fn shutdown() void {
+    if (events_thread) |t| {
+        @atomicStore(u32, &events_stop, 1, .release);
+        _ = linux.futex_3arg(@ptrCast(&daemon_state), .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        wakeShared(@atomicLoad(usize, &events_head, .acquire));
+        _ = c.g_thread_join(t); // bounded by event_wait_ms
+    }
+    events_thread = null;
+    @atomicStore(usize, &events_head, 0, .release);
+    @atomicStore(u32, &health_subscribed, 0, .release);
+    health.reset();
     if (connector_thread) |t| _ = c.g_thread_join(t);
     connector_thread = null;
     if (pending_conn) |*p| p.close();

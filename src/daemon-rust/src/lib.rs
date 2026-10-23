@@ -1,6 +1,7 @@
 use std::{fmt, io, path::PathBuf};
 
 pub mod fsid;
+pub mod health;
 pub mod ipc;
 pub mod md;
 pub mod mdsvc;

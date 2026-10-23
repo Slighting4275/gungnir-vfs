@@ -190,9 +190,12 @@ fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
     }
 }
 
+/// Wakes every waiter: since milestone 7 a client may have two threads on its reply ring
+/// (a request waiting for its answer and the health-event reader), and waking only one
+/// of them could leave the request asleep until its next liveness slice.
 fn futex_wake(word: &AtomicU32) {
     unsafe {
-        libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, 1i32);
+        libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX);
     }
 }
 
@@ -403,6 +406,15 @@ impl Shm {
         }))
     }
 
+    /// Free slots in `ring` right now (`None` if its indices are corrupt). Only the
+    /// producer can rely on it staying at least this large.
+    #[must_use]
+    pub fn free_slots(&self, ring: Ring) -> Option<u32> {
+        let head = self.word(ring.head).load(Ordering::Relaxed);
+        let used = head.wrapping_sub(self.word(ring.tail).load(Ordering::Acquire));
+        SLOT_COUNT.checked_sub(used)
+    }
+
     /// Consumer: wait (futex, bounded by `timeout`) until the ring is non-empty.
     #[must_use]
     pub fn wait_readable(&self, ring: Ring, timeout: Duration) -> bool {
@@ -462,6 +474,28 @@ impl Port {
         if self.shm.push(RING_D2C, kind, seq, payload).is_err() {
             self.broken.store(true, Ordering::Release);
         }
+    }
+
+    /// Push unsolicited messages (milestone 7 health events, `seq` 0) all or none, and
+    /// only if at least `reserve` slots stay free for replies afterwards. Never marks the
+    /// connection broken for lack of room: the caller retries later. Returns whether
+    /// they were pushed.
+    pub fn push_unsolicited(&self, kind: u32, payloads: &[Vec<u8>], reserve: usize) -> bool {
+        let _g = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.broken.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.shm.free_slots(RING_D2C) {
+            Some(free) if free as usize >= payloads.len() + reserve => {}
+            _ => return false,
+        }
+        for p in payloads {
+            if self.shm.push(RING_D2C, kind, 0, p).is_err() {
+                self.broken.store(true, Ordering::Release);
+                return false;
+            }
+        }
+        true
     }
 
     /// Count a request handed to another thread; the guard un-counts it when dropped
