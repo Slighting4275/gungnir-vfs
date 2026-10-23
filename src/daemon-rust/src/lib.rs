@@ -1,12 +1,12 @@
-use std::{
-    fmt, io,
-    path::{Path, PathBuf},
-};
-
-use rusqlite::Connection;
+use std::{fmt, io, path::PathBuf};
 
 pub mod fsid;
 pub mod ipc;
+pub mod md;
+pub mod mdsvc;
+pub mod store;
+
+pub use store::open_db;
 
 /// Scratch directories for tests, under `<repo>/.build/tmp` (AGENTS.md §3: never /tmp).
 #[cfg(test)]
@@ -160,25 +160,6 @@ pub(crate) mod testdir {
     }
 }
 
-// `journal_mode` reports the mode actually in effect and silently keeps the old
-// one when WAL is unavailable (e.g. ":memory:"), so it is queried and checked.
-const JOURNAL_MODE_WAL: &str = "PRAGMA journal_mode = WAL";
-const PRAGMAS: &str = "PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;";
-
-// No separate delete index: the PRIMARY KEY prefix (fs_uuid, subvol_id, inode_num)
-// already serves unlink deletes; an extra index only adds write cost.
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
-  fs_uuid    TEXT    NOT NULL,
-  subvol_id  INTEGER NOT NULL,
-  inode_num  INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
-  key        TEXT    NOT NULL,
-  btime_sec  INTEGER NOT NULL DEFAULT 0,
-  btime_nsec INTEGER NOT NULL DEFAULT 0,
-  value      BLOB,
-  PRIMARY KEY (fs_uuid, subvol_id, inode_num, generation, key)
-) WITHOUT ROWID;";
-
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -190,9 +171,11 @@ pub enum Error {
     AlreadyRunning(PathBuf),
     NotASocket(PathBuf),
     InsecureSocketDir(PathBuf),
+    InsecureDbDir(PathBuf),
     Protocol(&'static str),
     RingFull,
     Fsid(fsid::FsidError),
+    Md(md::MdError),
 }
 
 impl fmt::Display for Error {
@@ -200,7 +183,10 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Sqlite(e) => write!(f, "sqlite: {e}"),
-            Error::NoHome => write!(f, "HOME is not set and no database path was given"),
+            Error::NoHome => write!(
+                f,
+                "neither XDG_DATA_HOME nor HOME is an absolute path, and no database path was given"
+            ),
             Error::WalUnavailable(mode) => {
                 write!(
                     f,
@@ -216,9 +202,15 @@ impl fmt::Display for Error {
                 "{} must be a directory owned by this user and not world-writable",
                 p.display()
             ),
+            Error::InsecureDbDir(p) => write!(
+                f,
+                "{} must be owned by this user and not writable by others",
+                p.display()
+            ),
             Error::Protocol(what) => write!(f, "protocol: {what}"),
             Error::RingFull => write!(f, "ring full"),
             Error::Fsid(e) => write!(f, "fsid: {e}"),
+            Error::Md(e) => write!(f, "metadata: {e}"),
         }
     }
 }
@@ -237,6 +229,12 @@ impl From<fsid::FsidError> for Error {
     }
 }
 
+impl From<md::MdError> for Error {
+    fn from(e: md::MdError) -> Self {
+        Error::Md(e)
+    }
+}
+
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Error::Sqlite(e)
@@ -244,25 +242,6 @@ impl From<rusqlite::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Open (or create) the metadata DB, apply the required PRAGMAs and schema.
-///
-/// # Errors
-/// I/O errors creating the parent directory, SQLite errors, or
-/// [`Error::WalUnavailable`] if SQLite does not switch to WAL.
-pub fn open_db(path: &Path) -> Result<Connection> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let conn = Connection::open(path)?;
-    let mode: String = conn.query_row(JOURNAL_MODE_WAL, [], |r| r.get(0))?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(Error::WalUnavailable(mode));
-    }
-    conn.execute_batch(PRAGMAS)?;
-    conn.execute_batch(SCHEMA)?;
-    Ok(conn)
-}
 
 /// Synthetic fs id for UUID-less filesystems: `synth-<first 32 hex of BLAKE3>`.
 /// Each part is length-prefixed so ("ab","c") and ("a","bc") never collide.
@@ -280,42 +259,6 @@ pub fn synth_fs_id(parts: &[&[u8]]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdir::TestDir;
-    use std::path::PathBuf;
-
-    /// Test DB in its own private directory under <repo>/.build/tmp (AGENTS.md: never
-    /// /tmp), independent of TMPDIR. The directory and the DB (with its -wal and -shm
-    /// files) are removed on drop, so a failing assertion (tests unwind even with
-    /// panic = "abort" in the release profile) or an early `?` cleans up too.
-    struct TestDb(PathBuf, #[allow(dead_code)] TestDir);
-
-    impl TestDb {
-        fn new(name: &str) -> Result<Self> {
-            let dir = TestDir::new(&format!("db-{name}"))?;
-            Ok(Self(dir.join("metadata.db"), dir))
-        }
-    }
-
-    #[test]
-    fn db_opens_in_wal_with_schema() -> Result<()> {
-        let db = TestDb::new("wal")?;
-        let conn = open_db(&db.0)?;
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-        assert_eq!(mode, "wal");
-        let sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE name = 'metadata'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert!(sql.contains("WITHOUT ROWID"));
-        Ok(())
-    }
-
-    #[test]
-    fn non_wal_database_is_rejected() {
-        let err = open_db(Path::new(":memory:")).err();
-        assert!(matches!(err, Some(Error::WalUnavailable(ref m)) if m == "memory"));
-    }
 
     #[test]
     fn synth_id_format_and_separation() {

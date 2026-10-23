@@ -1,26 +1,40 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
-use gungnird::{Error, Result, ipc, open_db};
+use gungnird::{
+    Result,
+    fsid::{Resolver, ResolverConfig, SysBackend},
+    ipc, mdsvc,
+    store::{self, DbConfig, Store, StoreConfig},
+};
 
+/// The first CLI argument, else `$XDG_DATA_HOME/gungnir/metadata.db`, else
+/// `$HOME/.local/share/gungnir/metadata.db`.
 fn db_path() -> Result<PathBuf> {
     if let Some(arg) = env::args_os().nth(1) {
         return Ok(PathBuf::from(arg));
     }
-    // An empty HOME would yield a relative path and put the DB under the CWD.
-    let home = env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .ok_or(Error::NoHome)?;
-    Ok(PathBuf::from(home).join(".cache/gungnir/metadata.db"))
+    store::default_db_path(
+        env::var_os("XDG_DATA_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
 }
 
 fn run() -> Result<()> {
     let path = db_path()?;
-    let _conn = open_db(&path)?;
+    let db = store::spawn(
+        Store::open(&path, StoreConfig::default())?,
+        DbConfig::default(),
+    )?;
     eprintln!("gungnird: metadata db ready at {}", path.display());
+    let resolver = Arc::new(Resolver::new(
+        SysBackend::new()?,
+        ResolverConfig::default(),
+    )?);
+    let handler: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db));
     let sock = ipc::socket_path_from_env()?;
     let listener = ipc::bind(&sock)?;
     eprintln!("gungnird: listening on {}", sock.display());
-    ipc::serve(&listener.socket, ipc::Config::default())
+    ipc::serve(&listener.socket, ipc::Config::default(), &handler)
 }
 
 fn main() -> ExitCode {

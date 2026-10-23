@@ -3,11 +3,15 @@
 //!   gungnir-itest <module-dir> no-opt-in                     GIO_USE_VFS unset: GLocalVfs
 //!   gungnir-itest <module-dir> daemon <tmp-dir> <gungnird>   starts gungnird, expects a ping round trip
 //!   gungnir-itest <module-dir> hung <tmp-dir>                a socket that never answers
+//!   gungnir-itest <module-dir> metadata <tmp-dir> <gungnird> starts gungnird, then sets and
+//!                                                            gets keys with the md.zig client
 //! <module-dir> contains only libgiogungnir.so and GIO_EXTRA_MODULES is unset, so no
 //! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
 //! directory per run, created under <tmp-dir> (.build/tmp).
 const std = @import("std");
 const c = @import("c");
+const ipc = @import("ipc.zig");
+const md = @import("md.zig");
 const linux = std.os.linux;
 
 /// The GIO calling thread must get its VFS and answer local file queries in this time,
@@ -215,8 +219,91 @@ fn removeFile(path: [*c]const u8) void {
     _ = linux.unlink(path);
 }
 
-fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
-    const tmp_dir = privateDir(tmp_arg, "daemon") orelse return fail("could not create a private test directory");
+/// What a daemon-backed mode checks once gungnird listens. Null on success.
+const DaemonCheck = *const fn (tmp_dir: [*:0]const u8, sock: [*:0]const u8) ?[*:0]const u8;
+
+/// GIO module against the real daemon: daemon-state reaches 1 (hello, rings, ping).
+fn checkModuleConnects(tmp_dir: [*:0]const u8, sock: [*:0]const u8) ?[*:0]const u8 {
+    _ = tmp_dir;
+    _ = sock;
+    if (checkGungnirFast()) |what| return what;
+    return expectState(1, 5_000, 0);
+}
+
+/// The md.zig client against the real daemon: identify a file, set and get a string
+/// and a stringv, list, unset; plus the clean errors for a missing file.
+fn checkMetadata(tmp_dir: [*:0]const u8, sock: [*:0]const u8) ?[*:0]const u8 {
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    const gpa = dbg.allocator();
+    const what = metadataRoundTrip(gpa, tmp_dir, sock) catch |err| blk: {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: metadata: %s", @errorName(err).ptr);
+        break :blk "metadata round trip failed";
+    };
+    if (dbg.deinit() == .leak) return "the metadata client leaked memory";
+    return what;
+}
+
+fn metadataRoundTrip(gpa: std.mem.Allocator, tmp_dir: [*:0]const u8, sock: [*:0]const u8) md.Error!?[*:0]const u8 {
+    const sock_path = try ipc.resolveSocketPath(std.mem.span(sock), null, null);
+    var conn = try ipc.connectAndPing(&sock_path, 2_000);
+    defer conn.close();
+    var client: md.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
+
+    const file = tmpPath(tmp_dir, "meta-file");
+    defer c.g_free(file);
+    const fd_rc = linux.open(file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(fd_rc) != .SUCCESS) return "could not create the test file";
+    _ = linux.close(@intCast(fd_rc));
+    defer removeFile(file);
+
+    const id = try client.identify(std.mem.span(file));
+    if (id.inode_num == 0 or id.fsUuid().len == 0) return "identify returned an empty identity";
+    const again = try client.identify(std.mem.span(file));
+    if (!again.eql(&id)) return "identify is not stable";
+
+    if (try client.get(gpa, &id, "custom-icon")) |v| {
+        v.deinit(gpa);
+        return "a fresh file already has metadata";
+    }
+    try client.setString(&id, "custom-icon", "file:///icons/spear.png");
+    const got = (try client.get(gpa, &id, "custom-icon")) orelse return "set then get returned nothing";
+    defer got.deinit(gpa);
+    if (got != .string or !std.mem.eql(u8, got.string, "file:///icons/spear.png")) return "get returned another value";
+
+    const emblems = [_][]const u8{ "emblem-important", "", "emblem-\u{2603}" };
+    try client.setStringv(&id, "emblems", &emblems);
+    const gv = (try client.get(gpa, &id, "emblems")) orelse return "stringv set then get returned nothing";
+    defer gv.deinit(gpa);
+    if (gv != .stringv or gv.stringv.len != emblems.len) return "stringv came back with another shape";
+    for (gv.stringv, emblems) |a, b| if (!std.mem.eql(u8, a, b)) return "stringv came back different";
+
+    const keys = try client.listKeys(gpa, &id);
+    defer md.freeKeys(gpa, keys);
+    if (keys.len != 2 or !std.mem.eql(u8, keys[0], "custom-icon") or !std.mem.eql(u8, keys[1], "emblems"))
+        return "listKeys returned the wrong keys";
+
+    try client.unset(&id, "custom-icon");
+    if (try client.get(gpa, &id, "custom-icon")) |v| {
+        v.deinit(gpa);
+        return "unset key is still there";
+    }
+
+    // Clean errors: a missing file, an invalid key (refused before sending); the daemon
+    // keeps answering afterwards.
+    const missing = tmpPath(tmp_dir, "no-such-file");
+    defer c.g_free(missing);
+    if (client.identify(std.mem.span(missing))) |_| return "a missing file was identified" else |err| {
+        if (err != error.NoSuchFile) return "a missing file gave the wrong error";
+    }
+    if (client.setString(&id, "bad\xffkey", "v")) |_| return "a non-UTF-8 key was accepted" else |err| {
+        if (err != error.BadUtf8) return "a non-UTF-8 key gave the wrong error";
+    }
+    try client.setString(&id, "after-errors", "ok");
+    return null;
+}
+
+fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8, mode: [*:0]const u8, check: DaemonCheck) c_int {
+    const tmp_dir = privateDir(tmp_arg, mode) orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
     defer _ = linux.rmdir(tmp_dir); // after the files below; a kept log keeps the dir too
     const sock = tmpPath(tmp_dir, "gungnird.sock");
@@ -286,8 +373,7 @@ fn runDaemon(tmp_arg: [*c]u8, gungnird: [*c]u8) c_int {
         if (nowMs() - t0 > 10_000) return fail("gungnird did not start listening within 10 s");
         c.g_usleep(10 * 1000);
     }
-    if (checkGungnirFast()) |what| return fail(what);
-    if (expectState(1, 5_000, 0)) |what| return fail(what);
+    if (check(tmp_dir, sock)) |what| return fail(what);
     rc = 0;
     return rc;
 }
@@ -342,6 +428,7 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (c.g_setenv("GIO_USE_VFS", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VFS");
     if (std.mem.eql(u8, mode, "opt-in") and argc == 4) return runMissing(argv[3]);
     if (std.mem.eql(u8, mode, "hung") and argc == 4) return runHung(argv[3]);
-    if (std.mem.eql(u8, mode, "daemon") and argc == 5) return runDaemon(argv[3], argv[4]);
+    if (std.mem.eql(u8, mode, "daemon") and argc == 5) return runDaemon(argv[3], argv[4], "daemon", &checkModuleConnects);
+    if (std.mem.eql(u8, mode, "metadata") and argc == 5) return runDaemon(argv[3], argv[4], "metadata", &checkMetadata);
     return fail("unknown mode or wrong argument count");
 }

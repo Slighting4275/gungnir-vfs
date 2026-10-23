@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("c"); // translated GIO headers, see build.zig
 const ipc = @import("ipc.zig");
+/// Metadata client API (milestone 5); GIO metadata::* wiring follows in milestone 6.
+pub const md = @import("md.zig");
 
 /// Root panic handler: log through GLib, then terminate the whole process.
 pub const panic = std.debug.FullPanic(gungnirPanic);
@@ -242,6 +244,7 @@ test "priority stays below local (0) and gvfs (10)" {
 
 test {
     _ = ipc;
+    _ = md;
 }
 
 test "daemon state starts as connecting" {

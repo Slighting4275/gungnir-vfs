@@ -63,17 +63,18 @@ pub fn build(b: *std.Build) void {
     cargo_build.has_side_effects = true;
     const gungnird_bin = b.path("../../.build/target/release/gungnird");
 
-    const itest = b.step("itest", "Load libgiogungnir.so through GIO, check GungnirVfs and the daemon handshake");
+    const itest = b.step("itest", "Load libgiogungnir.so through GIO, check GungnirVfs, the daemon handshake and metadata");
     // opt-in: GIO_USE_VFS=gungnir, nothing at the socket: GungnirVfs with local fallback.
     // no-opt-in: without GIO_USE_VFS the module must NOT become the default VFS.
     // daemon: real gungnird, hello + ring pair + ping. hung: a socket that never answers.
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung" }) |mode| {
+    // metadata: real gungnird, set then get keys through the md.zig client (protocol v2).
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());
         run.addArg(mode);
         if (!std.mem.eql(u8, mode, "no-opt-in")) run.addDirectoryArg2(repo_tmp, .{ .make_absolute = true });
-        if (std.mem.eql(u8, mode, "daemon")) {
+        if (std.mem.eql(u8, mode, "daemon") or std.mem.eql(u8, mode, "metadata")) {
             run.addFileArg2(gungnird_bin, .{ .make_absolute = true });
             run.step.dependOn(&cargo_build.step);
         }

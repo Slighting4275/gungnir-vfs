@@ -40,7 +40,7 @@ The full rules are in [AGENTS.md](AGENTS.md).
 # Rust daemon
 cargo build --release
 cargo test --release
-cargo clippy --release -- -D warnings
+cargo clippy --release --all-targets -- -D warnings
 ```
 
 Build artifacts stay inside the repo under `.build/`, so nothing needs to run from `/tmp`.
@@ -59,8 +59,9 @@ GIO_USE_VFS=gungnir gio info .
 Every push and merge request runs [`.gitlab-ci.yml`](.gitlab-ci.yml) on GitLab in a pinned
 `archlinux` image (tag and digest) that installs packages from the Arch Linux Archive snapshot
 of the same day, so runs are reproducible. Lint checks formatting (`cargo fmt --check`,
-`zig fmt --check`), `cargo check` with `-D warnings` and `cargo clippy -- -D warnings`. Build
-runs `cargo build --release` and `./zb` with the exported-symbol and `gio-querymodules` checks.
+`zig fmt --check`), `cargo check` with `-D warnings` and
+`cargo clippy --all-targets -- -D warnings`. Build runs `cargo build --release` and `./zb`
+with the exported-symbol and `gio-querymodules` checks.
 Test runs `cargo test --release` and `./zb test --summary all`. CI uses the current Zig master
 tarball from ziglang.org and rejects it unless its minisign signature, signed file name and
 sha256 verify, and it is not older than `minimum_zig_version` in `build.zig.zon`.

@@ -158,7 +158,7 @@ rust:lint:
   script:
     - cargo fmt --all --check
     - RUSTFLAGS="-D warnings" cargo check --release
-    - cargo clippy --release -- -D warnings
+    - cargo clippy --release --all-targets -- -D warnings
 
 zig:lint:
   stage: lint

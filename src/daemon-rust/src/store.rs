@@ -1,0 +1,593 @@
+//! Metadata store (milestone 5): SQLite in WAL mode, keyed by the M4 file identity, and
+//! the dedicated database thread that owns the connection.
+//!
+//! Non-blocking rule: only the database thread ever touches SQLite. Ring threads hand it
+//! jobs through a bounded queue ([`DbHandle::submit`] fails with [`MdError::Busy`] when it
+//! is full) and never wait for them: the job's completion callback writes the reply. A
+//! lock held by another process (a second daemon on the same file, a `sqlite3` shell)
+//! costs at most `busy_timeout` x (`busy_retries` + 1) per job and then answers Busy;
+//! jobs that sat in the queue longer than `max_age` are answered Busy without running.
+
+use std::{
+    ffi::OsStr,
+    fs,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+
+use crate::{
+    Error, Result,
+    md::{Ident, MAX_KEYS_PER_FILE, MdError, Value, check_key, list_body},
+};
+
+// `journal_mode` reports the mode actually in effect and silently keeps the old
+// one when WAL is unavailable (e.g. ":memory:"), so it is queried and checked.
+const JOURNAL_MODE_WAL: &str = "PRAGMA journal_mode = WAL";
+// busy_timeout is set separately from the config (small: see the module docs).
+const PRAGMAS: &str = "PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF;";
+
+// No separate delete index: the PRIMARY KEY prefix (fs_uuid, subvol_id, inode_num)
+// already serves unlink deletes; an extra index only adds write cost.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
+  fs_uuid    TEXT    NOT NULL,
+  subvol_id  INTEGER NOT NULL,
+  inode_num  INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  key        TEXT    NOT NULL,
+  btime_sec  INTEGER NOT NULL DEFAULT 0,
+  btime_nsec INTEGER NOT NULL DEFAULT 0,
+  value      BLOB,
+  PRIMARY KEY (fs_uuid, subvol_id, inode_num, generation, key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS path_hint (
+  fs_uuid    TEXT    NOT NULL,
+  subvol_id  INTEGER NOT NULL,
+  inode_num  INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  path       BLOB    NOT NULL,
+  updated    INTEGER NOT NULL,
+  PRIMARY KEY (fs_uuid, subvol_id, inode_num, generation)
+) WITHOUT ROWID;";
+
+const ID_WHERE: &str = "fs_uuid = ?1 AND subvol_id = ?2 AND inode_num = ?3 AND generation = ?4";
+
+/// Database file: `$XDG_DATA_HOME/gungnir/metadata.db`, else
+/// `$HOME/.local/share/gungnir/metadata.db` (absolute values only).
+///
+/// # Errors
+/// [`Error::NoHome`] if neither is set to an absolute path.
+pub fn default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+    fn abs(v: Option<&OsStr>) -> Option<&Path> {
+        v.map(Path::new).filter(|p| p.is_absolute())
+    }
+    if let Some(d) = abs(xdg_data_home) {
+        return Ok(d.join("gungnir/metadata.db"));
+    }
+    if let Some(h) = abs(home) {
+        return Ok(h.join(".local/share/gungnir/metadata.db"));
+    }
+    Err(Error::NoHome)
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Create the database directory (0700) if missing and refuse one that is not ours or
+/// is writable by others; create the file 0600 (and tighten an existing file of ours).
+/// SQLite gives `-wal` and `-shm` the database file's mode.
+fn prepare_files(path: &Path) -> Result<()> {
+    if path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let md = fs::symlink_metadata(dir)?;
+        if !md.is_dir() || md.uid() != euid() || md.mode() & 0o022 != 0 {
+            return Err(Error::InsecureDbDir(dir.to_path_buf()));
+        }
+    }
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let md = f.metadata()?;
+    if !md.is_file() || md.uid() != euid() {
+        return Err(Error::InsecureDbDir(path.to_path_buf()));
+    }
+    if md.mode() & 0o077 != 0 {
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Open (or create) the metadata DB, apply the PRAGMAs and schema.
+///
+/// # Errors
+/// I/O errors creating the directory or file, [`Error::InsecureDbDir`], SQLite errors,
+/// or [`Error::WalUnavailable`] if SQLite does not switch to WAL.
+pub fn open_db(path: &Path, busy_timeout: Duration) -> Result<Connection> {
+    prepare_files(path)?;
+    let conn = Connection::open(path)?;
+    // Setup (switching to WAL, creating the schema) runs once, before anything is served:
+    // it may wait out another opener (a second daemon on the same file starting at the
+    // same moment, a backup), so it gets SQLite's usual patience. The short serving
+    // timeout applies from the first request on.
+    // SQLite also returns SQLITE_BUSY at once, without its busy handler, where waiting
+    // could deadlock (two connections switching a fresh file to WAL), so setup is retried
+    // as a whole until the same deadline.
+    conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
+    let deadline = Instant::now() + OPEN_BUSY_TIMEOUT;
+    loop {
+        match setup(&conn) {
+            Err(Error::Sqlite(e)) if is_busy(&e) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            r => break r?,
+        }
+    }
+    conn.busy_timeout(busy_timeout)?;
+    Ok(conn)
+}
+
+fn setup(conn: &Connection) -> Result<()> {
+    let mode: String = conn.query_row(JOURNAL_MODE_WAL, [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::WalUnavailable(mode));
+    }
+    conn.execute_batch(PRAGMAS)?;
+    conn.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+/// SQLite's wait for a lock while the database is being opened (not while serving).
+pub const OPEN_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+pub struct StoreConfig {
+    /// SQLite's own wait for a lock, per attempt. Small: the DB thread serves everyone.
+    pub busy_timeout: Duration,
+    /// Further attempts after a busy one.
+    pub busy_retries: u32,
+    /// Pause between attempts.
+    pub retry_pause: Duration,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Duration::from_millis(20),
+            busy_retries: 2,
+            retry_pause: Duration::from_millis(5),
+        }
+    }
+}
+
+/// Errors inside a store transaction: SQLite's, or a protocol-level refusal.
+enum TxErr {
+    Sql(rusqlite::Error),
+    Md(MdError),
+}
+
+impl From<rusqlite::Error> for TxErr {
+    fn from(e: rusqlite::Error) -> Self {
+        TxErr::Sql(e)
+    }
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// SQLite stores INTEGER as i64; identity fields are u64 bit patterns.
+fn sql_u64(v: u64) -> i64 {
+    v as i64
+}
+
+/// The metadata database. Owned by exactly one thread (see [`spawn`]).
+pub struct Store {
+    conn: Connection,
+    cfg: StoreConfig,
+}
+
+impl Store {
+    /// # Errors
+    /// As [`open_db`].
+    pub fn open(path: &Path, cfg: StoreConfig) -> Result<Self> {
+        Ok(Self {
+            conn: open_db(path, cfg.busy_timeout)?,
+            cfg,
+        })
+    }
+
+    /// Run `f` in an IMMEDIATE transaction, retrying a busy database a bounded number of
+    /// times, then [`MdError::Busy`]. Any other SQLite error is [`MdError::Db`].
+    fn write<T>(
+        &mut self,
+        mut f: impl FnMut(&rusqlite::Transaction<'_>) -> std::result::Result<T, TxErr>,
+    ) -> std::result::Result<T, MdError> {
+        let mut attempt = 0;
+        loop {
+            let r = (|| {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let v = f(&tx)?;
+                tx.commit()?;
+                Ok(v)
+            })();
+            match r {
+                Ok(v) => return Ok(v),
+                Err(TxErr::Md(e)) => return Err(e),
+                Err(TxErr::Sql(e)) if is_busy(&e) => {
+                    if attempt >= self.cfg.busy_retries {
+                        return Err(MdError::Busy);
+                    }
+                    attempt += 1;
+                    thread::sleep(self.cfg.retry_pause);
+                }
+                Err(TxErr::Sql(e)) => {
+                    eprintln!("gungnird: metadata db: {e}");
+                    return Err(MdError::Db);
+                }
+            }
+        }
+    }
+
+    /// Read-only statement(s), with the same bounded retry.
+    fn read<T>(
+        &self,
+        mut f: impl FnMut(&Connection) -> rusqlite::Result<T>,
+    ) -> std::result::Result<T, MdError> {
+        let mut attempt = 0;
+        loop {
+            match f(&self.conn) {
+                Ok(v) => return Ok(v),
+                Err(e) if is_busy(&e) => {
+                    if attempt >= self.cfg.busy_retries {
+                        return Err(MdError::Busy);
+                    }
+                    attempt += 1;
+                    thread::sleep(self.cfg.retry_pause);
+                }
+                Err(e) => {
+                    eprintln!("gungnird: metadata db: {e}");
+                    return Err(MdError::Db);
+                }
+            }
+        }
+    }
+
+    /// True if the stored rows belong to an earlier file that had this inode: both the
+    /// stored and the current btime are known (non-zero) and differ.
+    fn is_stale(conn: &Connection, id: &Ident) -> rusqlite::Result<bool> {
+        if (id.btime_sec, id.btime_nsec) == (0, 0) {
+            return Ok(false);
+        }
+        let stored: Option<(i64, i64)> = conn
+            .prepare_cached(&format!(
+                "SELECT btime_sec, btime_nsec FROM metadata WHERE {ID_WHERE} \
+                 AND (btime_sec != 0 OR btime_nsec != 0) LIMIT 1"
+            ))?
+            .query_row(Self::id_params(id), |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(stored.is_some_and(|s| s != (id.btime_sec, i64::from(id.btime_nsec))))
+    }
+
+    fn id_params(id: &Ident) -> (&str, i64, i64, i64) {
+        (
+            id.fs_uuid.as_str(),
+            sql_u64(id.subvol_id),
+            sql_u64(id.inode_num),
+            sql_u64(id.generation),
+        )
+    }
+
+    fn forget(tx: &Connection, id: &Ident) -> rusqlite::Result<()> {
+        tx.prepare_cached(&format!("DELETE FROM metadata WHERE {ID_WHERE}"))?
+            .execute(Self::id_params(id))?;
+        tx.prepare_cached(&format!("DELETE FROM path_hint WHERE {ID_WHERE}"))?
+            .execute(Self::id_params(id))?;
+        Ok(())
+    }
+
+    /// Drop the rows of a recycled inode: `id` must carry the btime the daemon itself
+    /// just observed (identify), never one a client sent. Returns true if it did.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn purge_stale(&mut self, id: &Ident) -> std::result::Result<bool, MdError> {
+        if !self.read(|c| Self::is_stale(c, id))? {
+            return Ok(false);
+        }
+        self.write(|tx| {
+            if Self::is_stale(tx, id)? {
+                Self::forget(tx, id)?;
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// The encoded value of `key`, `None` if unset.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn get(&mut self, id: &Ident, key: &str) -> std::result::Result<Option<Vec<u8>>, MdError> {
+        // A btime that differs from the stored one: either the rows or the client's
+        // identity are stale, and only identify can tell (it sees the file). Never delete
+        // on a client's word: the rows are just not this file's.
+        if self.read(|c| Self::is_stale(c, id))? {
+            return Ok(None);
+        }
+        self.read(|c| {
+            let (u, s, i, g) = Self::id_params(id);
+            c.prepare_cached(&format!(
+                "SELECT value FROM metadata WHERE {ID_WHERE} AND key = ?5"
+            ))?
+            .query_row(params![u, s, i, g, key], |r| r.get::<_, Option<Vec<u8>>>(0))
+            .optional()
+            .map(Option::flatten)
+        })
+    }
+
+    /// Set `key` to an already validated, encoded value; remember `hint` as the file's
+    /// last known path.
+    ///
+    /// # Errors
+    /// [`MdError::TooManyKeys`], [`MdError::NoSuchFile`] (the stored rows carry another
+    /// btime: re-identify), [`MdError::Busy`] or [`MdError::Db`].
+    pub fn set(
+        &mut self,
+        id: &Ident,
+        key: &str,
+        value: &[u8],
+        hint: Option<&[u8]>,
+    ) -> std::result::Result<(), MdError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.write(|tx| {
+            if Self::is_stale(tx, id)? {
+                return Err(TxErr::Md(MdError::NoSuchFile));
+            }
+            let (u, s, i, g) = Self::id_params(id);
+            let exists = tx
+                .prepare_cached(&format!(
+                    "SELECT 1 FROM metadata WHERE {ID_WHERE} AND key = ?5"
+                ))?
+                .exists(params![u, s, i, g, key])?;
+            if !exists {
+                let n: i64 = tx
+                    .prepare_cached(&format!("SELECT count(*) FROM metadata WHERE {ID_WHERE}"))?
+                    .query_row(Self::id_params(id), |r| r.get(0))?;
+                if usize::try_from(n).unwrap_or(usize::MAX) >= MAX_KEYS_PER_FILE {
+                    return Err(TxErr::Md(MdError::TooManyKeys));
+                }
+            }
+            let bs = id.btime_sec;
+            let bn = i64::from(id.btime_nsec);
+            tx.prepare_cached(
+                "INSERT INTO metadata \
+                 (fs_uuid, subvol_id, inode_num, generation, key, btime_sec, btime_nsec, value) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT (fs_uuid, subvol_id, inode_num, generation, key) \
+                 DO UPDATE SET value = excluded.value, btime_sec = excluded.btime_sec, \
+                 btime_nsec = excluded.btime_nsec",
+            )?
+            .execute(params![u, s, i, g, key, bs, bn, value])?;
+            if (bs, bn) != (0, 0) {
+                // Older rows recorded before btime was known: adopt the current one.
+                tx.prepare_cached(&format!(
+                    "UPDATE metadata SET btime_sec = ?5, btime_nsec = ?6 WHERE {ID_WHERE} \
+                     AND btime_sec = 0 AND btime_nsec = 0"
+                ))?
+                .execute(params![u, s, i, g, bs, bn])?;
+            }
+            if let Some(p) = hint {
+                tx.prepare_cached(
+                    "INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT (fs_uuid, subvol_id, inode_num, generation) \
+                     DO UPDATE SET path = excluded.path, updated = excluded.updated",
+                )?
+                .execute(params![u, s, i, g, p, now])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove `key` (a no-op if it is not set). The path hint goes with the last key.
+    ///
+    /// # Errors
+    /// [`MdError::NoSuchFile`] (another btime is stored: re-identify), [`MdError::Busy`]
+    /// or [`MdError::Db`].
+    pub fn unset(&mut self, id: &Ident, key: &str) -> std::result::Result<(), MdError> {
+        self.write(|tx| {
+            if Self::is_stale(tx, id)? {
+                return Err(TxErr::Md(MdError::NoSuchFile));
+            }
+            let (u, s, i, g) = Self::id_params(id);
+            tx.prepare_cached(&format!(
+                "DELETE FROM metadata WHERE {ID_WHERE} AND key = ?5"
+            ))?
+            .execute(params![u, s, i, g, key])?;
+            let left = tx
+                .prepare_cached(&format!("SELECT 1 FROM metadata WHERE {ID_WHERE} LIMIT 1"))?
+                .exists(Self::id_params(id))?;
+            if !left {
+                tx.prepare_cached(&format!("DELETE FROM path_hint WHERE {ID_WHERE}"))?
+                    .execute(Self::id_params(id))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Up to `limit` keys strictly after `after` (byte order), and whether more follow.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn list(
+        &mut self,
+        id: &Ident,
+        after: &str,
+        limit: usize,
+    ) -> std::result::Result<(Vec<String>, bool), MdError> {
+        if self.read(|c| Self::is_stale(c, id))? {
+            return Ok((Vec::new(), false));
+        }
+        let lim = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut keys = self.read(|c| {
+            let (u, s, i, g) = Self::id_params(id);
+            let mut st = c.prepare_cached(&format!(
+                "SELECT key FROM metadata WHERE {ID_WHERE} AND key > ?5 ORDER BY key LIMIT ?6"
+            ))?;
+            st.query_map(params![u, s, i, g, after, lim], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        })?;
+        let more = keys.len() > limit;
+        keys.truncate(limit);
+        Ok((keys, more))
+    }
+
+    /// The last path a value was set through (diagnostics, later moves and GC).
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn path_hint(&self, id: &Ident) -> std::result::Result<Option<Vec<u8>>, MdError> {
+        self.read(|c| {
+            c.prepare_cached(&format!("SELECT path FROM path_hint WHERE {ID_WHERE}"))?
+                .query_row(Self::id_params(id), |r| r.get(0))
+                .optional()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The database thread
+
+/// A request for the database thread (already parsed and validated on the ring thread).
+#[derive(Debug, Clone)]
+pub enum DbReq {
+    Get(Ident, String),
+    /// Encoded value, optional path hint.
+    Set(Ident, String, Vec<u8>, Option<Vec<u8>>),
+    Unset(Ident, String),
+    /// Cursor (keys strictly after it).
+    List(Ident, String),
+    /// Drop stale rows for an identity the daemon just resolved (identify). Runs even
+    /// when older than `max_age`: requests queued behind it rely on it.
+    Purge(Ident),
+}
+
+/// Reply body on success (see `md` for the layouts), or the failure status.
+pub type DbResult = std::result::Result<Vec<u8>, MdError>;
+
+pub struct Job {
+    pub req: DbReq,
+    pub enqueued: Instant,
+    /// Called exactly once on the database thread (or on drop of the queue, never).
+    pub done: Box<dyn FnOnce(DbResult) + Send>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DbConfig {
+    /// Jobs that may wait; beyond this, [`DbHandle::submit`] answers Busy.
+    pub queue: usize,
+    /// A job older than this when the thread gets to it is answered Busy, not run.
+    pub max_age: Duration,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            queue: 128,
+            max_age: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Sending side of the database thread's queue. Cheap to clone.
+#[derive(Clone)]
+pub struct DbHandle {
+    tx: SyncSender<Job>,
+}
+
+impl DbHandle {
+    /// Queue a job without ever waiting. A refused job is dropped without calling
+    /// `done`: the caller answers [`MdError::Busy`] itself.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] if the queue is full or the thread is gone.
+    pub fn submit(&self, job: Job) -> std::result::Result<(), MdError> {
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(MdError::Busy),
+        }
+    }
+}
+
+/// Run one job against the store.
+pub fn execute(store: &mut Store, req: &DbReq) -> DbResult {
+    match req {
+        DbReq::Get(id, k) => {
+            let v = store.get(id, k)?.ok_or(MdError::NotFound)?;
+            // The file is only ours by convention: a row written by something else must
+            // never reach the client (or overflow a reply slot) unvalidated.
+            Value::decode(&v).map_err(|_| MdError::Db)?;
+            Ok(v)
+        }
+        DbReq::Set(id, k, v, hint) => store.set(id, k, v, hint.as_deref()).map(|()| Vec::new()),
+        DbReq::Unset(id, k) => store.unset(id, k).map(|()| Vec::new()),
+        DbReq::Purge(id) => store.purge_stale(id).map(|_| Vec::new()),
+        DbReq::List(id, after) => {
+            let (mut keys, more) = store.list(id, after, MAX_KEYS_PER_FILE)?;
+            // Same for keys: one that the protocol could not carry is skipped.
+            keys.retain(|k| check_key(k.as_bytes()).is_ok());
+            Ok(list_body(&keys, more))
+        }
+    }
+}
+
+fn db_thread(mut store: Store, rx: &Receiver<Job>, max_age: Duration) {
+    while let Ok(job) = rx.recv() {
+        let r = if job.enqueued.elapsed() > max_age && !matches!(job.req, DbReq::Purge(_)) {
+            Err(MdError::Busy)
+        } else {
+            execute(&mut store, &job.req)
+        };
+        (job.done)(r);
+    }
+}
+
+/// Start the database thread; it owns `store` and exits when every handle is dropped.
+///
+/// # Errors
+/// [`Error::Io`] if the thread cannot be started.
+pub fn spawn(store: Store, cfg: DbConfig) -> Result<DbHandle> {
+    let (tx, rx) = mpsc::sync_channel(cfg.queue.max(1));
+    thread::Builder::new()
+        .name("gungnir-db".into())
+        .spawn(move || db_thread(store, &rx, cfg.max_age))
+        .map_err(Error::Io)?;
+    Ok(DbHandle { tx })
+}
+
+#[cfg(test)]
+mod tests;

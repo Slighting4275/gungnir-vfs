@@ -1,4 +1,4 @@
-//! Client half of the control plane, protocol v1 (AGENTS.md §1.B "Handshake protocol v1").
+//! Client half of the control plane, protocol v2 (AGENTS.md §1.B "Handshake protocol").
 //! Mirrors src/daemon-rust/src/ipc.rs; keep both in sync. Raw Linux syscalls only, all
 //! non-blocking or bounded by a deadline: nothing here can hang the calling thread.
 //! Everything read from the socket or the shared memory is untrusted and validated.
@@ -7,15 +7,20 @@ const linux = std.os.linux;
 
 /// "GNGR" read as a little-endian u32.
 pub const magic: u32 = 0x5247_4E47;
-pub const version: u16 = 1;
+/// Bumped for every layout change; the daemon refuses another version with a reject
+/// frame (status_bad_version), reported as error.VersionMismatch.
+pub const version: u16 = 2;
 pub const kind_hello: u16 = 1;
 pub const kind_ack: u16 = 2;
 pub const kind_reject: u16 = 3;
 pub const frame_len = 16;
+pub const status_bad_version: u32 = 2;
 
-pub const slot_count: u32 = 64;
-pub const slot_size: usize = 64;
-pub const payload_max: usize = 48;
+pub const slot_count: u32 = 32;
+pub const slot_size: usize = 4096;
+/// kind u32 | len u32 | seq u64.
+pub const slot_header: usize = 16;
+pub const payload_max: usize = slot_size - slot_header;
 pub const shm_size: usize = 4096 + 2 * slot_count * slot_size;
 pub const msg_ping: u32 = 1;
 pub const msg_pong: u32 = 2;
@@ -34,6 +39,7 @@ pub const Error = error{
     Io,
     Protocol,
     Rejected,
+    VersionMismatch,
     BadShm,
     RingFull,
     RingCorrupt,
@@ -143,7 +149,7 @@ pub const Shm = struct {
         return @ptrCast(@alignCast(s.mem[off..][0..4]));
     }
 
-    /// One 64-byte slot as eight u64 words. The peer process may write a slot at any time,
+    /// One slot as slot_size / 8 u64 words. The peer process may write a slot at any time,
     /// so slot bytes are only accessed atomically and validated after the copy.
     fn slotWords(s: Shm, ring: Ring, index: u32) *[slot_size / 8]u64 {
         const off = ring.slots + @as(usize, index % slot_count) * slot_size;
@@ -178,8 +184,10 @@ pub const Shm = struct {
         std.mem.writeInt(u32, local[0..4], kind, .little);
         std.mem.writeInt(u32, local[4..8], @intCast(payload.len), .little);
         std.mem.writeInt(u64, local[8..16], seq, .little);
-        @memcpy(local[16..][0..payload.len], payload);
-        for (s.slotWords(ring, head), 0..) |*w, i| {
+        @memcpy(local[slot_header..][0..payload.len], payload);
+        // Only the words holding the header and the payload are written.
+        const words = (slot_header + payload.len + 7) / 8;
+        for (s.slotWords(ring, head)[0..words], 0..) |*w, i| {
             @atomicStore(u64, w, std.mem.readInt(u64, local[i * 8 ..][0..8], .little), .monotonic);
         }
         @atomicStore(u32, head_p, head +% 1, .release);
@@ -193,8 +201,9 @@ pub const Shm = struct {
         const used = @atomicLoad(u32, s.word(ring.head), .acquire) -% tail;
         if (used > slot_count) return error.RingCorrupt;
         if (used == 0) return null;
-        var slot: [slot_size]u8 = undefined;
-        for (s.slotWords(ring, tail), 0..) |*w, i| {
+        const words = s.slotWords(ring, tail);
+        var slot: [slot_size]u8 = @splat(0);
+        for (words[0 .. slot_header / 8], 0..) |*w, i| {
             std.mem.writeInt(u64, slot[i * 8 ..][0..8], @atomicLoad(u64, w, .monotonic), .little);
         }
         var m: Msg = .{
@@ -203,8 +212,13 @@ pub const Shm = struct {
             .len = std.mem.readInt(u32, slot[4..8], .little),
             .buf = undefined,
         };
+        // Validate the length (read once, into the local copy) before copying the payload.
         if (m.len > payload_max) return error.Protocol;
-        @memcpy(&m.buf, slot[16..][0..payload_max]);
+        const n = (slot_header + m.len + 7) / 8;
+        for (words[slot_header / 8 .. n], slot_header / 8..) |*w, i| {
+            std.mem.writeInt(u64, slot[i * 8 ..][0..8], @atomicLoad(u64, w, .monotonic), .little);
+        }
+        @memcpy(&m.buf, slot[slot_header..][0..payload_max]);
         @atomicStore(u32, tail_p, tail +% 1, .release);
         return m;
     }
@@ -349,6 +363,13 @@ fn mapShm(memfd: linux.fd_t) Error!Shm {
     return shm;
 }
 
+/// The error for a reply that came without a ring: a reject frame (a daemon speaking
+/// another protocol version says so with status_bad_version), or garbage.
+fn refusal(f: Frame) Error {
+    if (f.magic != magic or f.kind != kind_reject) return error.Protocol;
+    return if (f.status == status_bad_version) error.VersionMismatch else error.Rejected;
+}
+
 /// Connect, exchange hellos, map the ring pair and round-trip one ping, all within
 /// `timeout_ms`. Never blocks past the deadline; run it off the GIO calling thread.
 pub fn connectAndPing(path: *const SocketPath, timeout_ms: u32) Error!Conn {
@@ -362,9 +383,7 @@ pub fn connectAndPing(path: *const SocketPath, timeout_ms: u32) Error!Conn {
     if (linux.errno(sent) != .SUCCESS or sent != hello.len) return error.Io;
 
     const reply = try recvReply(fd, deadline);
-    const memfd = reply.memfd orelse {
-        return if (reply.frame.magic == magic and reply.frame.kind == kind_reject) error.Rejected else error.Protocol;
-    };
+    const memfd = reply.memfd orelse return refusal(reply.frame);
     defer closeFd(memfd); // the mapping keeps the memory alive
     const f = reply.frame;
     if (f.magic != magic or f.version != version or f.kind != kind_ack or f.status != 0 or f.shm_size != shm_size)
@@ -389,7 +408,30 @@ test "frame layout matches the daemon" {
     const f = Frame.decode(&b);
     try std.testing.expectEqual(kind_ack, f.kind);
     try std.testing.expectEqual(@as(u32, 3), f.status);
-    try std.testing.expectEqual(@as(u32, 12288), f.shm_size);
+    try std.testing.expectEqual(@as(u32, 4096 + 2 * 32 * 4096), f.shm_size);
+}
+
+test "a version mismatch is reported as such" {
+    try std.testing.expectEqual(error.VersionMismatch, refusal(.{ .kind = kind_reject, .status = status_bad_version }));
+    try std.testing.expectEqual(error.Rejected, refusal(.{ .kind = kind_reject, .status = 1 }));
+    try std.testing.expectEqual(error.Protocol, refusal(.{ .kind = kind_ack }));
+    try std.testing.expectEqual(error.Protocol, refusal(.{ .magic = 0, .kind = kind_reject }));
+}
+
+test "a full-size payload round-trips and a lying length is refused" {
+    var buf: [shm_size]u8 align(4096) = undefined;
+    const shm: Shm = .{ .mem = &buf };
+    shm.initHeader();
+    var big: [payload_max]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try shm.push(ring_c2d, 18, 7, &big);
+    const m = (try shm.pop(ring_c2d)).?;
+    try std.testing.expectEqualSlices(u8, &big, m.payload());
+    try shm.push(ring_c2d, 18, 8, "x");
+    // Corrupt the len field of the queued slot: the consumer must refuse it.
+    const off = ring_c2d.slots + 1 * slot_size + 4;
+    @atomicStore(u32, @as(*u32, @ptrCast(@alignCast(buf[off..][0..4]))), payload_max + 1, .monotonic);
+    try std.testing.expectError(error.Protocol, shm.pop(ring_c2d));
 }
 
 test "socket path precedence and limits" {
