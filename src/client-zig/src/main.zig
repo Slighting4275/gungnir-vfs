@@ -8,6 +8,8 @@ pub const md = @import("md.zig");
 const gmeta = @import("gmeta.zig");
 /// Mount health events from the daemon (milestone 7).
 const health = @import("health.zig");
+/// Asynchronous file operations through the daemon: the GungnirFileOp type (milestone 8).
+const fileop = @import("fileop.zig");
 
 /// Root panic handler: log through GLib, then terminate the whole process.
 pub const panic = std.debug.FullPanic(gungnirPanic);
@@ -230,6 +232,8 @@ pub export fn g_io_module_load(module: *c.GIOModule) void {
         return;
     }
     _ = c.g_io_extension_point_implement(c.G_VFS_EXTENSION_POINT_NAME, gungnir_vfs_type, extension_name, vfs_priority);
+    // GIO cannot route GLocalFile copy/move/delete through a GVfs: see fileop.zig.
+    fileop.register(type_module);
 }
 
 pub export fn g_io_module_unload(module: *c.GIOModule) void {
@@ -260,6 +264,7 @@ test {
     _ = link;
     _ = gmeta;
     _ = health;
+    _ = fileop;
 }
 
 test "daemon state starts as connecting" {

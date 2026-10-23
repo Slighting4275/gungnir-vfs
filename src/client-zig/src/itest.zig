@@ -15,6 +15,10 @@
 //!                                                            mount (test-hooks build): the
 //!                                                            module hears of it and fails
 //!                                                            fast (milestone 7)
+//!   gungnir-itest <module-dir> file-ops <tmp-dir> <gungnird>  GungnirFileOp: copy, move,
+//!                                                            delete, fsync, errors, cancel,
+//!                                                            hung-mount refusal, no daemon
+//!                                                            (milestone 8; test-hooks build)
 //! <module-dir> contains only libgiogungnir.so and GIO_EXTRA_MODULES is unset, so no
 //! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
 //! directory per run, created under <tmp-dir> (.build/tmp).
@@ -1238,6 +1242,309 @@ fn checkHungMount(ctx: *Ctx) ?[*:0]const u8 {
     return null;
 }
 
+// ---- milestone 8: GungnirFileOp ------------------------------------------------
+
+/// "start" must return within this; it only spawns the op thread.
+const max_start_ms = 50;
+
+const OpRun = struct {
+    finished: bool = false,
+    code: c_int = 0, // 0: success, else the G_IO_ERROR code
+    message: [256]u8 = @splat(0),
+    progress: u32 = 0,
+    last_cur: i64 = 0,
+    last_total: i64 = 0,
+    start_ms: i64 = 0,
+    done_ms: i64 = 0,
+    order_ok: bool = true,
+};
+
+fn onOpProgress(obj: c.gpointer, cur: i64, total: i64, data: c.gpointer) callconv(.c) void {
+    _ = obj;
+    const r: *OpRun = @ptrCast(@alignCast(data));
+    if (r.finished) r.order_ok = false;
+    r.progress += 1;
+    r.last_cur = cur;
+    r.last_total = total;
+}
+
+fn onOpFinished(obj: c.gpointer, err: ?*c.GError, data: c.gpointer) callconv(.c) void {
+    _ = obj;
+    const r: *OpRun = @ptrCast(@alignCast(data));
+    if (r.finished) r.order_ok = false;
+    r.finished = true;
+    r.done_ms = nowMs();
+    if (err) |e| {
+        r.code = e.code;
+        const m = std.mem.span(e.message);
+        const n = @min(m.len, r.message.len - 1);
+        @memcpy(r.message[0..n], m[0..n]);
+    }
+}
+
+fn newOp(op: c_int, src: [*c]const u8, dest: [*c]const u8, flags: c_uint) ?*c.GObject {
+    const t = c.g_type_from_name("GungnirFileOp");
+    if (t == 0) return null;
+    const obj = if (dest != null)
+        c.g_object_new(t, "operation", op, "source", src, "destination", dest, "flags", flags, @as(?*anyopaque, null))
+    else
+        c.g_object_new(t, "operation", op, "source", src, "flags", flags, @as(?*anyopaque, null));
+    return @ptrCast(@alignCast(obj));
+}
+
+/// Start `obj` and run the main context until "finished" (bounded). `cancel_after_ms`
+/// cancels the GCancellable that long after the start (negative: never).
+fn runOpObj(obj: *c.GObject, r: *OpRun, cancel_after_ms: i64) ?[*:0]const u8 {
+    _ = c.g_signal_connect_data(obj, "progress", @ptrCast(&onOpProgress), r, null, 0);
+    _ = c.g_signal_connect_data(obj, "finished", @ptrCast(&onOpFinished), r, null, 0);
+    const cancellable = c.g_cancellable_new();
+    defer c.g_object_unref(cancellable);
+    var ok: c.gboolean = 0;
+    r.start_ms = nowMs();
+    c.g_signal_emit_by_name(obj, "start", cancellable, &ok);
+    if (nowMs() - r.start_ms > max_start_ms) return "GungnirFileOp start blocked the caller";
+    if (ok == 0) return "GungnirFileOp start returned FALSE";
+    var again: c.gboolean = 1;
+    c.g_signal_emit_by_name(obj, "start", cancellable, &again);
+    if (again != 0) return "a second start was accepted";
+    var cancelled = false;
+    while (!r.finished) {
+        if (nowMs() - r.start_ms > 30_000) return "GungnirFileOp did not finish within 30 s";
+        if (!cancelled and cancel_after_ms >= 0 and nowMs() - r.start_ms >= cancel_after_ms) {
+            c.g_cancellable_cancel(cancellable);
+            cancelled = true;
+        }
+        if (c.g_main_context_iteration(null, 0) == 0) c.g_usleep(1000);
+    }
+    if (!r.order_ok) return "GungnirFileOp signals out of order (progress after finished, or two finished)";
+    return null;
+}
+
+fn runOp(op: c_int, src: [*c]const u8, dest: [*c]const u8, flags: c_uint, r: *OpRun) ?[*:0]const u8 {
+    const obj = newOp(op, src, dest, flags) orelse return "GungnirFileOp is not registered";
+    defer c.g_object_unref(obj);
+    return runOpObj(obj, r, -1);
+}
+
+fn expectOp(op: c_int, src: [*c]const u8, dest: [*c]const u8, flags: c_uint, want: c_int, what: [*:0]const u8) ?[*:0]const u8 {
+    var r: OpRun = .{};
+    if (runOp(op, src, dest, flags, &r)) |w| return w;
+    if (r.code != want) {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: %s: code %d (want %d): %s", what, r.code, want, @as([*:0]const u8, @ptrCast(&r.message)));
+        return what;
+    }
+    return null;
+}
+
+fn writeFile(path: [*c]const u8, data: []const u8) bool {
+    return c.g_file_set_contents(path, data.ptr, @intCast(data.len), null) != 0;
+}
+
+fn fileExists(path: [*c]const u8) bool {
+    return c.g_file_test(path, c.G_FILE_TEST_EXISTS) != 0 or c.g_file_test(path, c.G_FILE_TEST_IS_SYMLINK) != 0;
+}
+
+/// No `.gungnir-*.tmp` left behind in `dir`.
+fn noTempFiles(dir: [*c]const u8) bool {
+    const d = c.g_dir_open(dir, 0, null) orelse return false;
+    defer c.g_dir_close(d);
+    while (c.g_dir_read_name(d)) |name| {
+        const n = std.mem.span(name);
+        if (std.mem.startsWith(u8, n, ".gungnir-")) return false;
+    }
+    return true;
+}
+
+fn statOf(path: [*c]const u8) ?linux.Statx {
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .MTIME = true, .SIZE = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS) return null;
+    return st;
+}
+
+/// GungnirFileOp against the real daemon (a test-hooks build), then slowed down for
+/// cancellation, with a fake hung mount for the refusal, and with no daemon at all.
+fn checkFileOps(ctx: *Ctx) ?[*:0]const u8 {
+    if (checkGungnirFast()) |what| return what;
+    if (expectState(1, 5_000, 0)) |what| return what;
+    const dir = tmpPath(ctx.tmp_dir, "ops");
+    defer c.g_free(dir);
+    if (linux.errno(linux.mkdirat(linux.AT.FDCWD, dir, 0o700)) != .SUCCESS) return "could not create the ops dir";
+    defer {
+        // Whatever a failed check left behind: the test dir is private and ours.
+        const argv = [_][*c]const u8{ "rm", "-rf", "--", dir, null };
+        _ = c.g_spawn_sync(null, @ptrCast(@constCast(&argv)), null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, null, null);
+    }
+    const a = tmpPath(dir, "a");
+    defer c.g_free(a);
+    const b = tmpPath(dir, "b");
+    defer c.g_free(b);
+    const m = tmpPath(dir, "m");
+    defer c.g_free(m);
+
+    // Copy with all metadata: content, mode, mtime and metadata::* follow; progress seen.
+    {
+        const size = 4 << 20;
+        const data = std.heap.c_allocator.alloc(u8, size) catch return "out of memory";
+        defer std.heap.c_allocator.free(data);
+        for (data, 0..) |*x, i| x.* = @truncate(i *% 2654435761 >> 13);
+        if (!writeFile(a, data)) return "could not write the source";
+        if (linux.errno(linux.chmod(a, 0o640)) != .SUCCESS) return "chmod";
+        const ts = [2]linux.timespec{ .{ .sec = 1_000_000_000, .nsec = 123_456_789 }, .{ .sec = 1_000_000_000, .nsec = 123_456_789 } };
+        if (linux.errno(linux.utimensat(linux.AT.FDCWD, a, &ts, 0)) != .SUCCESS) return "utimensat";
+        const fa = c.g_file_new_for_path(a);
+        defer c.g_object_unref(fa);
+        var err: [*c]c.GError = null;
+        if (c.g_file_set_attribute_string(fa, "metadata::k", "copied", c.G_FILE_QUERY_INFO_NONE, null, &err) == 0) {
+            logError("set", err);
+            return "metadata set on the source failed";
+        }
+        var r: OpRun = .{};
+        if (runOp(1, a, b, c.G_FILE_COPY_ALL_METADATA, &r)) |w| return w;
+        if (r.code != 0) {
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: copy: %s", @as([*:0]const u8, @ptrCast(&r.message)));
+            return "copy failed";
+        }
+        if (r.progress == 0 or r.last_total != size) return "copy reported no (or wrong) progress";
+        var got: [*c]u8 = null;
+        var len: c.gsize = 0;
+        if (c.g_file_get_contents(b, &got, &len, null) == 0) return "could not read the copy";
+        defer c.g_free(got);
+        if (len != size or !std.mem.eql(u8, got[0..len], data)) return "the copy's content differs";
+        const st = statOf(b) orelse return "stat of the copy";
+        if (st.mode & 0o7777 != 0o640) return "the copy's mode differs";
+        if (st.mtime.sec != 1_000_000_000 or st.mtime.nsec != 123_456_789) return "the copy's mtime differs";
+        if (!noTempFiles(dir)) return "copy left a temp file";
+        const fb = c.g_file_new_for_path(b);
+        defer c.g_object_unref(fb);
+        var slow = false;
+        const info = queryTimed(fb, "metadata::k", &slow) orelse return "query of the copy failed";
+        defer c.g_object_unref(info);
+        if (!stringAttr(info, "metadata::k", "copied")) return "metadata did not follow the copy (ALL_METADATA)";
+    }
+    // Copy without ALL_METADATA: no metadata rows; existing destination: EXISTS; OVERWRITE.
+    {
+        const c2 = tmpPath(dir, "c2");
+        defer c.g_free(c2);
+        if (expectOp(1, a, c2, 0, 0, "plain copy")) |w| return w;
+        const f = c.g_file_new_for_path(c2);
+        defer c.g_object_unref(f);
+        var slow = false;
+        const info = queryTimed(f, "metadata::k", &slow) orelse return "query of the plain copy failed";
+        defer c.g_object_unref(info);
+        if (hasMetadata(info)) return "metadata followed a copy without ALL_METADATA";
+        if (expectOp(1, a, c2, 0, c.G_IO_ERROR_EXISTS, "copy onto an existing file")) |w| return w;
+        if (expectOp(1, b, c2, c.G_FILE_COPY_OVERWRITE, 0, "copy with OVERWRITE")) |w| return w;
+        if (expectOp(3, c2, null, 0, 0, "delete")) |w| return w;
+        if (fileExists(c2)) return "delete left the file";
+    }
+    // Move: the file and its metadata.
+    {
+        if (expectOp(2, b, m, 0, 0, "move")) |w| return w;
+        if (fileExists(b) or !fileExists(m)) return "move did not move";
+        const f = c.g_file_new_for_path(m);
+        defer c.g_object_unref(f);
+        var slow = false;
+        const info = queryTimed(f, "metadata::k", &slow) orelse return "query after move failed";
+        defer c.g_object_unref(info);
+        if (!stringAttr(info, "metadata::k", "copied")) return "metadata did not follow the move";
+    }
+    // Errors.
+    {
+        const none = tmpPath(dir, "none");
+        defer c.g_free(none);
+        if (expectOp(1, none, b, 0, c.G_IO_ERROR_NOT_FOUND, "copy of a missing file")) |w| return w;
+        if (expectOp(3, none, null, 0, c.G_IO_ERROR_NOT_FOUND, "delete of a missing file")) |w| return w;
+        const sub = tmpPath(dir, "sub");
+        defer c.g_free(sub);
+        if (linux.errno(linux.mkdirat(linux.AT.FDCWD, sub, 0o700)) != .SUCCESS) return "mkdir sub";
+        const inner = tmpPath(sub, "x");
+        defer c.g_free(inner);
+        if (!writeFile(inner, "x")) return "write sub/x";
+        if (expectOp(1, sub, b, 0, c.G_IO_ERROR_WOULD_RECURSE, "copy of a directory")) |w| return w;
+        if (expectOp(3, sub, null, 0, c.G_IO_ERROR_NOT_EMPTY, "delete of a non-empty dir")) |w| return w;
+        if (expectOp(1, "relative", b, 0, c.G_IO_ERROR_INVALID_ARGUMENT, "relative path")) |w| return w;
+        if (expectOp(1, a, b, c.G_FILE_COPY_BACKUP, c.G_IO_ERROR_NOT_SUPPORTED, "BACKUP flag")) |w| return w;
+        if (expectOp(5, m, null, 0, 0, "fsync")) |w| return w;
+        if (expectOp(4, sub, null, 0, 0, "delete tree")) |w| return w;
+        if (fileExists(sub)) return "delete-tree left the directory";
+    }
+    // Already-cancelled: CANCELLED without a round trip.
+    {
+        const obj = newOp(1, a, b, 0) orelse return "GungnirFileOp is not registered";
+        defer c.g_object_unref(obj);
+        var r: OpRun = .{};
+        if (runOpObj(obj, &r, 0)) |w| return w;
+        if (r.code != c.G_IO_ERROR_CANCELLED and r.code != 0) return "a cancel at once gave the wrong result";
+        if (r.code == 0) _ = linux.unlink(b);
+    }
+
+    // Mid-operation cancellation: every step of the daemon takes 300 ms now.
+    if (c.g_setenv("GUNGNIR_TEST_SLOW_OPS_MS", "300", 1) == 0) return "g_setenv GUNGNIR_TEST_SLOW_OPS_MS";
+    ctx.stopDaemon();
+    if (ctx.startDaemon()) |what| return what;
+    c.g_unsetenv("GUNGNIR_TEST_SLOW_OPS_MS");
+    {
+        const obj = newOp(1, a, b, 0) orelse return "GungnirFileOp is not registered";
+        defer c.g_object_unref(obj);
+        var r: OpRun = .{};
+        if (runOpObj(obj, &r, 150)) |w| return w;
+        if (r.code != c.G_IO_ERROR_CANCELLED) {
+            c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: cancel: code %d: %s", r.code, @as([*:0]const u8, @ptrCast(&r.message)));
+            return "a cancelled copy did not report CANCELLED";
+        }
+        if (r.done_ms - r.start_ms > 2_000) return "cancellation took too long";
+        if (fileExists(b)) return "a cancelled copy left its destination";
+        // The daemon removes its temp file as the op unwinds.
+        const t0 = nowMs();
+        while (!noTempFiles(dir)) {
+            if (nowMs() - t0 > 2_000) return "a cancelled copy left a temp file";
+            c.g_usleep(10 * 1000);
+        }
+    }
+
+    // A hung mount: refused by the module's health cache within max_hung_call_ms.
+    {
+        const hung = tmpPath(ctx.tmp_dir, "fake-hung");
+        defer c.g_free(hung);
+        if (linux.errno(linux.mkdirat(linux.AT.FDCWD, hung, 0o700)) != .SUCCESS) return "could not create the fake mount dir";
+        defer _ = linux.rmdir(hung);
+        const hf = tmpPath(hung, "f");
+        defer c.g_free(hf);
+        if (c.g_setenv("GUNGNIR_TEST_FAKE_HUNG_MOUNT", hung, 1) == 0) return "g_setenv GUNGNIR_TEST_FAKE_HUNG_MOUNT";
+        ctx.stopDaemon();
+        if (ctx.startDaemon()) |what| return what;
+        c.g_unsetenv("GUNGNIR_TEST_FAKE_HUNG_MOUNT");
+        // Reconnect and learn the mount's state from the pushed events.
+        const t0 = nowMs();
+        while (unhealthyMounts() < 1) {
+            if (nowMs() - t0 > 10_000) return "no mount-health event reached the module";
+            // A metadata call drives the module's reconnect.
+            const f = c.g_file_new_for_path(m);
+            defer c.g_object_unref(f);
+            const info = c.g_file_query_info(f, "metadata::k", c.G_FILE_QUERY_INFO_NONE, null, null);
+            if (info != null) c.g_object_unref(info);
+            c.g_usleep(20 * 1000);
+        }
+        var r: OpRun = .{};
+        if (runOp(1, m, hf, 0, &r)) |w| return w;
+        if (r.code != c.G_IO_ERROR_TIMED_OUT) return "a copy into a hung mount was not refused with TIMED_OUT";
+        if (r.done_ms - r.start_ms > max_hung_call_ms) return "a copy into a hung mount was not refused fast";
+        if (!contains(@ptrCast(&r.message), "health monitor")) return "the refusal did not come from the health cache";
+    }
+
+    // No daemon: NOT_SUPPORTED, quickly.
+    ctx.stopDaemon();
+    {
+        var r: OpRun = .{};
+        if (runOp(5, m, null, 0, &r)) |w| return w;
+        if (r.code != c.G_IO_ERROR_NOT_SUPPORTED) return "an op without a daemon gave the wrong error";
+        if (r.done_ms - r.start_ms > 1_000) return "an op without a daemon took too long";
+    }
+    if (checkGungnirFast()) |what| return what;
+    return null;
+}
+
 fn runHung(tmp_arg: [*c]u8) c_int {
     const tmp_dir = privateDir(tmp_arg, "hung") orelse return fail("could not create a private test directory");
     defer c.g_free(tmp_dir);
@@ -1299,5 +1606,6 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "daemon-stopped") and argc == 5) return runDaemon(argv[3], argv[4], "daemon-stopped", &checkDaemonStopped);
     if (std.mem.eql(u8, mode, "ui-thread") and argc == 5) return runDaemon(argv[3], argv[4], "ui-thread", &checkUiThread);
     if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
+    if (std.mem.eql(u8, mode, "file-ops") and argc == 5) return runDaemon(argv[3], argv[4], "file-ops", &checkFileOps);
     return fail("unknown mode or wrong argument count");
 }

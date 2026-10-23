@@ -221,6 +221,8 @@ rust:test:
   needs: ["rust:build"]
   script:
     - cargo test --release
+    # Milestone 8: the thread-pool fallback engine, forced.
+    - GUNGNIR_NO_URING=1 cargo test --release
 
 zig:test:
   stage: test

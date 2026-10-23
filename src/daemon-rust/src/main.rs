@@ -5,6 +5,8 @@ use gungnird::{
     fsid::{Resolver, ResolverConfig, SysBackend},
     health::{self, FakeHung, Gated, HealthConfig, HealthHandler, Monitor, StatfsProber},
     ipc, mdsvc,
+    ops::{self, Ops, OpsConfig},
+    opsvc::{DbMeta, MonitorGate, OpsHandler},
     store::{self, DbConfig, Store, StoreConfig},
 };
 
@@ -41,8 +43,18 @@ fn run() -> Result<()> {
     )?);
     let sink: Arc<dyn health::SuspectSink> = resolver.clone();
     monitor.set_sink(Arc::downgrade(&sink));
+    // Bulk file operations (milestone 8): io_uring if it passes its probe, else threads.
+    let (engine, why) = ops::choose_engine(env::var_os(ops::NO_URING_ENV).as_deref());
+    eprintln!("gungnird: file ops engine: {engine:?} ({why})");
+    let ops = Arc::new(Ops::start(
+        OpsConfig::from_env(),
+        engine,
+        Arc::new(MonitorGate::new(Arc::clone(&monitor))),
+        Arc::new(DbMeta::new(Arc::clone(&resolver), db.clone())),
+    )?);
     let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db));
-    let handler: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
+    let health: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
+    let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
     let sock = ipc::socket_path_from_env()?;
     let listener = ipc::bind(&sock)?;
     eprintln!("gungnird: listening on {}", sock.display());
