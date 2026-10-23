@@ -31,8 +31,9 @@ const JOURNAL_MODE_WAL: &str = "PRAGMA journal_mode = WAL";
 // busy_timeout is set separately from the config (small: see the module docs).
 const PRAGMAS: &str = "PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF;";
 
-// No separate delete index: the PRIMARY KEY prefix (fs_uuid, subvol_id, inode_num)
-// already serves unlink deletes; an extra index only adds write cost.
+// No separate delete index on metadata: the PRIMARY KEY prefix (fs_uuid, subvol_id,
+// inode_num) already serves unlink deletes; an extra index only adds write cost. path_hint
+// (written only when a value is set) is indexed by path for removed/moved (milestone 6).
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
   fs_uuid    TEXT    NOT NULL,
   subvol_id  INTEGER NOT NULL,
@@ -51,8 +52,10 @@ CREATE TABLE IF NOT EXISTS path_hint (
   generation INTEGER NOT NULL,
   path       BLOB    NOT NULL,
   updated    INTEGER NOT NULL,
+  links      INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (fs_uuid, subvol_id, inode_num, generation)
-) WITHOUT ROWID;";
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS path_hint_by_path ON path_hint (path);";
 
 const ID_WHERE: &str = "fs_uuid = ?1 AND subvol_id = ?2 AND inode_num = ?3 AND generation = ?4";
 
@@ -150,6 +153,15 @@ fn setup(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch(PRAGMAS)?;
     conn.execute_batch(SCHEMA)?;
+    // Milestone 5 databases: path_hint without the hard link count.
+    let has_links: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('path_hint') WHERE name = 'links'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has_links {
+        conn.execute_batch("ALTER TABLE path_hint ADD COLUMN links INTEGER NOT NULL DEFAULT 1")?;
+    }
     Ok(())
 }
 
@@ -193,6 +205,20 @@ fn is_busy(e: &rusqlite::Error) -> bool {
         e.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
+}
+
+/// Same metadata key (btime is only a staleness check, not part of the key).
+fn same_key(a: &Ident, b: &Ident) -> bool {
+    a.fs_uuid == b.fs_uuid
+        && a.subvol_id == b.subvol_id
+        && a.inode_num == b.inode_num
+        && a.generation == b.generation
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// SQLite stores INTEGER as i64; identity fields are u64 bit patterns.
@@ -360,9 +386,22 @@ impl Store {
         value: &[u8],
         hint: Option<&[u8]>,
     ) -> std::result::Result<(), MdError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.set_linked(id, key, value, hint.map(|p| (p, 1)))
+    }
+
+    /// [`Store::set`], recording the file's hard link count with the path hint: a file
+    /// with several links keeps its metadata when one of them is deleted.
+    ///
+    /// # Errors
+    /// As [`Store::set`].
+    pub fn set_linked(
+        &mut self,
+        id: &Ident,
+        key: &str,
+        value: &[u8],
+        hint: Option<(&[u8], u32)>,
+    ) -> std::result::Result<(), MdError> {
+        let now = unix_now();
         self.write(|tx| {
             if Self::is_stale(tx, id)? {
                 return Err(TxErr::Md(MdError::NoSuchFile));
@@ -400,14 +439,16 @@ impl Store {
                 ))?
                 .execute(params![u, s, i, g, bs, bn])?;
             }
-            if let Some(p) = hint {
+            if let Some((p, links)) = hint {
                 tx.prepare_cached(
-                    "INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                    "INSERT INTO path_hint \
+                     (fs_uuid, subvol_id, inode_num, generation, path, updated, links) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                      ON CONFLICT (fs_uuid, subvol_id, inode_num, generation) \
-                     DO UPDATE SET path = excluded.path, updated = excluded.updated",
+                     DO UPDATE SET path = excluded.path, updated = excluded.updated, \
+                     links = excluded.links",
                 )?
-                .execute(params![u, s, i, g, p, now])?;
+                .execute(params![u, s, i, g, p, now, links])?;
             }
             Ok(())
         })
@@ -466,6 +507,151 @@ impl Store {
         Ok((keys, more))
     }
 
+    /// The identities whose last known path is `path`.
+    /// Identities last seen at `path`, with their hard link count then.
+    fn hinted_at(tx: &Connection, path: &[u8]) -> rusqlite::Result<Vec<(Ident, i64)>> {
+        let mut st = tx.prepare_cached(
+            "SELECT fs_uuid, subvol_id, inode_num, generation, links FROM path_hint \
+             WHERE path = ?1",
+        )?;
+        st.query_map(params![path], |r| {
+            Ok((
+                Ident {
+                    fs_uuid: r.get(0)?,
+                    subvol_id: r.get::<_, i64>(1)? as u64,
+                    inode_num: r.get::<_, i64>(2)? as u64,
+                    generation: r.get::<_, i64>(3)? as u64,
+                    btime_sec: 0,
+                    btime_nsec: 0,
+                },
+                r.get(4)?,
+            ))
+        })?
+        .collect()
+    }
+
+    /// `id`'s name at its hinted path is gone (deleted, or replaced by a rename). With
+    /// one link the file is gone: drop its metadata. With several, the file lives on
+    /// under another name the daemon does not know: keep the metadata (keyed by
+    /// identity, it is found again from any link), drop only the outdated hint.
+    /// Returns whether the metadata was dropped.
+    fn unlinked(tx: &Connection, id: &Ident, links: i64) -> rusqlite::Result<bool> {
+        if links > 1 {
+            tx.prepare_cached(&format!("DELETE FROM path_hint WHERE {ID_WHERE}"))?
+                .execute(Self::id_params(id))?;
+            return Ok(false);
+        }
+        Self::forget(tx, id)?;
+        Ok(true)
+    }
+
+    /// The file at `path` was deleted: drop the metadata of every identity last seen
+    /// there, except `alive` (what is at `path` now, if anything: a file created again
+    /// at the same path, or the same file still linked there). Returns how many
+    /// identities were dropped.
+    ///
+    /// Only files whose metadata was set through `path` (their path hint) can be found:
+    /// the file is gone, so its identity cannot be read any more. A file renamed behind
+    /// GIO's back keeps its old hint until its next set; a later delete of whatever then
+    /// sits at the old path drops it too (see AGENTS.md).
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn removed(
+        &mut self,
+        path: &[u8],
+        alive: Option<&Ident>,
+    ) -> std::result::Result<u32, MdError> {
+        // Every GIO delete reports here; most files never had metadata. Look before
+        // taking the write lock.
+        if self.read(|c| Self::hinted_at(c, path))?.is_empty() {
+            return Ok(0);
+        }
+        self.write(|tx| {
+            let mut n = 0u32;
+            for (id, links) in Self::hinted_at(tx, path)? {
+                if alive.is_some_and(|a| same_key(a, &id)) {
+                    continue;
+                }
+                n += u32::from(Self::unlinked(tx, &id, links)?);
+            }
+            Ok(n)
+        })
+    }
+
+    /// The file `id` was renamed from `src` to `dest`. Its rows stay (they are keyed by
+    /// identity); its path hint becomes `dest`, the hints of all files below `src/` are
+    /// rewritten to below `dest/` in the same transaction, and files last seen at `dest`
+    /// (replaced by the rename) are dropped, unless they had other hard links (only their
+    /// hint goes). Returns
+    /// `(hints rewritten, identities dropped)`.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn moved(
+        &mut self,
+        src: &[u8],
+        dest: &[u8],
+        id: &Ident,
+    ) -> std::result::Result<(u32, u32), MdError> {
+        let now = unix_now();
+        let lo = [src, b"/"].concat();
+        let hi = [src, b"0"].concat();
+        // Most renamed files have no metadata, nothing hinted at `dest` and nothing below:
+        // look before taking the write lock.
+        let anything = self.read(|c| {
+            Ok(!Self::hinted_at(c, dest)?.is_empty()
+                || c.prepare_cached(&format!("SELECT 1 FROM metadata WHERE {ID_WHERE} LIMIT 1"))?
+                    .exists(Self::id_params(id))?
+                || c.prepare_cached(
+                    "SELECT 1 FROM path_hint WHERE path >= ?1 AND path < ?2 LIMIT 1",
+                )?
+                .exists(params![lo, hi])?)
+        })?;
+        if !anything {
+            return Ok((0, 0));
+        }
+        self.write(|tx| {
+            let mut forgotten = 0u32;
+            for (other, links) in Self::hinted_at(tx, dest)? {
+                if !same_key(&other, id) {
+                    forgotten += u32::from(Self::unlinked(tx, &other, links)?);
+                }
+            }
+            if Self::is_stale(tx, id)? {
+                Self::forget(tx, id)?;
+            }
+            let mut rewritten = 0u32;
+            let has_rows = tx
+                .prepare_cached(&format!("SELECT 1 FROM metadata WHERE {ID_WHERE} LIMIT 1"))?
+                .exists(Self::id_params(id))?;
+            if has_rows {
+                let (u, s, i, g) = Self::id_params(id);
+                tx.prepare_cached(
+                    "INSERT INTO path_hint (fs_uuid, subvol_id, inode_num, generation, path, updated) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT (fs_uuid, subvol_id, inode_num, generation) \
+                     DO UPDATE SET path = excluded.path, updated = excluded.updated",
+                )?
+                .execute(params![u, s, i, g, dest, now])?;
+                rewritten += 1;
+            }
+            // Below a renamed directory: paths in [src/, src0) ('0' follows '/'), byte
+            // order, all of them in this transaction (one indexed range update, however
+            // many: a hint left at the old path would let a later delete there drop the
+            // moved file's metadata). CAST keeps the result a BLOB: `||` yields TEXT,
+            // which sorts after every BLOB and would fall out of these byte ranges.
+            let n = tx
+                .prepare_cached(
+                    "UPDATE path_hint SET path = CAST(?3 || substr(path, ?4) AS BLOB), \
+                     updated = ?5 WHERE path >= ?1 AND path < ?2",
+                )?
+                .execute(params![lo, hi, dest, src.len() + 1, now])?;
+            rewritten = rewritten.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+            Ok((rewritten, forgotten))
+        })
+    }
+
     /// The last path a value was set through (diagnostics, later moves and GC).
     ///
     /// # Errors
@@ -487,13 +673,18 @@ impl Store {
 pub enum DbReq {
     Get(Ident, String),
     /// Encoded value, optional path hint.
-    Set(Ident, String, Vec<u8>, Option<Vec<u8>>),
+    /// The value, and the path hint with the file's hard link count.
+    Set(Ident, String, Vec<u8>, Option<(Vec<u8>, u32)>),
     Unset(Ident, String),
     /// Cursor (keys strictly after it).
     List(Ident, String),
     /// Drop stale rows for an identity the daemon just resolved (identify). Runs even
     /// when older than `max_age`: requests queued behind it rely on it.
     Purge(Ident),
+    /// Deleted path, and the identity found at it now (if any) on the ring thread.
+    Removed(Vec<u8>, Option<Ident>),
+    /// Source path, destination path, identity of the renamed file.
+    Moved(Vec<u8>, Vec<u8>, Ident),
 }
 
 /// Reply body on success (see `md` for the layouts), or the failure status.
@@ -553,7 +744,9 @@ pub fn execute(store: &mut Store, req: &DbReq) -> DbResult {
             Value::decode(&v).map_err(|_| MdError::Db)?;
             Ok(v)
         }
-        DbReq::Set(id, k, v, hint) => store.set(id, k, v, hint.as_deref()).map(|()| Vec::new()),
+        DbReq::Set(id, k, v, hint) => store
+            .set_linked(id, k, v, hint.as_ref().map(|(p, n)| (p.as_slice(), *n)))
+            .map(|()| Vec::new()),
         DbReq::Unset(id, k) => store.unset(id, k).map(|()| Vec::new()),
         DbReq::Purge(id) => store.purge_stale(id).map(|_| Vec::new()),
         DbReq::List(id, after) => {
@@ -562,6 +755,14 @@ pub fn execute(store: &mut Store, req: &DbReq) -> DbResult {
             keys.retain(|k| check_key(k.as_bytes()).is_ok());
             Ok(list_body(&keys, more))
         }
+        DbReq::Removed(path, alive) => store
+            .removed(path, alive.as_ref())
+            .map(|n| n.to_le_bytes().to_vec()),
+        DbReq::Moved(src, dest, id) => store.moved(src, dest, id).map(|(r, f)| {
+            let mut b = r.to_le_bytes().to_vec();
+            b.extend_from_slice(&f.to_le_bytes());
+            b
+        }),
     }
 }
 

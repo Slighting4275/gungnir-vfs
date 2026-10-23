@@ -68,6 +68,9 @@ pub struct FileIdentity {
     /// `stx_btime` when `STATX_BTIME` is reported, else 0 (not part of the key).
     pub btime_sec: i64,
     pub btime_nsec: u32,
+    /// `stx_nlink` (1 if not reported): not part of the key. The metadata service keeps
+    /// the metadata of a file deleted through one of several hard links.
+    pub nlink: u32,
     /// Which step of the fallback chain produced `fs_uuid` (diagnostics only).
     pub fs_uuid_source: UuidSource,
 }
@@ -842,6 +845,11 @@ impl SysBackend {
             generation,
             btime_sec,
             btime_nsec,
+            nlink: if stx.stx_mask & libc::STATX_NLINK != 0 {
+                stx.stx_nlink
+            } else {
+                1
+            },
             fs_uuid_source: src,
         })
     }

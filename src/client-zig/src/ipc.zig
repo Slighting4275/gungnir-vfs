@@ -254,6 +254,16 @@ pub const Conn = struct {
         _ = linux.munmap(conn.shm.mem.ptr, conn.shm.mem.len);
         _ = linux.close(conn.fd);
     }
+
+    /// Zero-timeout liveness check of the control socket. The daemon never writes to it
+    /// after the ack, so any event (EOF, hang-up, error, stray bytes) means the
+    /// connection is over: a stopped daemon is noticed at once, not at a deadline.
+    pub fn alive(conn: *const Conn) bool {
+        var pfd = [1]linux.pollfd{.{ .fd = conn.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const rc = linux.poll(&pfd, 1, 0);
+        if (linux.errno(rc) != .SUCCESS) return true; // EINTR: the next call checks again
+        return rc == 0;
+    }
 };
 
 fn closeFd(fd: linux.fd_t) void {
@@ -503,6 +513,17 @@ test "empty ring wait is bounded" {
     const t0 = nowNs();
     try std.testing.expectError(error.Timeout, shm.waitReadable(ring_d2c, t0 + 20 * std.time.ns_per_ms));
     try std.testing.expect(nowNs() - t0 < 1000 * std.time.ns_per_ms);
+}
+
+test "liveness follows the peer of the control socket" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
+    defer closeFd(fds[0]);
+    var buf: [shm_size]u8 align(4096) = undefined;
+    const conn: Conn = .{ .fd = fds[0], .shm = .{ .mem = &buf } };
+    try std.testing.expect(conn.alive());
+    closeFd(fds[1]);
+    try std.testing.expect(!conn.alive());
 }
 
 test "missing daemon fails fast" {

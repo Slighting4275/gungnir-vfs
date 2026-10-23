@@ -5,8 +5,10 @@
 Gungnir is a replacement for GVfs, the GNOME virtual filesystem layer. It is built as a
 non-blocking I/O pipeline: no call ever waits on a broken mount or a metadata lock.
 
-**Status:** early skeleton. It does not replace GVfs yet. The GIO module currently
-hands every operation to GLib's local VFS.
+**Status:** early skeleton. It does not replace GVfs yet. The GIO module hands file
+operations to GLib's local VFS and serves `metadata::*` attributes for local files from
+`gungnird` (for example `gio set FILE metadata::foo bar`, `gio info -a 'metadata::*' FILE`
+with `GIO_USE_VFS=gungnir`).
 
 ## Components
 
