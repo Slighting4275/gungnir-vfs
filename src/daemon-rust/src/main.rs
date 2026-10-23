@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use gungnird::{Error, Result, open_db};
+use gungnird::{Error, Result, ipc, open_db};
 
 fn db_path() -> Result<PathBuf> {
     if let Some(arg) = env::args_os().nth(1) {
@@ -17,7 +17,10 @@ fn run() -> Result<()> {
     let path = db_path()?;
     let _conn = open_db(&path)?;
     eprintln!("gungnird: metadata db ready at {}", path.display());
-    Ok(())
+    let sock = ipc::socket_path_from_env()?;
+    let listener = ipc::bind(&sock)?;
+    eprintln!("gungnird: listening on {}", sock.display());
+    ipc::serve(&listener.socket, ipc::Config::default())
 }
 
 fn main() -> ExitCode {

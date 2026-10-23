@@ -7,4 +7,5 @@ publish = false
 
 [dependencies]
 blake3 = "1"
+libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }

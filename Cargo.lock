@@ -87,6 +87,7 @@ name = "gungnird"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "libc",
  "rusqlite",
 ]
 

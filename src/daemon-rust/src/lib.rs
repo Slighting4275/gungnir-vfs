@@ -1,6 +1,11 @@
-use std::{fmt, io, path::Path};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::Connection;
+
+pub mod ipc;
 
 // `journal_mode` reports the mode actually in effect and silently keeps the old
 // one when WAL is unavailable (e.g. ":memory:"), so it is queried and checked.
@@ -27,6 +32,13 @@ pub enum Error {
     Sqlite(rusqlite::Error),
     NoHome,
     WalUnavailable(String),
+    NoSocketPath,
+    SocketPathTooLong(PathBuf),
+    AlreadyRunning(PathBuf),
+    NotASocket(PathBuf),
+    InsecureSocketDir(PathBuf),
+    Protocol(&'static str),
+    RingFull,
 }
 
 impl fmt::Display for Error {
@@ -41,6 +53,17 @@ impl fmt::Display for Error {
                     "sqlite refused WAL journal mode (still in '{mode}' mode)"
                 )
             }
+            Error::NoSocketPath => write!(f, "no socket path (set XDG_RUNTIME_DIR or HOME)"),
+            Error::SocketPathTooLong(p) => write!(f, "socket path too long: {}", p.display()),
+            Error::AlreadyRunning(p) => write!(f, "already listening on {}", p.display()),
+            Error::NotASocket(p) => write!(f, "{} exists and is not a socket", p.display()),
+            Error::InsecureSocketDir(p) => write!(
+                f,
+                "{} must be a directory owned by this user and not world-writable",
+                p.display()
+            ),
+            Error::Protocol(what) => write!(f, "protocol: {what}"),
+            Error::RingFull => write!(f, "ring full"),
         }
     }
 }
