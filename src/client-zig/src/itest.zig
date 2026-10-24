@@ -1581,6 +1581,43 @@ fn runMissing(tmp_arg: [*c]u8) c_int {
     return 0;
 }
 
+fn runVolmon(tmp_arg: [*c]u8) c_int {
+    _ = tmp_arg;
+    if (checkGungnirFast()) |what| return fail(what);
+    const vm_type = c.g_type_from_name("GungnirVolumeMonitor");
+    if (vm_type == 0) return fail("GungnirVolumeMonitor type is not registered");
+    const vm_obj = c.g_object_new(vm_type, @as(?*const u8, null));
+    if (vm_obj == null) return fail("could not instantiate GungnirVolumeMonitor");
+    const vm: *c.GVolumeMonitor = @ptrCast(@alignCast(vm_obj));
+    defer c.g_object_unref(vm);
+
+    const mounts = c.g_volume_monitor_get_mounts(vm);
+    if (mounts == null) return fail("g_volume_monitor_get_mounts returned NULL");
+    defer c.g_list_free_full(mounts, @ptrCast(&c.g_object_unref));
+
+    var found_root = false;
+    var curr: ?*c.GList = mounts;
+    while (curr) |node| : (curr = node.*.next) {
+        const m: *c.GMount = @ptrCast(@alignCast(node.*.data));
+        const root = c.g_mount_get_root(m);
+        if (root) |r| {
+            defer c.g_object_unref(r);
+            const path = c.g_file_get_path(r);
+            if (path) |p| {
+                defer c.g_free(p);
+                if (std.mem.eql(u8, std.mem.span(p), "/")) found_root = true;
+            }
+        }
+    }
+    if (!found_root) return fail("root mount / not found in GungnirVolumeMonitor mounts");
+
+    const vols = c.g_volume_monitor_get_volumes(vm);
+    if (vols == null) return fail("g_volume_monitor_get_volumes returned NULL");
+    defer c.g_list_free_full(vols, @ptrCast(&c.g_object_unref));
+
+    return 0;
+}
+
 pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (argc < 3) return fail("usage: gungnir-itest <module-dir> <mode> [args]");
     const mode = std.mem.span(argv[2]);
@@ -1607,5 +1644,6 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "ui-thread") and argc == 5) return runDaemon(argv[3], argv[4], "ui-thread", &checkUiThread);
     if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
     if (std.mem.eql(u8, mode, "file-ops") and argc == 5) return runDaemon(argv[3], argv[4], "file-ops", &checkFileOps);
+    if (std.mem.eql(u8, mode, "volmon") and argc == 4) return runVolmon(argv[3]);
     return fail("unknown mode or wrong argument count");
 }

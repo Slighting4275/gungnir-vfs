@@ -21,13 +21,21 @@
 | **M7** | Mount Health Monitor (`health.rs`, `health.zig`) | **ACCEPTED** | Merged |
 | **M8** | Async File Operations Engine (`ops.rs`, `fileop.zig`) | **ACCEPTED** | Merged |
 | **M9** | Trash (`trash://`) & Recent Items (`recent://`) | **ACCEPTED** | Integrated in Gungnir VFS & gungnir-fm (FreeDesktop Trash spec 1.0, DIB-F001, SEC-F-001, A-T005-1, BC-T005-F1) |
-| **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **IN PROGRESS** | Daemon and client monitor |
-| **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **QUEUED** | Planned |
+| **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **ACCEPTED** | `GVolumeMonitor`, `GVolume`, `GMount`, non-blocking mountinfo parser |
+| **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **IN PROGRESS** | Planned |
 | **M12** | Hardening, Packaging & System Release | **QUEUED** | PKGBUILD, systemd unit, fuzzing |
 
 ---
 
-## Active Task State: M9 Complete & Universal Compatibility Verified, Advancing to M10
+## Active Task State: M10 Complete, Advancing to M11
+- **Objective:** Complete Volume & Mount Monitor subsystem (`volmon.zig`), exposing `GungnirVolumeMonitor` as `GNativeVolumeMonitor` / `GVolumeMonitor` and `GungnirMount` as `GMount`.
+- **Milestone 10 Features Completed:**
+  - Non-blocking `/proc/self/mountinfo` parsing with octal path unescaping.
+  - Virtual/pseudo filesystem filtering to present user-relevant storage volumes.
+  - Full `GMountIface` implementation (`get_root`, `get_name`, `get_icon`, `can_unmount`, `get_uuid`).
+  - Full `GVolumeIface` implementation (`get_name`, `get_uuid`, `get_mount`, `can_mount`).
+  - `GNativeVolumeMonitorClass` implementation with `get_mount_for_mount_path` and `GVolumeMonitorClass` vfuncs (`get_mounts`, `get_volumes`, `get_mount_for_uuid`).
+  - Integration test suite expanded to 12 modes including `itest volmon` (all 22/22 steps passing).
 - **Objective:** FreeDesktop.org Trash & Recent Items verified and integrated natively into `gungnir-fm` (`GUNGNIR_FM_BACKEND=live`).
 - **Universal Compatibility Verified:**
   - Deterministic directory traversal ordering across all filesystem types (Btrfs FIFO, tmpfs LIFO, Ext4 hash-based).

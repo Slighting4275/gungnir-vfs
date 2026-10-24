@@ -21,8 +21,8 @@ Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem opera
 | **M7** | Hang-Proof Mount Health Monitor | **Complete** | Sacrificial probe threads, automatic detection of hung/gone network and FUSE mounts, fail-fast refusal (`SuspectMount`). |
 | **M8** | Asynchronous File Operations Engine | **Complete** | Native kernel `io_uring` with POSIX fallback, reflink (`FICLONE`), sparse copying (`copy_file_range`), atomic rename, progress events & cancellation. |
 | **M9** | Trash & Recent Items Engine | **Complete** | FreeDesktop.org Trash spec 1.0 (`trash://`, `.trashinfo`), `recent://` URI schemes, mount boundary defenses (`DIB-F001`), relative path sanitization (`SEC-F-001`). |
-| **M10** | Volume & Mount Monitor | **In Progress** | `GVolumeMonitor`, `GVolume`, `GMount`, `GDrive` event-driven lifecycle. |
-| **M11** | Daemon Lifecycle Management | **Queued** | Socket activation, idle auto-shutdown, live upgrade handoff. |
+| **M10** | Volume & Mount Monitor | **Complete** | `GVolumeMonitor`, `GVolume`, `GMount`, `GDrive` event-driven lifecycle, non-blocking mountinfo parser. |
+| **M11** | Daemon Lifecycle Management | **In Progress** | Socket activation, idle auto-shutdown, live upgrade handoff. |
 | **M12** | Hardening & System Release | **Queued** | Seccomp BPF filters, fuzzing verification, PKGBUILD, systemd user service. |
 
 ---

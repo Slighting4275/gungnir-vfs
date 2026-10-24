@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
     // events and fails GIO calls under it within 100 ms (milestone 7).
     // file-ops: the GungnirFileOp type against gungnird (milestone 8).
     const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops" }) |mode| {
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "volmon" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());
