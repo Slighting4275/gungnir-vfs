@@ -736,8 +736,11 @@ fn unreadable_file_or_dir_never_gets_a_different_key() -> Result<()> {
 fn unreadable_file_without_generations_keeps_generation_0() -> Result<()> {
     // procfs has no FS_IOC_GETVERSION: an unreadable proc file keeps the readable key.
     let p = Path::new("/proc/1/environ");
-    if euid_is_root() || fs::File::open(p).is_ok() {
-        eprintln!("skipped: {} is readable here", p.display());
+    if !p.exists() || euid_is_root() || fs::File::open(p).is_ok() {
+        eprintln!(
+            "skipped: {} is not present or is readable here",
+            p.display()
+        );
         return Ok(());
     }
     let id = sys()?.identify_path(p)?;

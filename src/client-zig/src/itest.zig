@@ -1387,7 +1387,7 @@ fn checkFileOps(ctx: *Ctx) ?[*:0]const u8 {
         const size = 4 << 20;
         const data = std.heap.c_allocator.alloc(u8, size) catch return "out of memory";
         defer std.heap.c_allocator.free(data);
-        for (data, 0..) |*x, i| x.* = @truncate(i *% 2654435761 >> 13);
+        for (data, 0..) |*x, i| x.* = @truncate((i *% 2654435761) >> 13);
         if (!writeFile(a, data)) return "could not write the source";
         if (linux.errno(linux.chmod(a, 0o640)) != .SUCCESS) return "chmod";
         const ts = [2]linux.timespec{ .{ .sec = 1_000_000_000, .nsec = 123_456_789 }, .{ .sec = 1_000_000_000, .nsec = 123_456_789 } };
