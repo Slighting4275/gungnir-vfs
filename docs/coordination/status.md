@@ -1,8 +1,8 @@
 # Gungnir VFS Coordination Status
 
-**Current Revision:** `8cf6077` (main)
-**Active Milestone:** Milestone 9 (Trash and Recent Items) & Milestone 10 (Volume & Mount Monitor)
-**Task in Progress:** M9 Complete / M10 Initiation
+**Current Revision:** `d947cb8` (main)
+**Active Milestone:** Milestone 10 (Volume & Mount Monitor)
+**Task in Progress:** M9 Complete / M10 Active Implementation
 **Current Owner:** Antigravity (Engineering Lead & Active Bug Checker)
 **Authorized by:** the project maintainer
 
@@ -27,14 +27,20 @@
 
 ---
 
-## Active Task State: M9 Complete, Advancing to M10
-- **Objective:** FreeDesktop.org Trash & Recent Items verified and integrated into `gungnir-fm`.
+## Active Task State: M9 Complete & Universal Compatibility Verified, Advancing to M10
+- **Objective:** FreeDesktop.org Trash & Recent Items verified and integrated natively into `gungnir-fm` (`GUNGNIR_FM_BACKEND=live`).
+- **Universal Compatibility Verified:**
+  - Deterministic directory traversal ordering across all filesystem types (Btrfs FIFO, tmpfs LIFO, Ext4 hash-based).
+  - FSID 3-tier discovery chain across volatile (tmpfs/ramfs), network (NFS/SMB), and block mounts.
+  - Native kernel `io_uring` with transparent POSIX fallback.
+  - Native zero-copy shared-memory ring buffer (protocol v2, 32 slots × 4096B, futex signaling).
 - **Safety Mitigations Verified:**
   - `DIB-F001` (Critical): Mount boundary check during recursive trash deletion verified.
   - `SEC-F-001` (Security): Relative path sanitization against mount root verified.
   - `A-T005-1` (Medium): Corrupted or unreadable `.trashinfo` mode-000 tolerance.
   - `BC-T005-F1` (Medium): Directory at `info/X.trashinfo` removability check before payload deletion.
 - **Verification Suite:**
+  - GitLab CI Pipeline #2985406943: 100% green (`rust:lint`, `zig:lint`, `rust:build`, `zig:build`, `rust:test`, `zig:test`).
   - `zb test --summary all`: 21/21 steps passed (38/38 unit tests + 11 integration modes).
   - `cargo test --release`: 100% unit tests passed in daemon and client.
-  - `gungnir-fm`: 73/73 tests passed with full Trash restore and empty-trash integration.
+  - `gungnir-fm`: All 73 tests passed + all 4 `gungnir_live` tests passed against real `gungnird`.
