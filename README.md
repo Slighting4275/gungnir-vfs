@@ -97,4 +97,4 @@ Every push and merge request executes [`.gitlab-ci.yml`](.gitlab-ci.yml) against
 
 ## License
 
-Gungnir is licensed under the GNU GPL v3.0 or later **and** the GNU AGPL v3.0 or later, combined (SPDX: `GPL-3.0-or-later AND AGPL-3.0-or-later`). See [COPYING](COPYING) and [LICENSES/](LICENSES).
+Gungnir is licensed under the GNU GPL v3.0 or later **and** the GNU AGPL v3.0 or later, combined (SPDX: `GPL-3.0-or-later AND AGPL-3.0-or-later`). Both apply at once; it is not a choice between them. The full text of both licenses is written in [COPYING](COPYING), [LICENSE](LICENSE), and the [LICENSES/](LICENSES) directory.
