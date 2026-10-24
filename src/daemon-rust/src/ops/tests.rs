@@ -1215,9 +1215,38 @@ fn a_failed_delete_tree_reports_only_what_it_deleted() -> R {
         let ops = Ops::start(test_cfg(), engine, Arc::new(NoGate), meta.clone())?;
         let root = t.join("tree");
         fs::create_dir(&root)?;
-        fs::write(root.join("gone"), b"x")?;
-        let mut deep = root.clone();
-        for i in 0..MAX_DEPTH {
+        let gone = root.join("gone");
+        fs::write(&gone, b"x")?;
+        let mut d_name = "d0".to_string();
+        let mut d_path = root.join(&d_name);
+        fs::create_dir(&d_path)?;
+
+        // Ensure `gone` is returned by readdir before the deep directory on any filesystem
+        // (btrfs is creation-order FIFO; tmpfs is LIFO; ext4 is hash-based).
+        let first_entry = |dir: &Path| -> std::io::Result<Option<std::ffi::OsString>> {
+            Ok(fs::read_dir(dir)?
+                .next()
+                .transpose()?
+                .map(|e| e.file_name()))
+        };
+        if first_entry(&root)?.as_deref() != Some(std::ffi::OsStr::new("gone")) {
+            // On tmpfs / LIFO filesystems, recreating `gone` makes it the newest entry.
+            fs::remove_file(&gone)?;
+            fs::write(&gone, b"x")?;
+        }
+        let mut counter = 1;
+        while first_entry(&root)?.as_deref() != Some(std::ffi::OsStr::new("gone")) {
+            // For hash-based ordering (like ext4 dir_index), rotate candidate directory names
+            // until `gone` sorts before the directory.
+            fs::remove_dir(&d_path)?;
+            d_name = format!("d{counter}");
+            d_path = root.join(&d_name);
+            fs::create_dir(&d_path)?;
+            counter += 1;
+        }
+
+        let mut deep = d_path;
+        for i in 1..MAX_DEPTH {
             deep.push(format!("d{i}"));
         }
         fs::create_dir_all(&deep)?;
