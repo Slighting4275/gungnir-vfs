@@ -83,7 +83,7 @@ fn getFileForUri(vfs: [*c]c.GVfs, uri: [*c]const u8) callconv(.c) ?*c.GFile {
 /// pointers, so this must not be g_vfs_get_supported_uri_schemes(local): those strings
 /// are owned by the local VFS's scheme table and freed on unregister (use-after-free),
 /// and "resource" would be listed twice.
-const supported_uri_schemes = [_][*c]const c.gchar{ "file", null };
+const supported_uri_schemes = [_][*c]const c.gchar{ "file", "trash", "recent", null };
 
 fn getSupportedUriSchemes(vfs: [*c]c.GVfs) callconv(.c) [*c]const [*c]const c.gchar {
     _ = vfs;
