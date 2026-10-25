@@ -22,7 +22,7 @@ Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem opera
 | **M8** | Asynchronous File Operations Engine | **Complete** | Native kernel `io_uring` with POSIX fallback, reflink (`FICLONE`), sparse copying (`copy_file_range`), atomic rename, progress events & cancellation. |
 | **M9** | Trash & Recent Items Engine | **Complete** | FreeDesktop.org Trash spec 1.0 (`trash://`, `.trashinfo`), `recent://` URI schemes, mount boundary defenses (`DIB-F001`), relative path sanitization (`SEC-F-001`). |
 | **M10** | Volume & Mount Monitor | **Complete** | `GVolumeMonitor`, `GVolume`, `GMount`, `GDrive` event-driven lifecycle, non-blocking mountinfo parser. |
-| **M11** | Daemon Lifecycle Management | **In Progress** | Socket activation, idle auto-shutdown, live upgrade handoff. |
+| **M11** | Daemon Lifecycle Management | **Complete** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
 | **M12** | Hardening & System Release | **Queued** | Seccomp BPF filters, fuzzing verification, PKGBUILD, systemd user service. |
 
 ---
@@ -81,6 +81,12 @@ GIO_USE_VFS=gungnir gio info .
 # Set and inspect metadata
 GIO_USE_VFS=gungnir gio set file.txt metadata::project "Gungnir"
 GIO_USE_VFS=gungnir gio info -a 'metadata::*' file.txt
+
+# Run background daemon with custom socket, DB path, and idle auto-shutdown
+gungnird --socket /run/user/1000/gungnir/control.sock --db ~/.local/share/gungnir/metadata.db --idle-timeout 300
+
+# Live in-place upgrade without dropping incoming connections
+kill -HUP $(pgrep gungnird)
 ```
 
 ---

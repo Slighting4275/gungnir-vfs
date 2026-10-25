@@ -192,6 +192,10 @@ impl Handler for OpsHandler {
             active: Vec::new(),
         })
     }
+
+    fn is_busy(&self) -> bool {
+        self.ops.is_busy() || self.inner.is_busy()
+    }
 }
 
 struct OpsSession {

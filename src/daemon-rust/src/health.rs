@@ -1175,6 +1175,10 @@ impl Handler for HealthHandler {
             monitor: Arc::clone(&self.monitor),
         })
     }
+
+    fn is_busy(&self) -> bool {
+        self.inner.is_busy()
+    }
 }
 
 struct HealthSession {

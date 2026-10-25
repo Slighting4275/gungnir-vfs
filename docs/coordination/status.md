@@ -1,8 +1,8 @@
 # Gungnir VFS Coordination Status
 
 **Current Revision:** `b5ada78` (main)
-**Active Milestone:** Milestone 10 (Volume & Mount Monitor) & Milestone 11 Initiation
-**Task in Progress:** Full Offline Bug Checker Complete / M10 Hardened
+**Active Milestone:** Milestone 11 (Daemon Lifecycle Management) Complete & Milestone 12 Queued
+**Task in Progress:** Milestone 11 Complete, Hardened & Verified across Unit and Integration Suites
 **Current Owner:** Antigravity (Engineering Lead & Active Bug Checker)
 **Authorized by:** the project maintainer
 
@@ -22,7 +22,7 @@
 | **M8** | Async File Operations Engine (`ops.rs`, `fileop.zig`) | **ACCEPTED** | Merged |
 | **M9** | Trash (`trash://`) & Recent Items (`recent://`) | **ACCEPTED** | Integrated in Gungnir VFS & gungnir-fm (FreeDesktop Trash spec 1.0, DIB-F001, SEC-F-001, A-T005-1, BC-T005-F1) |
 | **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **ACCEPTED** | `GVolumeMonitor`, `GVolume`, `GMount`, non-blocking mountinfo parser; Bug Checker audited & hardened |
-| **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **IN PROGRESS** | Planned |
+| **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **ACCEPTED** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`), idle auto-shutdown (`--idle-timeout`), race-free `signalfd` (`SIGTERM`/`SIGINT` graceful exit, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing; 149/149 tests passed |
 | **M12** | Hardening, Packaging & System Release | **QUEUED** | PKGBUILD, systemd unit, fuzzing |
 
 ---

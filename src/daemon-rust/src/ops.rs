@@ -747,6 +747,13 @@ impl Ops {
         (s.threads, s.stuck)
     }
 
+    /// Whether any file operations are queued or running.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        let s = lock(&self.sh.state);
+        !s.queue.is_empty() || !s.running.is_empty()
+    }
+
     /// The mount `path` is refused on, if any (health monitor or a recent timeout).
     #[must_use]
     pub fn blocked(&self, path: &[u8]) -> Option<PathBuf> {

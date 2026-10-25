@@ -4,8 +4,8 @@
 //! v2 (milestone 5) widened the slots to carry metadata requests (`md.rs`).
 
 use std::{
-    ffi::OsStr,
-    ffi::OsString,
+    env,
+    ffi::{CString, OsStr, OsString},
     fs,
     io::{self, Read, Write},
     mem,
@@ -537,6 +537,11 @@ pub trait Session: Send {
 /// Creates a [`Session`] per connection.
 pub trait Handler: Send + Sync + 'static {
     fn session(&self) -> Box<dyn Session>;
+
+    /// Whether any background or async operations are active on behalf of this handler.
+    fn is_busy(&self) -> bool {
+        false
+    }
 }
 
 /// Answers every request with [`crate::md::ST_UNSUPPORTED`] (pings still work).
@@ -560,13 +565,18 @@ impl Handler for NoService {
     }
 }
 
-/// Timeouts for one client connection.
+/// Timeouts and lifecycle configuration for the control socket.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// A client must complete its hello within this time, or it is dropped.
     pub handshake_timeout: Duration,
     /// How often an idle connection checks whether the client hung up.
     pub idle_poll: Duration,
+    /// Idle shutdown timeout (milestone 11). If set and active clients remain 0 with no
+    /// in-flight operations, `serve` exits cleanly.
+    pub idle_timeout: Option<Duration>,
+    /// Whether to handle lifecycle signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`) via `signalfd`.
+    pub handle_signals: bool,
 }
 
 impl Default for Config {
@@ -574,15 +584,59 @@ impl Default for Config {
         Self {
             handshake_timeout: Duration::from_secs(2),
             idle_poll: Duration::from_millis(200),
+            idle_timeout: None,
+            handle_signals: false,
         }
     }
 }
 
+/// The reason why `serve` returned (milestone 11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// Graceful termination requested via POSIX signal (SIGINT or SIGTERM).
+    Signal(i32),
+    /// Configured idle timeout elapsed with no active clients or in-flight ops.
+    IdleTimeout,
+    /// Live in-place upgrade requested via POSIX signal (SIGHUP or SIGUSR1).
+    LiveUpgrade(i32),
+}
+
 /// The bound control socket and the lock file that makes this daemon its only owner.
-/// Dropping it releases the lock; the socket file is left behind and is stale from then on.
+/// Dropping it releases the lock. For systemd socket activation, the socket file is
+/// preserved on shutdown.
 pub struct Listener {
     pub socket: UnixListener,
-    _lock: fs::File,
+    pub path: Option<PathBuf>,
+    pub socket_activated: bool,
+    _lock: Option<fs::File>,
+}
+
+impl Listener {
+    /// Bound socket path, if known.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Construct a socket-activated `Listener` around an already open `UnixListener`.
+    #[must_use]
+    pub fn new_socket_activated(socket: UnixListener, path: Option<PathBuf>) -> Self {
+        Self {
+            socket,
+            path,
+            socket_activated: true,
+            _lock: None,
+        }
+    }
+
+    /// Clean up the socket file if this daemon bound it directly and not via socket activation.
+    pub fn cleanup(&self) {
+        if !self.socket_activated
+            && let Some(path) = &self.path
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn euid() -> u32 {
@@ -698,11 +752,203 @@ pub fn bind(path: &Path) -> Result<Listener> {
         Err(e) => return Err(e.into()),
     }
     let socket = UnixListener::bind(path)?;
+    socket.set_nonblocking(true)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(Listener {
         socket,
-        _lock: lock,
+        path: Some(path.to_path_buf()),
+        socket_activated: false,
+        _lock: Some(lock),
     })
+}
+
+fn socket_path_from_fd(fd: i32) -> Option<PathBuf> {
+    let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getsockname called on valid fd with pointer to properly sized sockaddr_un.
+    let rc = unsafe { libc::getsockname(fd, (&raw mut addr).cast(), &raw mut len) };
+    if rc < 0 || addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
+        return None;
+    }
+    if addr.sun_path[0] == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = addr
+        .sun_path
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+    }
+}
+
+/// Inspect environment for systemd socket activation descriptors.
+///
+/// If `LISTEN_PID` matches our PID and `LISTEN_FDS >= 1`, adopts fd 3 (`SD_LISTEN_FDS_START`),
+/// sets non-blocking mode, unsets the environment variables, and returns a socket-activated `Listener`.
+pub fn systemd_listener() -> Result<Option<Listener>> {
+    let listen_pid = match env::var("LISTEN_PID") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let listen_fds = match env::var("LISTEN_FDS") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let Ok(pid) = listen_pid.parse::<u32>() else {
+        return Ok(None);
+    };
+    if pid != std::process::id() {
+        return Ok(None);
+    }
+
+    let Ok(fds) = listen_fds.parse::<usize>() else {
+        return Ok(None);
+    };
+    if fds < 1 {
+        return Ok(None);
+    }
+
+    // Unset environment variables so child processes do not inherit them
+    unsafe {
+        env::remove_var("LISTEN_PID");
+        env::remove_var("LISTEN_FDS");
+    }
+
+    const SD_LISTEN_FDS_START: i32 = 3;
+    let raw_fd = SD_LISTEN_FDS_START;
+
+    // SAFETY: fcntl F_GETFD verifies fd validity.
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: fcntl sets CLOEXEC for normal runtime.
+    unsafe {
+        libc::fcntl(raw_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    }
+
+    let path = socket_path_from_fd(raw_fd);
+    let lock = if let Some(p) = &path {
+        let mut lock_path = OsString::from(p.as_os_str());
+        lock_path.push(".lock");
+        if let Ok(lock_file) = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+        {
+            // SAFETY: flock non-blocking lock attempt on valid fd.
+            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                Some(lock_file)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // SAFETY: raw_fd is validated above.
+    let socket = unsafe { UnixListener::from_raw_fd(raw_fd) };
+    socket.set_nonblocking(true)?;
+
+    Ok(Some(Listener {
+        socket,
+        path,
+        socket_activated: true,
+        _lock: lock,
+    }))
+}
+
+/// Live in-place upgrade handover: preserves the listening socket across `execv`
+/// using the systemd socket activation protocol so no incoming connections are dropped.
+///
+/// # Errors
+/// Returns an error if socket preparation or `execv` fails.
+pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
+    const SD_LISTEN_FDS_START: i32 = 3;
+    let raw_fd = listener.socket.as_raw_fd();
+    if raw_fd != SD_LISTEN_FDS_START {
+        // SAFETY: dup2 duplicates raw_fd to fd 3
+        let rc = unsafe { libc::dup2(raw_fd, SD_LISTEN_FDS_START) };
+        if rc < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+    }
+    // Clear FD_CLOEXEC on fd 3 so it survives execv!
+    // SAFETY: fcntl retrieves and modifies file descriptor flags.
+    let flags = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
+    if flags >= 0 {
+        let rc = unsafe {
+            libc::fcntl(
+                SD_LISTEN_FDS_START,
+                libc::F_SETFD,
+                flags & !libc::FD_CLOEXEC,
+            )
+        };
+        if rc < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+    }
+
+    // Set socket activation environment variables for the new process image
+    unsafe {
+        env::set_var("LISTEN_FDS", "1");
+        env::set_var("LISTEN_PID", std::process::id().to_string());
+    }
+
+    let exe = env::current_exe()?;
+    let c_exe = CString::new(exe.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+    let args: Vec<CString> = env::args_os()
+        .map(|arg| {
+            CString::new(arg.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut argv: Vec<*const libc::c_char> = args.iter().map(|s| s.as_ptr()).collect();
+    argv.push(ptr::null());
+
+    eprintln!("gungnird: live upgrade: re-execing {}...", exe.display());
+    // SAFETY: execv replaces the process image in place; does not return on success.
+    let rc = unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        eprintln!("gungnird: execv failed: {err}");
+        return Err(Error::Io(err));
+    }
+    Ok(())
+}
+
+/// Block lifecycle signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`) on the calling thread
+/// so that all subsequently spawned threads inherit the mask and signals are consumed
+/// exclusively by `signalfd`.
+pub fn block_lifecycle_signals() -> Result<()> {
+    let mut mask: libc::sigset_t = unsafe { mem::zeroed() };
+    // SAFETY: signal set initialization and pthread_sigmask call.
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGHUP);
+        libc::sigaddset(&mut mask, libc::SIGUSR1);
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, ptr::null_mut());
+        if rc != 0 {
+            return Err(Error::Io(io::Error::from_raw_os_error(rc)));
+        }
+    }
+    Ok(())
 }
 
 /// Decrements the active-client count when a client thread ends (or fails to start).
@@ -714,41 +960,179 @@ impl Drop for ClientSlot {
     }
 }
 
-/// Accept clients forever, one thread per connection, at most [`MAX_CLIENTS`] at once.
+struct SigmaskGuard(libc::sigset_t);
+
+impl Drop for SigmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: pthread_sigmask restores original process signal mask.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, ptr::null_mut());
+        }
+    }
+}
+
+/// Accept clients, monitoring connection activity, signalfd events, and idle timeout.
 ///
 /// # Errors
-/// Never returns on its own; accept errors are logged and retried.
-pub fn serve(listener: &UnixListener, cfg: Config, handler: &Arc<dyn Handler>) -> Result<()> {
+/// Returns an I/O error if socket operations fail.
+pub fn serve(
+    listener: &UnixListener,
+    cfg: Config,
+    handler: &Arc<dyn Handler>,
+) -> Result<ShutdownReason> {
+    listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
+
+    let (_guard, sfd_owned) = if cfg.handle_signals {
+        let mut mask: libc::sigset_t = unsafe { mem::zeroed() };
+        let mut old_mask: libc::sigset_t = unsafe { mem::zeroed() };
+        // SAFETY: sigemptyset/sigaddset and pthread_sigmask setup
+        unsafe {
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGINT);
+            libc::sigaddset(&mut mask, libc::SIGTERM);
+            libc::sigaddset(&mut mask, libc::SIGHUP);
+            libc::sigaddset(&mut mask, libc::SIGUSR1);
+            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old_mask);
+            if rc != 0 {
+                return Err(Error::Io(io::Error::from_raw_os_error(rc)));
+            }
+        }
+        // SAFETY: signalfd allocates descriptor for signals in mask.
+        let sfd = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
+        if sfd < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(sfd) };
+        (Some(SigmaskGuard(old_mask)), Some(owned))
+    } else {
+        (None, None)
+    };
+
+    let mut last_active = Instant::now();
+
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if active.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    drop(stream); // the client sees EOF and falls back to the local VFS
-                    continue;
-                }
-                let slot = ClientSlot(Arc::clone(&active));
-                let handler = Arc::clone(handler);
-                let spawned =
-                    thread::Builder::new()
-                        .name("gungnird-client".into())
-                        .spawn(move || {
-                            let _slot = slot;
-                            if let Err(e) = handle_client(stream, cfg, handler.as_ref()) {
-                                eprintln!("gungnird: client: {e}");
-                            }
-                        });
-                if let Err(e) = spawned {
-                    eprintln!("gungnird: cannot spawn client thread: {e}");
+        let active_cnt = active.load(Ordering::Acquire);
+        let busy = active_cnt > 0 || handler.is_busy();
+        if busy {
+            last_active = Instant::now();
+        }
+
+        let timeout_ms = match cfg.idle_timeout {
+            Some(limit) => {
+                if !busy {
+                    let elapsed = last_active.elapsed();
+                    if elapsed >= limit {
+                        eprintln!(
+                            "gungnird: idle timeout of {}s expired with 0 active clients; shutting down",
+                            limit.as_secs()
+                        );
+                        return Ok(ShutdownReason::IdleTimeout);
+                    }
+                    let remaining = limit.saturating_sub(elapsed);
+                    remaining.as_millis().min(500) as libc::c_int
+                } else {
+                    500
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                // e.g. EMFILE: back off instead of spinning.
-                eprintln!("gungnird: accept: {e}");
-                thread::sleep(Duration::from_millis(50));
+            None => 1000,
+        };
+
+        let mut fds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: sfd_owned.as_ref().map_or(-1, |s| s.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if sfd_owned.is_some() { 2 } else { 1 };
+
+        // SAFETY: poll on fds array with length nfds.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(Error::Io(err));
+        }
+
+        // Check signalfd
+        if let Some(sfd) = &sfd_owned
+            && fds[1].revents & libc::POLLIN != 0
+        {
+            let mut siginfo: libc::signalfd_siginfo = unsafe { mem::zeroed() };
+            // SAFETY: read into siginfo struct of exact size
+            let n = unsafe {
+                libc::read(
+                    sfd.as_raw_fd(),
+                    (&raw mut siginfo).cast(),
+                    mem::size_of::<libc::signalfd_siginfo>(),
+                )
+            };
+            if n as usize == mem::size_of::<libc::signalfd_siginfo>() {
+                let sig = siginfo.ssi_signo as i32;
+                match sig {
+                    libc::SIGINT | libc::SIGTERM => {
+                        eprintln!("gungnird: received signal {sig}, shutting down gracefully");
+                        return Ok(ShutdownReason::Signal(sig));
+                    }
+                    libc::SIGHUP | libc::SIGUSR1 => {
+                        eprintln!("gungnird: received signal {sig}, initiating live upgrade");
+                        return Ok(ShutdownReason::LiveUpgrade(sig));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Check incoming connections
+        if fds[0].revents & libc::POLLIN != 0 {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        last_active = Instant::now();
+                        if active.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
+                            active.fetch_sub(1, Ordering::AcqRel);
+                            drop(stream);
+                            continue;
+                        }
+                        let slot = ClientSlot(Arc::clone(&active));
+                        let handler = Arc::clone(handler);
+                        let spawned = thread::Builder::new().name("gungnird-client".into()).spawn(
+                            move || {
+                                let _slot = slot;
+                                if let Err(e) = handle_client(stream, cfg, handler.as_ref()) {
+                                    eprintln!("gungnird: client: {e}");
+                                }
+                            },
+                        );
+                        if let Err(e) = spawned {
+                            eprintln!("gungnird: cannot spawn client thread: {e}");
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("gungnird: accept: {e}");
+                        thread::sleep(Duration::from_millis(50));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(Error::Io(io::Error::other("listener socket closed")));
         }
     }
 }

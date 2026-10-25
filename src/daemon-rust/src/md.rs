@@ -686,6 +686,26 @@ impl Client {
         }
     }
 
+    /// Send a ping frame and wait for its matching pong.
+    ///
+    /// # Errors
+    /// [`Error::Protocol`] on timeout or unexpected reply.
+    pub fn ping(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let seq = self.send(ipc::MSG_PING, payload)?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let m = self.recv(left)?;
+            if m.seq != seq {
+                continue;
+            }
+            if m.kind != ipc::MSG_PONG {
+                return Err(Error::Protocol("expected pong reply"));
+            }
+            return Ok(m.payload().to_vec());
+        }
+    }
+
     /// Push one request without waiting; returns its `seq`.
     ///
     /// # Errors

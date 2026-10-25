@@ -776,3 +776,24 @@ fn copy_meta_follows_the_hard_link_rule() -> Result<()> {
     assert_eq!(s.get(&id(12), "k")?, None);
     Ok(())
 }
+
+#[test]
+fn wal_checkpoint_flushes_and_truncates() -> Result<()> {
+    let t = TestStore::new("checkpoint")?;
+    let mut s = t.open()?;
+    let v = enc(&Value::String("persisted".into()));
+    for i in 0..100 {
+        s.set(&id(i), "key", &v, None)?;
+    }
+    s.checkpoint()?;
+
+    let handle = spawn(s, DbConfig::default())?;
+    handle.flush_and_checkpoint()?;
+    drop(handle);
+
+    let mut s2 = t.open()?;
+    for i in 0..100 {
+        assert_eq!(s2.get(&id(i), "key")?, Some(v.clone()));
+    }
+    Ok(())
+}

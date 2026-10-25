@@ -35,9 +35,9 @@ The complete architectural scope encompasses 12 total milestones:
 - **Milestone 6 (ACCEPTED / MERGED):** GIO `metadata::` attributes and hooks (`gmeta.zig`), GLib `GVfsClass` hooks (`local_file_add_info`, `local_file_set_attributes`, `local_file_removed`, `local_file_moved`).
 - **Milestone 7 (ACCEPTED / MERGED):** Mount health monitor (`health.rs`, `health.zig`), polling `/proc/self/mountinfo`, sacrificial threads for `statfs`, suspect mount flagging for zero-wait fast path failure.
 - **Milestone 8 (ACCEPTED / MERGED):** Async file ops engine via `io_uring` with thread fallback (`ops.rs`, `fileop.zig`, `GungnirFileOp`), reflink/FICLONE, sparse `copy_file_range`, atomic rename temp files, delete-tree, fsync.
-- **Milestone 9 (ACTIVE - IMPLEMENTING & VERIFYING):** Trash (`trash://`) and Recent Items (`recent://`), FreeDesktop Trash spec (`.trashinfo`), cross-mount deletion protections (`DIB-F001`), relative path sanitization (`SEC-F-001`), degraded unreadable `.trashinfo` tolerance (`A-T005-1`), info-entry removability checks before payload deletion (`BC-T005-F1`), XBEL recent store.
-- **Milestone 10 (SCHEDULED):** Volume and Mount Monitor (`GVolumeMonitor` subclass, `GVolume`, `GMount`, `GDrive`, drive discovery, mount/unmount tracking, `GIO_USE_VOLUME_MONITOR=gungnir`).
-- **Milestone 11 (SCHEDULED):** Daemon Lifecycle Management (systemd socket activation, idle shutdown, live in-place upgrade, state persistence).
+- **Milestone 9 (ACCEPTED / MERGED):** Trash (`trash://`) and Recent Items (`recent://`), FreeDesktop Trash spec (`.trashinfo`), cross-mount deletion protections (`DIB-F001`), relative path sanitization (`SEC-F-001`), degraded unreadable `.trashinfo` tolerance (`A-T005-1`), info-entry removability checks before payload deletion (`BC-T005-F1`), XBEL recent store.
+- **Milestone 10 (ACCEPTED / MERGED):** Volume and Mount Monitor (`GVolumeMonitor` subclass, `GVolume`, `GMount`, `GDrive`, drive discovery, mount/unmount tracking, `GIO_USE_VOLUME_MONITOR=gungnir`).
+- **Milestone 11 (ACCEPTED / MERGED):** Daemon Lifecycle Management (systemd socket activation via `LISTEN_FDS`/`LISTEN_PID`, configurable `--idle-timeout` auto-shutdown, race-free `signalfd` multiplexing for `SIGINT`/`SIGTERM` graceful exit and `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover, SQLite WAL truncation checkpointing).
 - **Milestone 12 (SCHEDULED):** Hardening, Packaging & Release (seccomp filters, comprehensive fuzzing/stress test suites, Arch Linux `PKGBUILD`, systemd user units, final release sign-off).
 
 ---

@@ -242,6 +242,30 @@ impl Store {
         })
     }
 
+    /// Checkpoint the WAL journal into the main database and truncate the WAL file.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] if busy retries are exhausted, or [`MdError::Db`] on SQLite error.
+    pub fn checkpoint(&mut self) -> std::result::Result<(), MdError> {
+        let mut attempt = 0;
+        loop {
+            match self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                Ok(()) => return Ok(()),
+                Err(e) if is_busy(&e) => {
+                    if attempt >= self.cfg.busy_retries {
+                        return Err(MdError::Busy);
+                    }
+                    attempt += 1;
+                    thread::sleep(self.cfg.retry_pause);
+                }
+                Err(e) => {
+                    eprintln!("gungnird: checkpoint error: {e}");
+                    return Err(MdError::Db);
+                }
+            }
+        }
+    }
+
     /// Run `f` in an IMMEDIATE transaction, retrying a busy database a bounded number of
     /// times, then [`MdError::Busy`]. Any other SQLite error is [`MdError::Db`].
     fn write<T>(
@@ -844,6 +868,8 @@ pub enum DbReq {
     RemovedTree(Vec<u8>),
     /// Milestone 8: what a failed recursive delete removed (`true`: with its subtree).
     RemovedPaths(Vec<(Vec<u8>, bool)>),
+    /// Milestone 11: flush and truncate the SQLite WAL log.
+    Checkpoint,
 }
 
 /// Reply body on success (see `md` for the layouts), or the failure status.
@@ -891,6 +917,23 @@ impl DbHandle {
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(MdError::Busy),
         }
     }
+
+    /// Synchronously flush all queued writes and checkpoint the WAL.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] or [`MdError::Db`].
+    pub fn flush_and_checkpoint(&self) -> std::result::Result<(), MdError> {
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            req: DbReq::Checkpoint,
+            enqueued: Instant::now(),
+            done: Box::new(move |res| {
+                let _ = tx.send(res);
+            }),
+        };
+        self.tx.send(job).map_err(|_| MdError::Busy)?;
+        rx.recv().map_err(|_| MdError::Busy)?.map(|_| ())
+    }
 }
 
 /// Run one job against the store.
@@ -927,18 +970,22 @@ pub fn execute(store: &mut Store, req: &DbReq) -> DbResult {
             .map(|n| n.to_le_bytes().to_vec()),
         DbReq::RemovedTree(path) => store.removed_tree(path).map(|n| n.to_le_bytes().to_vec()),
         DbReq::RemovedPaths(paths) => store.removed_paths(paths).map(|n| n.to_le_bytes().to_vec()),
+        DbReq::Checkpoint => store.checkpoint().map(|()| Vec::new()),
     }
 }
 
 fn db_thread(mut store: Store, rx: &Receiver<Job>, max_age: Duration) {
     while let Ok(job) = rx.recv() {
-        let r = if job.enqueued.elapsed() > max_age && !matches!(job.req, DbReq::Purge(_)) {
+        let r = if job.enqueued.elapsed() > max_age
+            && !matches!(job.req, DbReq::Purge(_) | DbReq::Checkpoint)
+        {
             Err(MdError::Busy)
         } else {
             execute(&mut store, &job.req)
         };
         (job.done)(r);
     }
+    let _ = store.checkpoint();
 }
 
 /// Start the database thread; it owns `store` and exits when every handle is dropped.
