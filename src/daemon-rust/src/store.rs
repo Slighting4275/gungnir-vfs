@@ -796,21 +796,15 @@ impl Store {
         &mut self,
         paths: &[(Vec<u8>, bool)],
     ) -> std::result::Result<u32, MdError> {
-        // Most deleted trees never had metadata: look before taking the write lock.
-        let any = self.read(|c| {
-            for (path, tree) in paths {
-                let found = if *tree {
-                    Self::hinted_in_tree(c, path)?
-                } else {
-                    Self::hinted_at(c, path)?
-                };
-                if !found.is_empty() {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        // If the path_hint table is empty, no paths can match.
+        let has_hints = self.read(|c| {
+            let mut st = c.prepare_cached("SELECT 1 FROM path_hint LIMIT 1")?;
+            st.exists([])
         })?;
-        if !any {
+        if !has_hints {
             return Ok(0);
         }
         self.write(|tx| {
