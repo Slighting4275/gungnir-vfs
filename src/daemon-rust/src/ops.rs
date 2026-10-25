@@ -632,17 +632,20 @@ impl OpsConfig {
     /// The defaults plus the test hook from the environment (`test-hooks` builds).
     #[must_use]
     pub fn from_env() -> Self {
+        #[cfg(feature = "test-hooks")]
         let mut cfg = Self::default();
+        #[cfg(not(feature = "test-hooks"))]
+        let cfg = Self::default();
+
+        #[cfg(feature = "test-hooks")]
         if let Some(v) = std::env::var_os(SLOW_OPS_ENV) {
-            if cfg!(feature = "test-hooks") {
-                let ms = v.to_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                eprintln!("gungnird: TEST HOOK: file ops sleep {ms} ms per chunk");
-                cfg.slow = Duration::from_millis(ms);
-            } else {
-                eprintln!(
-                    "gungnird: {SLOW_OPS_ENV} ignored (built without the test-hooks feature)"
-                );
-            }
+            let ms = v.to_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            eprintln!("gungnird: TEST HOOK: file ops sleep {ms} ms per chunk");
+            cfg.slow = Duration::from_millis(ms);
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        if std::env::var_os(SLOW_OPS_ENV).is_some() {
+            eprintln!("gungnird: {SLOW_OPS_ENV} ignored (built without the test-hooks feature)");
         }
         cfg
     }

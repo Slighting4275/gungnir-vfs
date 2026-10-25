@@ -1,0 +1,53 @@
+# Maintainer: gungnir-dev <dev@gungnir.invalid>
+pkgname=gungnir-vfs
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Next-generation Linux virtual filesystem daemon and dynamic GIO extension module"
+arch=('x86_64')
+url="https://gitlab.com/exalted6165/gungnir-vfs"
+license=('GPL-3.0-or-later AND AGPL-3.0-or-later')
+depends=('glibc' 'glib2' 'sqlite')
+makedepends=('rust' 'cargo' 'zig' 'pkgconf' 'binutils' 'git')
+optdepends=(
+    'systemd: For systemd user socket activation and sandboxed user service'
+)
+provides=('gungnir-vfs' 'gungnird')
+conflicts=('gungnir-vfs-git')
+source=("$pkgname-$pkgver::git+$url.git#branch=main")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo build --release --locked --bin gungnird
+    ./zb
+}
+
+check() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo test --release
+    ./zb test --summary all
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    # Install daemon binary
+    install -Dm755 .build/target/release/gungnird "${pkgdir}/usr/bin/gungnird"
+
+    # Install dynamic GIO extension module
+    install -Dm755 .build/zig-out/lib/libgiogungnir.so "${pkgdir}/usr/lib/gio/modules/libgiogungnir.so"
+
+    # Install systemd user socket and service units
+    install -Dm644 init/systemd/gungnird.service "${pkgdir}/usr/lib/systemd/user/gungnird.service"
+    install -Dm644 init/systemd/gungnird.socket "${pkgdir}/usr/lib/systemd/user/gungnird.socket"
+
+    # Install licenses
+    install -Dm644 LICENSES/GPL-3.0-or-later.txt "${pkgdir}/usr/share/licenses/${pkgname}/GPL-3.0-or-later.txt"
+    install -Dm644 LICENSES/AGPL-3.0-or-later.txt "${pkgdir}/usr/share/licenses/${pkgname}/AGPL-3.0-or-later.txt"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 COPYING "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
+
+    # Install documentation
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 AGENTS.md "${pkgdir}/usr/share/doc/${pkgname}/AGENTS.md"
+}

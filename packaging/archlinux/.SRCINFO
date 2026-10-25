@@ -1,0 +1,24 @@
+pkgbase = gungnir-vfs
+	pkgdesc = Next-generation Linux virtual filesystem daemon and dynamic GIO extension module
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://gitlab.com/exalted6165/gungnir-vfs
+	arch = x86_64
+	license = GPL-3.0-or-later AND AGPL-3.0-or-later
+	makedepends = rust
+	makedepends = cargo
+	makedepends = zig
+	makedepends = pkgconf
+	makedepends = binutils
+	makedepends = git
+	depends = glibc
+	depends = glib2
+	depends = sqlite
+	optdepends = systemd: For systemd user socket activation and sandboxed user service
+	provides = gungnir-vfs
+	provides = gungnird
+	conflicts = gungnir-vfs-git
+	source = gungnir-vfs-0.1.0::git+https://gitlab.com/exalted6165/gungnir-vfs.git#branch=main
+	sha256sums = SKIP
+
+pkgname = gungnir-vfs

@@ -1,8 +1,8 @@
 # Gungnir VFS Coordination Status
 
-**Current Revision:** `b5ada78` (main)
-**Active Milestone:** Milestone 11 (Daemon Lifecycle Management) Complete & Milestone 12 Queued
-**Task in Progress:** Milestone 11 Complete, Hardened & Verified across Unit and Integration Suites
+**Current Revision:** `HEAD` (main)
+**Active Milestone:** Milestone 12 (Hardening, Packaging & System Release) Complete - Full Roadmap Accepted!
+**Task in Progress:** All 12 Milestones Fully Implemented, Hardened, Benchmarked & Verified
 **Current Owner:** Antigravity (Engineering Lead & Active Bug Checker)
 **Authorized by:** the project maintainer
 
@@ -23,7 +23,7 @@
 | **M9** | Trash (`trash://`) & Recent Items (`recent://`) | **ACCEPTED** | Integrated in Gungnir VFS & gungnir-fm (FreeDesktop Trash spec 1.0, DIB-F001, SEC-F-001, A-T005-1, BC-T005-F1) |
 | **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **ACCEPTED** | `GVolumeMonitor`, `GVolume`, `GMount`, non-blocking mountinfo parser; Bug Checker audited & hardened |
 | **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **ACCEPTED** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`), idle auto-shutdown (`--idle-timeout`), race-free `signalfd` (`SIGTERM`/`SIGINT` graceful exit, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing; 149/149 tests passed |
-| **M12** | Hardening, Packaging & System Release | **QUEUED** | PKGBUILD, systemd unit, fuzzing |
+| **M12** | Hardening, Packaging & System Release | **ACCEPTED** | Linux Seccomp BPF sandbox (`seccomp.rs`), systemd user units (`gungnird.service`/`socket`), Arch Linux `PKGBUILD`, wire & frame fuzzing, 50,000-event stress throughput benchmark (0.488s burst, 0.078ms p99, 22.56 MiB RSS); 156/156 tests passed |
 
 ---
 

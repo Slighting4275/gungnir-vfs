@@ -7,6 +7,7 @@ use gungnird::{
     ipc, mdsvc,
     ops::{self, Ops, OpsConfig},
     opsvc::{DbMeta, MonitorGate, OpsHandler},
+    seccomp::{self, SeccompMode},
     store::{self, DbConfig, Store, StoreConfig},
 };
 
@@ -22,6 +23,8 @@ Options:
   -s, --socket <PATH>        Path to UNIX control socket (overrides env and default)
   -d, --db <PATH>            Path to metadata database (overrides env and default)
   -i, --idle-timeout <SECS>  Idle shutdown timeout in seconds (0 = disabled)
+  -S, --seccomp[=MODE]       Enable Linux seccomp BPF sandbox (filter, strict, disabled)
+      --no-seccomp           Disable seccomp sandbox
   -V, --version              Print version information and exit
   -h, --help                 Print this help information and exit
 ";
@@ -31,6 +34,7 @@ pub struct CliOptions {
     pub db_path: Option<PathBuf>,
     pub socket_path: Option<PathBuf>,
     pub idle_timeout: Option<Duration>,
+    pub seccomp: Option<SeccompMode>,
     pub help: bool,
     pub version: bool,
 }
@@ -87,6 +91,17 @@ where
             } else {
                 None
             };
+        } else if s == "-S" || s == "--seccomp" {
+            opts.seccomp = Some(SeccompMode::Filter);
+        } else if let Some(rest) = s.strip_prefix("--seccomp=") {
+            let mode = SeccompMode::parse(rest).ok_or_else(|| {
+                format!(
+                    "invalid value for '--seccomp': '{rest}' (expected filter, strict, or disabled)"
+                )
+            })?;
+            opts.seccomp = Some(mode);
+        } else if s == "--no-seccomp" {
+            opts.seccomp = Some(SeccompMode::Disabled);
         } else if s.starts_with('-') {
             return Err(format!("unrecognized option '{s}'"));
         } else {
@@ -112,6 +127,14 @@ fn idle_timeout_from_env() -> Option<Duration> {
         }
     }
     None
+}
+
+fn seccomp_from_env() -> Option<SeccompMode> {
+    if let Ok(v) = env::var("GUNGNIR_SECCOMP") {
+        SeccompMode::parse(v.trim())
+    } else {
+        None
+    }
 }
 
 fn resolve_db_path(cli_db: Option<PathBuf>) -> Result<PathBuf> {
@@ -197,6 +220,16 @@ fn run() -> Result<()> {
     let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db.clone()));
     let health: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
     let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
+
+    // Milestone 12: Apply Seccomp BPF Sandbox
+    let seccomp_mode = opts
+        .seccomp
+        .or_else(seccomp_from_env)
+        .unwrap_or(SeccompMode::Disabled);
+    if seccomp_mode != SeccompMode::Disabled {
+        eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
+        seccomp::apply_sandbox(seccomp_mode)?;
+    }
 
     // 6. Serve with signal handling and idle shutdown multiplexing (milestone 11)
     let cfg = ipc::Config {
@@ -304,6 +337,16 @@ mod tests {
         // Disable idle timeout with 0
         let opts = parse_cli_args(["gungnird", "-i", "0"]).expect("idle timeout 0");
         assert_eq!(opts.idle_timeout, None);
+
+        // Seccomp flags
+        let opts = parse_cli_args(["gungnird", "-S"]).expect("seccomp short");
+        assert_eq!(opts.seccomp, Some(SeccompMode::Filter));
+        let opts = parse_cli_args(["gungnird", "--seccomp"]).expect("seccomp long");
+        assert_eq!(opts.seccomp, Some(SeccompMode::Filter));
+        let opts = parse_cli_args(["gungnird", "--seccomp=strict"]).expect("seccomp strict");
+        assert_eq!(opts.seccomp, Some(SeccompMode::Strict));
+        let opts = parse_cli_args(["gungnird", "--no-seccomp"]).expect("no-seccomp");
+        assert_eq!(opts.seccomp, Some(SeccompMode::Disabled));
 
         // Errors
         assert!(parse_cli_args(["gungnird", "--unknown-opt"]).is_err());

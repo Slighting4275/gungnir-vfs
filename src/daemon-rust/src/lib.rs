@@ -7,6 +7,7 @@ pub mod md;
 pub mod mdsvc;
 pub mod ops;
 pub mod opsvc;
+pub mod seccomp;
 pub mod store;
 
 pub use store::open_db;

@@ -1,0 +1,12 @@
+[Unit]
+Description=Gungnir VFS Daemon Socket Activation
+Documentation=https://gitlab.com/exalted6165/gungnir-vfs
+PartOf=gungnird.service
+
+[Socket]
+ListenStream=%t/gungnir/gungnird.sock
+DirectoryMode=0700
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

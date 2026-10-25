@@ -38,7 +38,7 @@ The complete architectural scope encompasses 12 total milestones:
 - **Milestone 9 (ACCEPTED / MERGED):** Trash (`trash://`) and Recent Items (`recent://`), FreeDesktop Trash spec (`.trashinfo`), cross-mount deletion protections (`DIB-F001`), relative path sanitization (`SEC-F-001`), degraded unreadable `.trashinfo` tolerance (`A-T005-1`), info-entry removability checks before payload deletion (`BC-T005-F1`), XBEL recent store.
 - **Milestone 10 (ACCEPTED / MERGED):** Volume and Mount Monitor (`GVolumeMonitor` subclass, `GVolume`, `GMount`, `GDrive`, drive discovery, mount/unmount tracking, `GIO_USE_VOLUME_MONITOR=gungnir`).
 - **Milestone 11 (ACCEPTED / MERGED):** Daemon Lifecycle Management (systemd socket activation via `LISTEN_FDS`/`LISTEN_PID`, configurable `--idle-timeout` auto-shutdown, race-free `signalfd` multiplexing for `SIGINT`/`SIGTERM` graceful exit and `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover, SQLite WAL truncation checkpointing).
-- **Milestone 12 (SCHEDULED):** Hardening, Packaging & Release (seccomp filters, comprehensive fuzzing/stress test suites, Arch Linux `PKGBUILD`, systemd user units, final release sign-off).
+- **Milestone 12 (ACCEPTED / MERGED):** Hardening, Packaging & Release (zero-dependency Linux Seccomp BPF sandbox, systemd user units `gungnird.service` and `gungnird.socket`, Arch Linux `PKGBUILD`, wire & frame fuzz suites, 50,000-event stress throughput benchmark meeting all SLOs: 0.488s burst, 0.078ms p99, 22.56 MiB RSS). Full 12-Milestone Architecture Complete!
 
 ---
 

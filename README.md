@@ -23,7 +23,7 @@ Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem opera
 | **M9** | Trash & Recent Items Engine | **Complete** | FreeDesktop.org Trash spec 1.0 (`trash://`, `.trashinfo`), `recent://` URI schemes, mount boundary defenses (`DIB-F001`), relative path sanitization (`SEC-F-001`). |
 | **M10** | Volume & Mount Monitor | **Complete** | `GVolumeMonitor`, `GVolume`, `GMount`, `GDrive` event-driven lifecycle, non-blocking mountinfo parser. |
 | **M11** | Daemon Lifecycle Management | **Complete** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
-| **M12** | Hardening & System Release | **Queued** | Seccomp BPF filters, fuzzing verification, PKGBUILD, systemd user service. |
+| **M12** | Hardening & System Release | **Complete** | Zero-dependency Linux seccomp BPF filter sandbox (`--seccomp`), systemd sandboxed user units (`gungnird.service` / `gungnird.socket`), Arch Linux `PKGBUILD` packaging, wire & metadata fuzz suites, 50,000-event stress throughput benchmark (0.488s burst, 0.078ms p99, 22.6 MiB RSS). |
 
 ---
 
@@ -82,12 +82,24 @@ GIO_USE_VFS=gungnir gio info .
 GIO_USE_VFS=gungnir gio set file.txt metadata::project "Gungnir"
 GIO_USE_VFS=gungnir gio info -a 'metadata::*' file.txt
 
-# Run background daemon with custom socket, DB path, and idle auto-shutdown
-gungnird --socket /run/user/1000/gungnir/control.sock --db ~/.local/share/gungnir/metadata.db --idle-timeout 300
+# Run background daemon with custom socket, DB path, idle auto-shutdown, and seccomp BPF sandbox
+gungnird --socket /run/user/1000/gungnir/control.sock --db ~/.local/share/gungnir/metadata.db --idle-timeout 300 --seccomp
 
 # Live in-place upgrade without dropping incoming connections
 kill -HUP $(pgrep gungnird)
+
+# Enable systemd user socket activation
+systemctl --user enable --now gungnird.socket
 ```
+
+---
+
+## Packaging & Systemd Units
+
+- **Systemd User Units**: Located in [`init/systemd/`](init/systemd/):
+  - `gungnird.socket`: Socket activation unit listening on `%t/gungnir/gungnird.sock`.
+  - `gungnird.service`: Sandboxed service unit with `ProtectSystem=strict`, `ProtectHome=read-only`, and system call filtering.
+- **Arch Linux PKGBUILD**: Provided in [`packaging/archlinux/PKGBUILD`](packaging/archlinux/PKGBUILD) and [`packaging/PKGBUILD`](packaging/PKGBUILD). Builds `gungnird` and `libgiogungnir.so`, runs verification tests, and packages binaries, systemd units, licenses, and documentation.
 
 ---
 

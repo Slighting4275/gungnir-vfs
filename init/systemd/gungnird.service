@@ -1,0 +1,30 @@
+[Unit]
+Description=Gungnir Virtual Filesystem Daemon
+Documentation=https://gitlab.com/exalted6165/gungnir-vfs
+Requires=gungnird.socket
+After=gungnird.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/gungnird --idle-timeout 300 --seccomp
+Restart=on-failure
+RestartSec=1s
+
+# Sandboxing and System Hardening (Milestone 12)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/gungnir %h/.local/share/gungnir %h/.cache/gungnir
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+SystemCallFilter=@system-service @file-system @io-uring io_uring_setup io_uring_enter io_uring_register memfd_create
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target
