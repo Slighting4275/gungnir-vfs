@@ -30,10 +30,13 @@ pub fn unescape(input: []const u8, out: []u8) []const u8 {
             const b2 = input[in_idx + 2];
             const b3 = input[in_idx + 3];
             if (b1 >= '0' and b1 <= '7' and b2 >= '0' and b2 <= '7' and b3 >= '0' and b3 <= '7') {
-                out[out_idx] = (b1 - '0') * 64 + (b2 - '0') * 8 + (b3 - '0');
-                out_idx += 1;
-                in_idx += 4;
-                continue;
+                const val: u16 = @as(u16, b1 - '0') * 64 + @as(u16, b2 - '0') * 8 + @as(u16, b3 - '0');
+                if (val <= 255) {
+                    out[out_idx] = @truncate(val);
+                    out_idx += 1;
+                    in_idx += 4;
+                    continue;
+                }
             }
         }
         out[out_idx] = input[in_idx];
@@ -583,6 +586,21 @@ test "unescape handles octal sequences" {
     var buf: [64]u8 = undefined;
     const res = unescape("My\\040Drive", &buf);
     try std.testing.expectEqualStrings("My Drive", res);
+
+    // Regression test: octal escapes >= 400 (e.g. \400, \777) must never integer-overflow or panic
+    const res_over = unescape("Path\\400Invalid", &buf);
+    try std.testing.expectEqualStrings("Path\\400Invalid", res_over);
+
+    const res_max = unescape("Path\\777Invalid", &buf);
+    try std.testing.expectEqualStrings("Path\\777Invalid", res_max);
+
+    // Edge boundary: \377 (255) is the maximum single-byte octal escape
+    const res_255 = unescape("Byte\\377End", &buf);
+    try std.testing.expectEqualStrings("Byte\xFFEnd", res_255);
+
+    // Truncated escape at end
+    const res_trunc = unescape("Truncated\\04", &buf);
+    try std.testing.expectEqualStrings("Truncated\\04", res_trunc);
 }
 
 test "isStorageFs filters virtual filesystems" {

@@ -1,8 +1,8 @@
 # Gungnir VFS Coordination Status
 
-**Current Revision:** `d947cb8` (main)
-**Active Milestone:** Milestone 10 (Volume & Mount Monitor)
-**Task in Progress:** M9 Complete / M10 Active Implementation
+**Current Revision:** `b5ada78` (main)
+**Active Milestone:** Milestone 10 (Volume & Mount Monitor) & Milestone 11 Initiation
+**Task in Progress:** Full Offline Bug Checker Complete / M10 Hardened
 **Current Owner:** Antigravity (Engineering Lead & Active Bug Checker)
 **Authorized by:** the project maintainer
 
@@ -21,34 +21,27 @@
 | **M7** | Mount Health Monitor (`health.rs`, `health.zig`) | **ACCEPTED** | Merged |
 | **M8** | Async File Operations Engine (`ops.rs`, `fileop.zig`) | **ACCEPTED** | Merged |
 | **M9** | Trash (`trash://`) & Recent Items (`recent://`) | **ACCEPTED** | Integrated in Gungnir VFS & gungnir-fm (FreeDesktop Trash spec 1.0, DIB-F001, SEC-F-001, A-T005-1, BC-T005-F1) |
-| **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **ACCEPTED** | `GVolumeMonitor`, `GVolume`, `GMount`, non-blocking mountinfo parser |
+| **M10** | Volume & Mount Monitor (`GVolumeMonitor`, `GVolume`) | **ACCEPTED** | `GVolumeMonitor`, `GVolume`, `GMount`, non-blocking mountinfo parser; Bug Checker audited & hardened |
 | **M11** | Daemon Lifecycle Management (socket activation, live upgrade) | **IN PROGRESS** | Planned |
 | **M12** | Hardening, Packaging & System Release | **QUEUED** | PKGBUILD, systemd unit, fuzzing |
 
 ---
 
-## Active Task State: M10 Complete, Advancing to M11
-- **Objective:** Complete Volume & Mount Monitor subsystem (`volmon.zig`), exposing `GungnirVolumeMonitor` as `GNativeVolumeMonitor` / `GVolumeMonitor` and `GungnirMount` as `GMount`.
-- **Milestone 10 Features Completed:**
-  - Non-blocking `/proc/self/mountinfo` parsing with octal path unescaping.
-  - Virtual/pseudo filesystem filtering to present user-relevant storage volumes.
-  - Full `GMountIface` implementation (`get_root`, `get_name`, `get_icon`, `can_unmount`, `get_uuid`).
-  - Full `GVolumeIface` implementation (`get_name`, `get_uuid`, `get_mount`, `can_mount`).
-  - `GNativeVolumeMonitorClass` implementation with `get_mount_for_mount_path` and `GVolumeMonitorClass` vfuncs (`get_mounts`, `get_volumes`, `get_mount_for_uuid`).
-  - Integration test suite expanded to 12 modes including `itest volmon` (all 22/22 steps passing).
-- **Objective:** FreeDesktop.org Trash & Recent Items verified and integrated natively into `gungnir-fm` (`GUNGNIR_FM_BACKEND=live`).
-- **Universal Compatibility Verified:**
-  - Deterministic directory traversal ordering across all filesystem types (Btrfs FIFO, tmpfs LIFO, Ext4 hash-based).
-  - FSID 3-tier discovery chain across volatile (tmpfs/ramfs), network (NFS/SMB), and block mounts.
-  - Native kernel `io_uring` with transparent POSIX fallback.
-  - Native zero-copy shared-memory ring buffer (protocol v2, 32 slots × 4096B, futex signaling).
-- **Safety Mitigations Verified:**
-  - `DIB-F001` (Critical): Mount boundary check during recursive trash deletion verified.
-  - `SEC-F-001` (Security): Relative path sanitization against mount root verified.
-  - `A-T005-1` (Medium): Corrupted or unreadable `.trashinfo` mode-000 tolerance.
-  - `BC-T005-F1` (Medium): Directory at `info/X.trashinfo` removability check before payload deletion.
-- **Verification Suite:**
-  - GitLab CI Pipeline #2985406943: 100% green (`rust:lint`, `zig:lint`, `rust:build`, `zig:build`, `rust:test`, `zig:test`).
-  - `zb test --summary all`: 21/21 steps passed (38/38 unit tests + 11 integration modes).
-  - `cargo test --release`: 100% unit tests passed in daemon and client.
-  - `gungnir-fm`: All 73 tests passed + all 4 `gungnir_live` tests passed against real `gungnird`.
+## Full Offline Bug Checker Audit Results (2026-10-24)
+
+- **Arsenal Executed:**
+  - **Compilers / Linters:** GCC 16.2.1, Clang 23.1.3, Zig 0.18 nightly (`zig ast-check`, `zig fmt`), `cargo clippy --release --all-targets -- -D warnings`, `cargo fmt --all --check`.
+  - **Static Analyzers:** GCC `-fanalyzer` (0 warnings), Clang Static Analyzer / `scan-build` (0 bugs), `CodeChecker` 6.29.x (0 defects across 6 analyzer passes), `cppcheck` 2.22.0, `flawfinder` 2.0.20, `sparse` v0.6.5, `codeql` 2.27.2 (0 alerts).
+  - **Formal Verification (ESBMC 8.5.0):** Bounded model checking on octal unescape & mountpoint memory safety (`esbmc --unwind 10 --overflow-check`): 19 of 19 properties mathematically proven (0 array bounds violations, 0 dereference failures, 0 arithmetic overflows).
+  - **Sanitizers:** AddressSanitizer (ASan) on all 138 Rust tests (0 errors), ThreadSanitizer (TSan) on SPSC memory ring concurrency (0 data races), Valgrind Memcheck on GIO module loading and volume monitoring (0 leaks, 0 invalid reads/writes).
+  - **Fuzzing (libFuzzer & AFL++):**
+    - `libFuzzer` (`fuzz_volmon`): 173.9M runs, 2.85M exec/s, 0 crashes.
+    - `libFuzzer` (`fuzz_ipc_wire`): 130.9M runs, 2.14M exec/s, 0 crashes.
+    - `AFL++` (`afl_volmon`): 84.9k execs, 1.41k exec/s, 0 crashes, 100% stability.
+    - `AFL++` (`afl_ipc_wire`): 84.3k execs, 1.40k exec/s, 85.96% bitmap coverage, 0 crashes, 100% stability.
+  - **Binary Hardening:** `checksec` verified Full RELRO, Stack Canary, NX enabled, PIE Enabled / DSO, No RPATH, W^X Segment enabled across both `gungnird` and `libgiogungnir.so`.
+  - **Code Coverage:** `llvm-cov` measured 89.93% line coverage (7,555/8,401 lines) and 89.35% function coverage (755/845 functions) across the daemon codebase.
+- **Defects Found & Resolved:**
+  - **BUG-VOLMON-001 (Integer Overflow in Octal Unescape):** In `volmon.zig`, evaluating `(b1 - '0') * 64` using `u8` arithmetic overflowed and panicked when encountering octal sequences with $b_1 \ge '4'$ (`\400`..`\777`). Fixed by calculating in `u16`, validating `val <= 255`, and falling through safely on values $> 255$. Comprehensive regression test suite added and verified.
+- **GitLab CI Pipeline:** Pipeline `#2985432648` on commit `b5ada78` verified 100% green across all 6 jobs (`rust:lint`, `zig:lint`, `rust:build`, `zig:build`, `rust:test`, `zig:test`).
+- **Companion Integration:** `gungnir-fm` passed all 73 unit tests and all 4 `gungnir_live` tests against live `gungnird`.

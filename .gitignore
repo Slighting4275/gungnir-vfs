@@ -8,6 +8,7 @@
 /target/
 .zig-cache/
 zig-out/
+/.bug-check/
 *.so
 *.o
 *.a
