@@ -90,6 +90,9 @@ fn authorized_syscalls() -> Vec<u32> {
         libc::SYS_stat as u32,
         libc::SYS_fstat as u32,
         libc::SYS_lstat as u32,
+        // glibc >= 2.33 implements stat, lstat and fstatat with newfstatat: SQLite opening
+        // its database in a re-execed daemon (live upgrade), std::fs metadata (BC-HC-F02).
+        libc::SYS_newfstatat as u32,
         libc::SYS_poll as u32,
         libc::SYS_lseek as u32,
         libc::SYS_mmap as u32,

@@ -12,7 +12,7 @@ use std::{
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
-            ffi::OsStrExt,
+            ffi::{OsStrExt, OsStringExt},
             fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
@@ -870,65 +870,130 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     }))
 }
 
-/// Live in-place upgrade handover: preserves the listening socket across `execv`
+/// Test hook (`test-hooks` builds only): re-exec this path instead of the running
+/// binary, so a test can make the live upgrade's exec fail.
+pub const UPGRADE_EXE_ENV: &str = "GUNGNIR_TEST_UPGRADE_EXE";
+
+/// The executable's path, resolved once at startup by [`remember_startup_exe`]. A
+/// package upgrade replaces the binary by rename; afterwards `/proc/self/exe` reads
+/// "<path> (deleted)", and re-execing that fails (BC-HC-F05). The live upgrade execs
+/// the path the daemon was started from, which by then holds the new binary.
+static STARTUP_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Resolve and keep the executable's path; call once, early in `main`.
+pub fn remember_startup_exe() {
+    if let Ok(p) = env::current_exe() {
+        let _ = STARTUP_EXE.set(p);
+    }
+}
+
+fn upgrade_exe() -> io::Result<PathBuf> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(p) = env::var_os(UPGRADE_EXE_ENV) {
+        eprintln!(
+            "gungnird: TEST HOOK: live upgrade re-execs {}",
+            Path::new(&p).display()
+        );
+        return Ok(PathBuf::from(p));
+    }
+    match STARTUP_EXE.get() {
+        Some(p) => Ok(p.clone()),
+        None => env::current_exe(),
+    }
+}
+
+fn cstring(b: &[u8]) -> io::Result<CString> {
+    CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// Live in-place upgrade handover: preserves the listening socket across `execve`
 /// using the systemd socket activation protocol so no incoming connections are dropped.
 ///
+/// Returns only if the exec failed, with the process as it was before the call: the
+/// listener is moved to fd 3 for the new image only for the exec itself, and whatever
+/// fd 3 was (the database, say) is put back; the new image's `LISTEN_FDS`/`LISTEN_PID`
+/// go into its own environment block, never into this process's environment (which
+/// other threads read). The caller keeps serving (BC-HC-F02).
+///
 /// # Errors
-/// Returns an error if socket preparation or `execv` fails.
+/// Always, when it returns: why the socket could not be prepared or `execve` failed.
 pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
     const SD_LISTEN_FDS_START: i32 = 3;
-    let raw_fd = listener.socket.as_raw_fd();
-    if raw_fd != SD_LISTEN_FDS_START {
-        // SAFETY: dup2 duplicates raw_fd to fd 3
-        let rc = unsafe { libc::dup2(raw_fd, SD_LISTEN_FDS_START) };
-        if rc < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-    }
-    // Clear FD_CLOEXEC on fd 3 so it survives execv!
-    // SAFETY: fcntl retrieves and modifies file descriptor flags.
-    let flags = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
-    if flags >= 0 {
-        let rc = unsafe {
-            libc::fcntl(
-                SD_LISTEN_FDS_START,
-                libc::F_SETFD,
-                flags & !libc::FD_CLOEXEC,
-            )
-        };
-        if rc < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-    }
-
-    // Set socket activation environment variables for the new process image
-    unsafe {
-        env::set_var("LISTEN_FDS", "1");
-        env::set_var("LISTEN_PID", std::process::id().to_string());
-    }
-
-    let exe = env::current_exe()?;
-    let c_exe = CString::new(exe.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-
-    let args: Vec<CString> = env::args_os()
-        .map(|arg| {
-            CString::new(arg.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
-        })
+    let exe = upgrade_exe()?;
+    let c_exe = cstring(exe.as_os_str().as_bytes())?;
+    let args = env::args_os()
+        .map(|a| cstring(a.as_bytes()))
         .collect::<io::Result<Vec<_>>>()?;
-
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|s| s.as_ptr()).collect();
     argv.push(ptr::null());
+    let mut envs = Vec::new();
+    for (k, v) in env::vars_os() {
+        if matches!(
+            k.to_str(),
+            Some("LISTEN_FDS" | "LISTEN_PID" | "LISTEN_FDNAMES")
+        ) {
+            continue;
+        }
+        let mut kv = k.into_vec();
+        kv.push(b'=');
+        kv.extend_from_slice(v.as_bytes());
+        envs.push(cstring(&kv)?);
+    }
+    envs.push(cstring(b"LISTEN_FDS=1")?);
+    envs.push(cstring(
+        format!("LISTEN_PID={}", std::process::id()).as_bytes(),
+    )?);
+    let mut envp: Vec<*const libc::c_char> = envs.iter().map(|s| s.as_ptr()).collect();
+    envp.push(ptr::null());
+
+    let raw_fd = listener.socket.as_raw_fd();
+    // What fd 3 is now (if it is not the listener): a copy to put back, and its flags.
+    let mut saved: Option<(OwnedFd, i32)> = None;
+    // SAFETY: fcntl on fds this process owns; no pointers.
+    let flags3 = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
+    if raw_fd != SD_LISTEN_FDS_START {
+        if flags3 >= 0 {
+            // SAFETY: as above; the result is a fresh fd owned by nobody else.
+            let copy = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_DUPFD_CLOEXEC, 4) };
+            if copy < 0 {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            // SAFETY: just created above.
+            saved = Some((unsafe { OwnedFd::from_raw_fd(copy) }, flags3));
+        }
+        // SAFETY: dup2 onto fd 3; the new fd 3 has no FD_CLOEXEC.
+        if unsafe { libc::dup2(raw_fd, SD_LISTEN_FDS_START) } < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+    } else if flags3 < 0
+        // SAFETY: as above.
+        || unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, flags3 & !libc::FD_CLOEXEC) } < 0
+    {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
 
     eprintln!("gungnird: live upgrade: re-execing {}...", exe.display());
-    // SAFETY: execv replaces the process image in place; does not return on success.
-    let rc = unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
-    if rc < 0 {
-        let err = io::Error::last_os_error();
-        eprintln!("gungnird: execv failed: {err}");
-        return Err(Error::Io(err));
+    // SAFETY: NUL-terminated argv/envp of CStrings that outlive the call; on success the
+    // process image is replaced and nothing here runs again.
+    unsafe { libc::execve(c_exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    let err = io::Error::last_os_error();
+
+    // Back to how it was: the listener at its own fd (CLOEXEC), fd 3 what it was.
+    // SAFETY: fcntl/dup2/close on fds this process owns.
+    unsafe {
+        if raw_fd == SD_LISTEN_FDS_START {
+            libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, flags3);
+        } else if let Some((copy, flags)) = &saved {
+            libc::dup2(copy.as_raw_fd(), SD_LISTEN_FDS_START);
+            libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, *flags);
+        } else {
+            libc::close(SD_LISTEN_FDS_START);
+        }
     }
-    Ok(())
+    Err(Error::Io(io::Error::new(
+        err.kind(),
+        format!("execve {}: {err}", exe.display()),
+    )))
 }
 
 /// Block lifecycle signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`) on the calling thread
@@ -980,8 +1045,22 @@ pub fn serve(
     cfg: Config,
     handler: &Arc<dyn Handler>,
 ) -> Result<ShutdownReason> {
+    serve_counting(listener, cfg, handler, &Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`serve`] with the count of connected clients kept by the caller, so that serving
+/// again after a failed live upgrade still counts the clients connected before it.
+///
+/// # Errors
+/// As [`serve`].
+pub fn serve_counting(
+    listener: &UnixListener,
+    cfg: Config,
+    handler: &Arc<dyn Handler>,
+    active: &Arc<AtomicUsize>,
+) -> Result<ShutdownReason> {
     listener.set_nonblocking(true)?;
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = Arc::clone(active);
 
     let (_guard, sfd_owned) = if cfg.handle_signals {
         let mut mask: libc::sigset_t = unsafe { mem::zeroed() };

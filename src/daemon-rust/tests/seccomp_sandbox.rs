@@ -68,3 +68,231 @@ fn in_process_filter_verification() {
         }
     }
 }
+
+// ---- The daemon itself under the filter (BC-HC-F02) -------------------------
+
+mod daemon {
+    use std::{
+        fs,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use gungnird::{
+        md::{Client, MSG_MD_REPLY, ST_OK, Value},
+        ops::{
+            self, Done, FLAG_ALL_METADATA, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, OpKind,
+            OpRequest,
+        },
+    };
+
+    pub type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// A private (0700) directory under <repo>/.build/tmp, removed on drop.
+    pub struct Dir(pub PathBuf);
+
+    impl Dir {
+        pub fn new(name: &str) -> R<Self> {
+            let base =
+                fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
+                    .join("tmp");
+            fs::create_dir_all(&base)?;
+            let mode = fs::symlink_metadata(&base)?.permissions().mode();
+            if mode & 0o022 != 0 {
+                fs::set_permissions(&base, fs::Permissions::from_mode(mode & 0o7755))?;
+            }
+            let p = base.join(format!("sc-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir(&p)?;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
+            Ok(Self(p))
+        }
+
+        pub fn join(&self, f: &str) -> PathBuf {
+            self.0.join(f)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// gungnird with `--seccomp=<mode>`, everything inside `dir`.
+    pub struct Daemon {
+        pub child: Child,
+        pub sock: PathBuf,
+        pub log: PathBuf,
+    }
+
+    impl Daemon {
+        pub fn start(dir: &Dir, mode: &str, no_uring: bool) -> R<Self> {
+            let sock = dir.join("gungnird.sock");
+            let log = dir.join(&format!("gungnird-{mode}-{no_uring}.log"));
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+            cmd.arg(format!("--seccomp={mode}"))
+                .arg("-s")
+                .arg(&sock)
+                .arg("-d")
+                .arg(dir.join("data/metadata.db"))
+                .env("HOME", &dir.0)
+                .env("XDG_DATA_HOME", dir.join("data"))
+                .env("XDG_RUNTIME_DIR", &dir.0)
+                .env_remove(ops::NO_URING_ENV)
+                .env_remove("GUNGNIR_SECCOMP")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&log)?);
+            if no_uring {
+                cmd.env(ops::NO_URING_ENV, "1");
+            }
+            let child = cmd.spawn()?;
+            let mut d = Self { child, sock, log };
+            let t0 = Instant::now();
+            while UnixStream::connect(&d.sock).is_err() {
+                if let Some(st) = d.child.try_wait()? {
+                    return Err(format!("gungnird exited early: {st}\n{}", d.log_text()).into());
+                }
+                if t0.elapsed() > Duration::from_secs(10) {
+                    return Err("gungnird did not start listening".into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(d)
+        }
+
+        pub fn client(&self) -> R<Client> {
+            Ok(Client::connect(&self.sock, Duration::from_secs(5))?)
+        }
+
+        pub fn log_text(&self) -> String {
+            fs::read_to_string(&self.log).unwrap_or_default()
+        }
+
+        /// Still running (a denied syscall in strict mode kills the whole process).
+        pub fn alive(&mut self) -> R<bool> {
+            Ok(self.child.try_wait()?.is_none())
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn b(p: &Path) -> Vec<u8> {
+        p.as_os_str().as_bytes().to_vec()
+    }
+
+    /// Run one op to its done event.
+    pub fn run(
+        c: &mut Client,
+        kind: OpKind,
+        flags: u32,
+        src: &Path,
+        dest: Option<&Path>,
+    ) -> R<Done> {
+        let r = OpRequest {
+            kind,
+            flags,
+            timeout_ms: 0,
+            src: b(src),
+            dest: dest.map(b).unwrap_or_default(),
+        };
+        let seq = c.send(MSG_OP_START, &r.encode())?;
+        let t0 = Instant::now();
+        let mut id = None;
+        loop {
+            let left = Duration::from_secs(30)
+                .checked_sub(t0.elapsed())
+                .ok_or("no done event in time")?;
+            let m = c.recv(left)?;
+            match m.kind {
+                MSG_MD_REPLY if m.seq == seq => {
+                    let p = m.payload();
+                    let st = u32::from_le_bytes(p[..4].try_into()?);
+                    if st != ST_OK {
+                        return Err(format!("{kind:?} refused with status {st}").into());
+                    }
+                    id = Some(u64::from_le_bytes(p[4..12].try_into()?));
+                }
+                MSG_OP_PROGRESS => {}
+                MSG_OP_DONE => {
+                    let d = ops::parse_done(m.payload()).ok_or("bad done")?;
+                    if Some(d.id) == id {
+                        return Ok(d);
+                    }
+                }
+                k => return Err(format!("unexpected message kind {k}").into()),
+            }
+        }
+    }
+
+    /// Metadata and every M8 op kind through a sandboxed daemon, on real files.
+    pub fn file_ops(dir: &Dir, mode: &str, no_uring: bool) -> R {
+        let mut d = Daemon::start(dir, mode, no_uring)?;
+        let mut c = d.client()?;
+        let what = format!("--seccomp={mode}, no_uring={no_uring}");
+        let tag = Value::String(what.clone());
+
+        let src = dir.join("src");
+        let data: Vec<u8> = (0..(3usize << 20)).map(|i| (i * 31 % 251) as u8).collect();
+        fs::write(&src, &data)?;
+        let sid = c.identify(&src)?;
+        c.set(&sid, "tag", &tag)?;
+        assert_eq!(c.get(&sid, "tag")?, Some(tag.clone()), "{what}");
+
+        let copy = dir.join("copy");
+        let done = run(&mut c, OpKind::Copy, FLAG_ALL_METADATA, &src, Some(&copy))?;
+        assert_eq!(done.result, Ok(()), "copy, {what}\n{}", d.log_text());
+        assert_eq!(fs::read(&copy)?, data, "{what}");
+        let id = c.identify(&copy)?;
+        assert_eq!(c.get(&id, "tag")?, Some(tag.clone()), "{what}");
+
+        fs::create_dir(dir.join("sub"))?;
+        let moved = dir.join("sub/moved");
+        let done = run(&mut c, OpKind::Move, 0, &copy, Some(&moved))?;
+        assert_eq!(done.result, Ok(()), "move, {what}\n{}", d.log_text());
+        assert!(!copy.exists() && moved.exists(), "{what}");
+        let id = c.identify(&moved)?;
+        assert_eq!(c.get(&id, "tag")?, Some(tag.clone()), "{what}");
+
+        let done = run(&mut c, OpKind::Fsync, 0, &moved, None)?;
+        assert_eq!(done.result, Ok(()), "fsync, {what}\n{}", d.log_text());
+        let done = run(&mut c, OpKind::Delete, 0, &moved, None)?;
+        assert_eq!(done.result, Ok(()), "delete, {what}\n{}", d.log_text());
+        assert!(!moved.exists(), "{what}");
+
+        for i in 0..12 {
+            fs::create_dir_all(dir.join(&format!("tree/d{}", i % 3)))?;
+            fs::write(dir.join(&format!("tree/d{}/f{i}", i % 3)), b"x")?;
+        }
+        let done = run(&mut c, OpKind::DeleteTree, 0, &dir.join("tree"), None)?;
+        assert_eq!(done.result, Ok(()), "delete-tree, {what}\n{}", d.log_text());
+        assert!(!dir.join("tree").exists(), "{what}");
+
+        drop(c);
+        assert!(d.alive()?, "{what}: the daemon died\n{}", d.log_text());
+        Ok(())
+    }
+}
+
+/// BC-HC-F02: the daemon as the shipped unit runs it (`--seccomp`, filter mode) and in
+/// strict mode (any denied syscall kills it) serves metadata and every M8 op kind on
+/// real files, on both engines.
+#[test]
+fn the_sandboxed_daemon_serves_metadata_and_file_ops() -> daemon::R {
+    for mode in ["filter", "strict"] {
+        for no_uring in [false, true] {
+            let dir = daemon::Dir::new(&format!("ops-{mode}-{no_uring}"))?;
+            daemon::file_ops(&dir, mode, no_uring)?;
+        }
+    }
+    Ok(())
+}

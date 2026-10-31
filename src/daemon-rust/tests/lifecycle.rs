@@ -83,8 +83,10 @@ fn systemd_socket_activation_protocol() -> R {
     let raw_fd = parent_sock.as_raw_fd();
 
     // Spawn gungnird configured to adopt fd 3 via pre_exec
+    // As the shipped unit runs it (ExecStart has --seccomp; BC-HC-F02).
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
-    cmd.arg("-d")
+    cmd.arg("--seccomp")
+        .arg("-d")
         .arg(&db_path)
         .arg("-i")
         .arg("1")
@@ -271,6 +273,7 @@ fn signal_handling_graceful_shutdown_sigterm() -> R {
     let db = dir.0.join("meta.db");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_gungnird"))
+        .arg("--seccomp") // as the shipped unit (BC-HC-F02)
         .arg("-s")
         .arg(&sock)
         .arg("-d")
@@ -314,71 +317,309 @@ fn signal_handling_graceful_shutdown_sigterm() -> R {
     Ok(())
 }
 
-#[test]
-fn signal_handling_live_upgrade_signal() -> R {
-    let dir = Dir::new("live-upgrade")?;
-    let sock = dir.0.join("upgrade.sock");
-    let db = dir.0.join("meta.db");
+/// A child daemon killed and reaped on drop, so a failed assertion leaves no daemon behind.
+struct Reap(std::process::Child);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gungnird"))
-        .arg("-s")
-        .arg(&sock)
+impl std::ops::Deref for Reap {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start gungnird (with `--seccomp` if `seccomp`) and wait until it listens; its stderr
+/// goes to `log`.
+fn spawn_listening(
+    sock: &Path,
+    db: &Path,
+    log: &Path,
+    seccomp: bool,
+    env: &[(&str, &str)],
+) -> R<Reap> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+    if seccomp {
+        cmd.arg("--seccomp");
+    }
+    cmd.arg("-s")
+        .arg(sock)
         .arg("-d")
-        .arg(&db)
+        .arg(db)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    // Wait until daemon listens
+        .stderr(fs::File::create(log)?);
+    let mut child = Reap(cmd.spawn()?);
     let t0 = Instant::now();
-    while UnixStream::connect(&sock).is_err() {
+    while UnixStream::connect(sock).is_err() {
         if let Some(status) = child.try_wait()? {
             return Err(format!("daemon exited prematurely: {status}").into());
         }
         if t0.elapsed() > Duration::from_secs(5) {
-            let _ = child.kill();
             return Err("daemon did not start listening in 5s".into());
         }
         thread::sleep(Duration::from_millis(10));
     }
+    Ok(child)
+}
 
-    // Connect and test before upgrade
-    let mut client = Client::connect(&sock, Duration::from_secs(2))?;
-    let pong = client.ping(b"pre-upgrade")?;
-    assert_eq!(pong, b"pre-upgrade");
-    drop(client);
-
-    // Send SIGHUP to trigger live in-place upgrade re-exec
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGHUP);
-    }
-
-    // Wait for re-execed process to respond
-    let t1 = Instant::now();
-    let mut upgraded = false;
-    while t1.elapsed() < Duration::from_secs(5) {
-        if let Ok(mut c) = Client::connect(&sock, Duration::from_millis(500))
-            && let Ok(resp) = c.ping(b"post-upgrade")
-            && resp == b"post-upgrade"
+/// Ping `sock` until it answers `msg` or 5 s pass.
+fn answers(sock: &Path, msg: &[u8]) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        if let Ok(mut c) = Client::connect(sock, Duration::from_millis(500))
+            && let Ok(resp) = c.ping(msg)
+            && resp == msg
         {
-            upgraded = true;
-            break;
+            return true;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(upgraded, "re-execed daemon must answer on the same socket");
+    false
+}
 
-    // Terminate upgraded daemon cleanly with SIGTERM
+/// SIGHUP re-execs the daemon in place; the new image answers on the same socket with
+/// the same pid, and exits cleanly on SIGTERM. Also under `--seccomp`, as the shipped
+/// unit runs it: the new image must start inside the inherited filter (BC-HC-F02:
+/// newfstatat was denied, SQLite could not open the database and the daemon died).
+#[test]
+fn signal_handling_live_upgrade_signal() -> R {
+    for seccomp in [false, true] {
+        let dir = Dir::new("upgrade")?;
+        let sock = dir.0.join("upgrade.sock");
+        let db = dir.0.join("meta.db");
+        let log = dir.0.join("gungnird.log");
+        let mut child = spawn_listening(&sock, &db, &log, seccomp, &[])?;
+
+        let mut client = Client::connect(&sock, Duration::from_secs(2))?;
+        assert_eq!(client.ping(b"pre-upgrade")?, b"pre-upgrade");
+        drop(client);
+
+        // SAFETY: a signal to our own child.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGHUP);
+        }
+        let upgraded = answers(&sock, b"post-upgrade");
+        let alive = child.try_wait()?.is_none();
+        let text = fs::read_to_string(&log)?;
+        assert!(
+            upgraded && alive,
+            "seccomp {seccomp}: the re-execed daemon must answer on the same socket\n{text}"
+        );
+        assert!(text.contains("live upgrade: re-execing"), "{text}");
+
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        let status = child.wait()?;
+        assert!(
+            status.success(),
+            "seccomp {seccomp}: the re-execed daemon must exit cleanly on SIGTERM"
+        );
+    }
+    Ok(())
+}
+
+/// BC-HC-F05: a package upgrade replaces the binary by rename, so `/proc/self/exe` of the
+/// running daemon reads "<path> (deleted)". SIGHUP must then exec the new binary at the
+/// path the daemon was started from, and the daemon keeps answering on its socket.
+#[test]
+fn live_upgrade_after_the_binary_is_replaced() -> R {
+    let dir = Dir::new("upgrade-replaced")?;
+    let bin = dir.0.join("bin");
+    fs::create_dir(&bin)?;
+    let exe = bin.join("gungnird");
+    fs::copy(env!("CARGO_BIN_EXE_gungnird"), &exe)?;
+    let sock = dir.0.join("upgrade.sock");
+    let db = dir.0.join("meta.db");
+    let log = dir.0.join("gungnird.log");
+    // A sibling test that forks while our copy is open for writing holds that fd until
+    // it execs, and exec of the copy then fails with ETXTBSY: retry, briefly.
+    let t0 = Instant::now();
+    let mut child = loop {
+        match Command::new(&exe)
+            .arg("-s")
+            .arg(&sock)
+            .arg("-d")
+            .arg(&db)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log)?)
+            .spawn()
+        {
+            Ok(c) => break Reap(c),
+            Err(e)
+                if e.raw_os_error() == Some(libc::ETXTBSY)
+                    && t0.elapsed() < Duration::from_secs(5) =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let up = answers(&sock, b"old");
+    let pid = child.id();
+    let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+    let old_ino = fs::metadata(&proc_exe).map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+
+    // What pacman/dpkg do: write the new file beside it, rename it over the old one.
+    let tmp = bin.join(".gungnird.new");
+    fs::copy(&exe, &tmp)?;
+    fs::rename(&tmp, &exe)?;
+    let replaced = fs::read_link(&proc_exe)?;
+
+    // SAFETY: a signal to our own child.
     unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
+        libc::kill(pid as i32, libc::SIGHUP);
+    }
+    let t0 = Instant::now();
+    let mut busy_retries = 0;
+    let mut now = fs::read_link(&proc_exe).ok();
+    while now.as_deref() != Some(exe.as_path()) && t0.elapsed() < Duration::from_secs(5) {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        // The same ETXTBSY race for the new copy (see above): the daemon logs the failed
+        // exec and keeps serving (BC-HC-F02); signal it again.
+        let busy = fs::read_to_string(&log)?
+            .matches("live upgrade failed, still serving")
+            .count();
+        if busy > busy_retries && fs::read_to_string(&log)?.contains("os error 26") {
+            busy_retries = busy;
+            // SAFETY: as above.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGHUP);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+        now = fs::read_link(&proc_exe).ok();
+    }
+    let alive = child.try_wait()?.is_none();
+    let serving = alive && answers(&sock, b"new");
+    let new_ino = fs::metadata(&proc_exe).map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+    let text = fs::read_to_string(&log)?;
+    if alive {
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
     }
     let status = child.wait()?;
+    assert!(up, "the daemon did not start\n{text}");
     assert!(
-        status.success(),
-        "re-execed daemon must exit cleanly on SIGTERM"
+        replaced.to_string_lossy().ends_with(" (deleted)"),
+        "the test did not replace the binary: {replaced:?}"
     );
+    assert!(
+        alive && serving,
+        "the daemon must survive a live upgrade after its binary is replaced\n{text}"
+    );
+    assert_eq!(
+        now.as_deref(),
+        Some(exe.as_path()),
+        "it runs the new binary\n{text}"
+    );
+    assert_ne!(
+        old_ino.ok(),
+        new_ino.ok(),
+        "it runs the new file, not the old one"
+    );
+    assert!(status.success(), "{status}\n{text}");
+    Ok(())
+}
 
+/// BC-HC-F02: if the live upgrade's exec fails, the daemon logs it and keeps serving
+/// on the same socket, with the same process and its database, and a later SIGTERM still
+/// shuts it down cleanly. The exec is made to fail with a test hook.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_failed_live_upgrade_keeps_serving() -> R {
+    use gungnird::md::{Ident, Value};
+    for seccomp in [false, true] {
+        let dir = Dir::new("upgrade-fail")?;
+        let sock = dir.0.join("upgrade.sock");
+        let db = dir.0.join("meta.db");
+        let log = dir.0.join("gungnird.log");
+        let missing = dir.0.join("no-such-gungnird");
+        let missing = missing.to_str().ok_or("path")?;
+        let mut child = spawn_listening(
+            &sock,
+            &db,
+            &log,
+            seccomp,
+            &[(ipc::UPGRADE_EXE_ENV, missing)],
+        )?;
+        let id = Ident {
+            fs_uuid: "00000000-0000-0000-0000-0000000000f2".into(),
+            subvol_id: 0,
+            inode_num: 42,
+            generation: 1,
+            btime_sec: 0,
+            btime_nsec: 0,
+        };
+        let mut c = Client::connect(&sock, Duration::from_secs(2))?;
+        let mut want = Value::String("before".into());
+        c.set(&id, "k", &want)?;
+        drop(c);
+        for (n, sig) in [libc::SIGHUP, libc::SIGUSR1].into_iter().enumerate() {
+            // SAFETY: a signal to our own child.
+            unsafe {
+                libc::kill(child.id() as i32, sig);
+            }
+            let t0 = Instant::now();
+            while fs::read_to_string(&log)?
+                .matches("live upgrade failed, still serving")
+                .count()
+                <= n
+            {
+                assert!(
+                    child.try_wait()?.is_none(),
+                    "seccomp {seccomp}: the daemon died after a failed exec\n{}",
+                    fs::read_to_string(&log)?
+                );
+                assert!(
+                    t0.elapsed() < Duration::from_secs(5),
+                    "no failure logged\n{}",
+                    fs::read_to_string(&log)?
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                answers(&sock, b"still-here"),
+                "seccomp {seccomp}, signal {sig}"
+            );
+            let mut c = Client::connect(&sock, Duration::from_secs(2))?;
+            assert_eq!(
+                c.get(&id, "k")?,
+                Some(want.clone()),
+                "the database still serves"
+            );
+            want = Value::String(format!("after {sig}"));
+            c.set(&id, "k", &want)?;
+            drop(c);
+        }
+        assert!(child.try_wait()?.is_none());
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        let status = child.wait()?;
+        assert!(status.success(), "seccomp {seccomp}: {status}");
+        assert!(!sock.exists(), "socket left behind after a clean shutdown");
+    }
     Ok(())
 }
 
@@ -425,6 +666,7 @@ fn cli_idle_shutdown_subprocess() -> R {
     // Spawn gungnird with --idle-timeout 1
     let t0 = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_gungnird"))
+        .arg("--seccomp") // as the shipped unit (BC-HC-F02)
         .arg("-s")
         .arg(&sock)
         .arg("-d")

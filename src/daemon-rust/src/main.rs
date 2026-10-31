@@ -149,6 +149,8 @@ fn resolve_db_path(cli_db: Option<PathBuf>) -> Result<PathBuf> {
 
 fn run() -> Result<()> {
     ipc::block_lifecycle_signals()?;
+    // Before anything can replace the binary (BC-HC-F05).
+    ipc::remember_startup_exe();
 
     let opts = parse_cli_args(env::args_os()).map_err(|msg| {
         eprintln!("gungnird: error: {msg}");
@@ -239,32 +241,38 @@ fn run() -> Result<()> {
         handle_signals: true,
     };
 
-    let shutdown_reason = ipc::serve(&listener.socket, cfg, &handler)?;
-
-    // 7. Handle lifecycle shutdown or live in-place upgrade
-    match shutdown_reason {
-        ipc::ShutdownReason::Signal(sig) => {
-            eprintln!("gungnird: signal {sig} received; persisting state and shutting down");
-            if let Err(e) = db.flush_and_checkpoint() {
-                eprintln!("gungnird: database checkpoint on shutdown failed: {e}");
+    // 7. Handle lifecycle shutdown or live in-place upgrade. A failed upgrade exec
+    // leaves everything as it was: log it and keep serving (BC-HC-F02).
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    loop {
+        match ipc::serve_counting(&listener.socket, cfg, &handler, &active)? {
+            ipc::ShutdownReason::Signal(sig) => {
+                eprintln!("gungnird: signal {sig} received; persisting state and shutting down");
+                if let Err(e) = db.flush_and_checkpoint() {
+                    eprintln!("gungnird: database checkpoint on shutdown failed: {e}");
+                }
+                listener.cleanup();
+                break;
             }
-            listener.cleanup();
-        }
-        ipc::ShutdownReason::IdleTimeout => {
-            eprintln!("gungnird: idle timeout elapsed; persisting state and shutting down");
-            if let Err(e) = db.flush_and_checkpoint() {
-                eprintln!("gungnird: database checkpoint on idle shutdown failed: {e}");
+            ipc::ShutdownReason::IdleTimeout => {
+                eprintln!("gungnird: idle timeout elapsed; persisting state and shutting down");
+                if let Err(e) = db.flush_and_checkpoint() {
+                    eprintln!("gungnird: database checkpoint on idle shutdown failed: {e}");
+                }
+                listener.cleanup();
+                break;
             }
-            listener.cleanup();
-        }
-        ipc::ShutdownReason::LiveUpgrade(sig) => {
-            eprintln!(
-                "gungnird: signal {sig} received; persisting state and performing live upgrade"
-            );
-            if let Err(e) = db.flush_and_checkpoint() {
-                eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
+            ipc::ShutdownReason::LiveUpgrade(sig) => {
+                eprintln!(
+                    "gungnird: signal {sig} received; persisting state and performing live upgrade"
+                );
+                if let Err(e) = db.flush_and_checkpoint() {
+                    eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
+                }
+                if let Err(e) = ipc::perform_live_upgrade(&listener) {
+                    eprintln!("gungnird: live upgrade failed, still serving: {e}");
+                }
             }
-            ipc::perform_live_upgrade(&listener)?;
         }
     }
 
