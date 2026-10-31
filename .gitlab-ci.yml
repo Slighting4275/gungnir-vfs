@@ -44,14 +44,15 @@ default:
   # No `timeout:` here: GitLab accepts it under `default:` but never applies it (only a
   # job's own or extended `timeout:` counts; gitlab-org/gitlab#213634), so it is set in
   # .rust and .zig below instead.
-  # job_execution_timeout is what a job hitting `timeout:` fails with; it is not covered
-  # by stuck_or_timeout_failure (pending/no-updates jobs). Since GitLab 19.1 a runner
-  # restart or host reclaim mid-job reports runner_interrupted, not runner_system_failure.
-  # Never script_failure: a failing build or test must fail the pipeline, not get a
-  # second try that can hide a flake (D-002, AUD-04). Network installs retry in-script.
+  # Retry only failures of the CI infrastructure itself. Never script_failure: a failing
+  # build or test must fail the pipeline, not get a second try that can hide a flake
+  # (D-002, AUD-04). Never job_execution_timeout or stuck_or_timeout_failure either: a
+  # job that hits its `timeout:` may be an intermittent hang, the bug class this project
+  # exists to prevent, and a green retry would hide it (RC-F020). Network installs retry
+  # in-script.
   retry:
     max: 1
-    when: [runner_system_failure, runner_interrupted, stuck_or_timeout_failure, job_execution_timeout]
+    when: [runner_system_failure, api_failure, scheduler_failure]
 
 # Cargo registry + target dir, keyed on Cargo.lock. Only rust:build uploads it; every
 # other job only downloads, so parallel jobs never race to overwrite the same cache.
