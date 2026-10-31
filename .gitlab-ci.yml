@@ -306,5 +306,7 @@ rust:perf:
   needs: ["rust:build"]
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"
+    # An API-started pipeline asks for it by name (PR-F014); plain API pipelines do not.
+    - if: $CI_PIPELINE_SOURCE == "api" && $RUN_PERF == "1"
   script:
-    - cargo test --release --test stress_throughput -- --ignored
+    - cargo test --release --test stress_throughput -- --ignored --nocapture
