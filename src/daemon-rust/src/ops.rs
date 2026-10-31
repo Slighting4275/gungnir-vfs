@@ -669,6 +669,9 @@ impl OpsConfig {
             let ms = v.to_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             eprintln!("gungnird: TEST HOOK: file ops sleep {ms} ms per chunk");
             cfg.slow = Duration::from_millis(ms);
+            // A reflink has no chunks to slow down: on btrfs a "slow" copy would finish at
+            // once and tests that interrupt it would find nothing left to stop.
+            cfg.no_clone = true;
         }
         #[cfg(not(feature = "test-hooks"))]
         if std::env::var_os(SLOW_OPS_ENV).is_some() {
