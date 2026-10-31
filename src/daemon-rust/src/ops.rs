@@ -1984,9 +1984,7 @@ impl Exec<'_> {
         // the other filesystem, then fail with EBUSY on the root itself (DIB-F001).
         if let Some(at) = p.iter().rposition(|&b| b == b'/') {
             let parent = cstr(if at == 0 { b"/" } else { &p[..at] })?;
-            let up = self
-                .io
-                .statx(self.op, libc::AT_FDCWD, &parent, libc::AT_SYMLINK_NOFOLLOW)?;
+            let up = self.io.statx(self.op, libc::AT_FDCWD, &parent, 0)?; // the directory, through any link
             if other_mount(&up, &st) {
                 return Err(OpError::Os(libc::EXDEV));
             }

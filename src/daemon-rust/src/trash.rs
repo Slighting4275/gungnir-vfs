@@ -28,11 +28,19 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
 };
 
 /// Longest `.trashinfo` read; anything bigger is listed degraded.
 const INFO_MAX: u64 = 64 * 1024;
 const HOME_VOLUME: &str = "h";
+/// Entries read from one trash directory: a volume is foreign media, and its list is not
+/// allowed to grow the daemon without bound.
+pub const SCAN_MAX: usize = 1 << 17;
+/// Largest `directorysizes` rewritten; a bigger one is left alone, it is only a cache.
+const SIZES_MAX: u64 = 1 << 20;
+/// Request threads delete at the same time; each rewrite must see the last one's result.
+static SIZES: Mutex<()> = Mutex::new(());
 
 /// One trash directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +131,16 @@ fn split_name(name: &[u8]) -> Option<(&[u8], &[u8])> {
     let at = name.iter().position(|&b| b == b'-')?;
     let (v, e) = (&name[..at], &name[at + 1..]);
     valid_entry(e).then_some((v, e))
+}
+
+/// The directory a URI name's volume part names; `None` for the home trash or a bad name.
+#[must_use]
+pub fn volume_of(name: &[u8]) -> Option<PathBuf> {
+    let (v, _) = split_name(name)?;
+    if v == HOME_VOLUME.as_bytes() {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&unhex(v)?)))
 }
 
 /// The trash directory a URI name belongs to, among those known. A volume is matched
@@ -340,7 +358,7 @@ pub fn read_item(d: &TrashDir, entry: &[u8]) -> Item {
 /// `files/` cannot be read.
 pub fn scan(d: &TrashDir) -> io::Result<Vec<Item>> {
     let mut items = Vec::new();
-    for e in fs::read_dir(d.files())? {
+    for e in fs::read_dir(d.files())?.take(SCAN_MAX) {
         let name = e?.file_name();
         items.push(read_item(d, name.as_bytes()));
     }
@@ -396,7 +414,11 @@ pub fn remove_info(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
 
 /// Remove `entry`'s line from `directorysizes`, atomically (`<size> <mtime> <encoded>`).
 fn drop_size_line(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
+    let _serial = SIZES.lock().unwrap_or_else(PoisonError::into_inner);
     let path = d.dir.join("directorysizes");
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.len() > SIZES_MAX) {
+        return Ok(());
+    }
     let text = match fs::read(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -639,6 +661,27 @@ mod tests {
         assert_eq!(volume_dirs(&t.0, uid).len(), 1, "not sticky");
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
         assert_eq!(volume_dirs(&t.0, uid).len(), 2);
+    }
+
+    /// Deletes run on up to four threads: each must drop its own line.
+    #[test]
+    fn concurrent_deletes_drop_every_size_line() {
+        let t = T::new("sizes-race");
+        let d = t.trash();
+        for round in 0..30 {
+            let text: String = (0..8).map(|i| format!("1 2 e{round}x{i}\n")).collect();
+            fs::write(d.dir.join("directorysizes"), text).unwrap();
+            std::thread::scope(|s| {
+                for i in 0..8 {
+                    let d = &d;
+                    s.spawn(move || {
+                        let e = format!("e{round}x{i}");
+                        let _ = drop_size_line(d, e.as_bytes());
+                    });
+                }
+            });
+            assert_eq!(fs::read(d.dir.join("directorysizes")).unwrap(), b"");
+        }
     }
 
     #[test]

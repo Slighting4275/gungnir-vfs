@@ -184,6 +184,11 @@ fn trashed(t: &Path, e: &str, orig: &Path) -> R {
     Ok(())
 }
 
+#[cfg(feature = "test-hooks")]
+fn hexed(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 fn engines() -> [bool; 2] {
     [false, true]
 }
@@ -329,6 +334,13 @@ fn a_hung_volume_is_skipped_and_named() -> R {
     assert_eq!(st, gungnird::md::ST_SUSPECT_MOUNT, "{body:?}");
     let names = String::from_utf8_lossy(&body[10..]).into_owned();
     assert!(names.contains(v), "{names}");
+    let mut name = hexed(vt.as_os_str().as_bytes()).into_bytes();
+    name.extend_from_slice(b"-v");
+    assert_eq!(
+        delete(&mut dm.c, SCHEME_TRASH, &name)?,
+        gungnird::md::ST_SUSPECT_MOUNT,
+        "an item on a hung volume is not a missing item"
+    );
     assert!(
         !t.join("files/e").exists(),
         "the reachable trash is emptied"

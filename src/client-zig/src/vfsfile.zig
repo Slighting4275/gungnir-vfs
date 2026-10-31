@@ -22,7 +22,9 @@ const msg_restore: u32 = 42;
 const scheme_trash: u8 = 0;
 const scheme_recent: u8 = 1;
 
+const st_cancelled: u32 = 14;
 const st_os_error: u32 = 15;
+const st_would_recurse: u32 = 16;
 const st_mount_inside: u32 = 17;
 const st_not_empty: u32 = 18;
 
@@ -143,6 +145,8 @@ fn failure(cl: *const md.Client, reply: *ipc.Msg, e: md.Error, err: [*c][*c]c.GE
         error.Protocol => switch (cl.last_status) {
             st_mount_inside => setError(err, c.G_IO_ERROR_BUSY, "contains a mounted filesystem; unmount it and try again"),
             st_not_empty => setError(err, c.G_IO_ERROR_NOT_EMPTY, "some items remain"),
+            st_cancelled => setError(err, c.G_IO_ERROR_CANCELLED, "cancelled"),
+            st_would_recurse => setError(err, c.G_IO_ERROR_WOULD_RECURSE, "a folder cannot be restored to another filesystem this way"),
             st_os_error => {
                 const p = reply.payload();
                 const errno: c_int = if (p.len >= 8) std.mem.readInt(i32, p[4..8], .little) else 5;

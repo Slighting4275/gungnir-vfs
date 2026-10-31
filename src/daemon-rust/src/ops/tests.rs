@@ -1209,6 +1209,31 @@ fn delete_tree_never_descends_into_a_bind_mount_of_the_same_filesystem() -> R {
     Ok(())
 }
 
+/// A path through a symlinked parent on another mount is not a mount-point root.
+#[test]
+fn delete_tree_works_through_a_symlinked_parent_on_another_mount() -> R {
+    if !in_mount_namespace(
+        "ops::tests::delete_tree_works_through_a_symlinked_parent_on_another_mount",
+    )? {
+        return Ok(());
+    }
+    for engine in engines() {
+        let t = TestDir::new("op-linkparent")?;
+        let ops = start(engine, test_cfg())?;
+        let (real, mounted) = (t.join("real"), t.join("mounted"));
+        fs::create_dir_all(real.join("tree/sub"))?;
+        fs::write(real.join("tree/sub/f"), b"x")?;
+        fs::create_dir(&mounted)?;
+        let m = Mount::bind(&real, &mounted)?;
+        std::os::unix::fs::symlink(&mounted, t.join("link"))?;
+        let (d, _) = run(&ops, req(OpKind::DeleteTree, 0, &t.join("link/tree"), None))?;
+        assert_eq!(d.result, Ok(()), "{engine:?}");
+        assert!(!real.join("tree").exists(), "{engine:?}");
+        drop(m);
+    }
+    Ok(())
+}
+
 /// A root that is itself a mount point: nothing on it is deleted, EXDEV (DIB-F001).
 #[test]
 fn delete_tree_refuses_a_root_that_is_a_mount_point() -> R {

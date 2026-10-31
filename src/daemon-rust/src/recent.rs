@@ -74,6 +74,22 @@ fn xml_decode(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Offset of the `>` ending the tag at the start of `text`: XML allows `>` inside a quoted
+/// attribute value.
+fn tag_end(text: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    for (i, &b) in text.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
 /// The bookmarks of `text`, in file order. Anything that is not a well-formed
 /// `<bookmark ...>` is skipped, never an error.
 #[must_use]
@@ -87,7 +103,7 @@ pub fn parse(text: &[u8]) -> Vec<Entry> {
             i = start + 9;
             continue;
         }
-        let Some(tag_len) = text[start..].iter().position(|&b| b == b'>') else {
+        let Some(tag_len) = tag_end(&text[start..]) else {
             break;
         };
         let tag = &text[start + 9..start + tag_len];
@@ -198,6 +214,8 @@ pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
     out.extend_from_slice(&text[at..]);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".gungnir-{}", std::process::id()));
+    // Under the lock, so anything here is what a crash left.
+    let _ = fs::remove_file(&tmp);
     let r = (|| -> io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -276,6 +294,41 @@ mod tests {
             forget(&p, b"file:///none"),
             Err(ForgetError::NotFound)
         ));
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    /// XML allows `>` inside an attribute value. A tag cut there must not swallow the next
+    /// bookmark, or forgetting one entry would lose another.
+    #[test]
+    fn a_greater_than_in_an_attribute_keeps_bookmarks_apart() {
+        let text = br#"<xbel>
+<bookmark href="file:///a" title="x>y"/>
+<bookmark href="file:///b" added="1"><info/></bookmark>
+</xbel>
+"#;
+        let e = parse(text);
+        assert_eq!(e.len(), 2, "{e:?}");
+        let p = tmp("gt");
+        fs::write(&p, text).unwrap();
+        forget(&p, b"file:///a").unwrap();
+        let left = parse(&fs::read(&p).unwrap());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].uri, b"file:///b");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    /// A temp file left by a crash under the same pid must not block every later forget.
+    #[test]
+    fn a_stale_temp_file_does_not_stop_a_forget() {
+        let p = tmp("stale");
+        fs::write(&p, XBEL).unwrap();
+        let mut t = p.as_os_str().to_owned();
+        t.push(format!(".gungnir-{}", std::process::id()));
+        fs::write(&t, b"leftover").unwrap();
+        forget(&p, b"file:///home/u/a%20b.txt").unwrap();
+        assert!(!Path::new(&t).exists());
         let _ = fs::remove_file(&p);
         let _ = fs::remove_file(p.with_extension("xbel.lock"));
     }

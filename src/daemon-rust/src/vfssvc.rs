@@ -378,13 +378,13 @@ impl Svc {
             });
         }
         let (dirs, _) = self.dirs();
-        let (d, entry) = trash::resolve(&dirs, name).ok_or(Failure::st(ST_NOT_FOUND))?;
+        let (d, entry) = trash::resolve(&dirs, name).ok_or_else(|| self.unresolved(name))?;
         self.delete_item(d, &entry)
     }
 
     fn restore(&self, name: &[u8], dest: &[u8]) -> Result<(), Failure> {
         let (dirs, _) = self.dirs();
-        let (d, entry) = trash::resolve(&dirs, name).ok_or(Failure::st(ST_NOT_FOUND))?;
+        let (d, entry) = trash::resolve(&dirs, name).ok_or_else(|| self.unresolved(name))?;
         if !trash::sound(d, self.uid) {
             return Err(Failure::os(libc::ENOTDIR));
         }
@@ -499,6 +499,12 @@ pub fn page(items: &[Item], cursor: usize) -> Vec<u8> {
         } else {
             i
         };
+        if encoded(it) > max - 6 {
+            // Not even its name fits: nothing could address it. Say so, and move on.
+            eprintln!("gungnird: a trash item's name is too long to list");
+            at += 1;
+            continue;
+        }
         if body.len() + encoded(it) > max {
             break;
         }
@@ -524,6 +530,16 @@ fn take16<'a>(p: &mut &'a [u8]) -> Option<&'a [u8]> {
     let (s, rest) = rest.split_at_checked(usize::from(u16::from_le_bytes(*l)))?;
     *p = rest;
     Some(s)
+}
+
+impl Svc {
+    /// Why `name` resolves to nothing: its volume is hung or gone, or it is no item.
+    fn unresolved(&self, name: &[u8]) -> Failure {
+        match trash::volume_of(name) {
+            Some(dir) if self.blocked(&dir) => Failure::st(ST_SUSPECT_MOUNT),
+            _ => Failure::st(ST_NOT_FOUND),
+        }
+    }
 }
 
 /// Serves the kinds above and hands everything else to `inner`.
@@ -730,6 +746,27 @@ mod tests {
         let b = page(&items, 0);
         assert!(b.len() + 4 <= PAYLOAD_MAX);
         assert_eq!(count(&b), (0, 2));
+    }
+
+    /// A name that fits no reply (a very long volume path) cannot be addressed anyway:
+    /// it must not stop the page or end the list early.
+    #[test]
+    fn an_item_whose_name_fits_no_reply_does_not_stop_the_list() {
+        let mut huge = item(0, 1);
+        huge.name = vec![b'n'; 9000];
+        let items = vec![item(1, 1), huge, item(2, 1), item(3, 1)];
+        let (mut cursor, mut seen) = (0, 0usize);
+        for _ in 0..8 {
+            let b = page(&items, cursor);
+            let (next, n) = count(&b);
+            seen += usize::from(n);
+            if next == 0 {
+                break;
+            }
+            assert!(next as usize > cursor, "no progress");
+            cursor = next as usize;
+        }
+        assert_eq!(seen, 3);
     }
 
     #[test]
