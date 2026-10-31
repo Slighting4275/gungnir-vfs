@@ -250,17 +250,11 @@ fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
         (a, len as libc::socklen_t)
     }
     fn body() -> i32 {
-        // An abstract-namespace listener unique to this child: no file to clean up.
+        // The listener was bound before the filter by the parent test, as the daemon's
+        // own control socket is (bind and listen are refused from here, SEC-H-010).
         let (a, len) = addr(b's');
         // SAFETY: raw socket calls on our own fds and a local sockaddr_un.
         unsafe {
-            let l = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-            if l < 0 {
-                return 1;
-            }
-            if libc::bind(l, (&raw const a).cast(), len) != 0 || libc::listen(l, 4) != 0 {
-                return 2;
-            }
             let c = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
             if c < 0 {
                 return 3;
@@ -324,7 +318,7 @@ fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
                 return 9;
             }
             // SCM_RIGHTS over the connected stream (what the IPC socket does).
-            let fd = l;
+            let fd = c;
             let mut cbuf = [0u8; 64];
             let mut iov = libc::iovec {
                 iov_base: buf.as_ptr() as *mut _,
@@ -364,9 +358,22 @@ fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
             0
         }
     }
+    // An abstract-namespace listener unique to this process: no file to clean up. Held
+    // open across both children, so a connect that got through would find it.
+    let (a, len) = addr(b's');
+    // SAFETY: raw socket calls on our own fd and a local sockaddr_un.
+    let l = unsafe {
+        let l = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(l >= 0, "socket");
+        assert_eq!(libc::bind(l, (&raw const a).cast(), len), 0, "bind");
+        assert_eq!(libc::listen(l, 4), 0, "listen");
+        l
+    };
     for mode in [SeccompMode::Filter, SeccompMode::Strict] {
         assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
     }
+    // SAFETY: our own fd.
+    unsafe { libc::close(l) };
     // Control: unsandboxed, the same connect reaches the listener.
     fn control() -> i32 {
         let (a, len) = addr(b'c');
@@ -384,6 +391,69 @@ fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
         0
     }
     assert_eq!(in_unsandboxed_child(control), 0, "control");
+}
+
+/// SEC-H-010: once sandboxed, in both modes, no new listener: bind gets EPERM for a path
+/// and an abstract name, and listen gets EPERM on a socket bound before the filter (the
+/// only path where a listen could matter). The daemon's own listener, bound before the
+/// filter, is covered by the real-daemon test below and the socket-activation test in
+/// lifecycle.rs, which runs under --seccomp.
+#[test]
+fn sandboxed_process_cannot_start_listening() {
+    static BOUND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    fn body() -> i32 {
+        // SAFETY: raw socket calls on local fds and sockaddr_un values.
+        unsafe {
+            let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if s < 0 {
+                return 1;
+            }
+            let mut a: libc::sockaddr_un = std::mem::zeroed();
+            a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (i, b) in b"gungnir-sec-h-010".iter().enumerate() {
+                a.sun_path[i + 1] = *b as libc::c_char; // abstract: sun_path[0] = 0
+            }
+            let len = (std::mem::size_of::<libc::sa_family_t>() + 18) as libc::socklen_t;
+            let r = libc::syscall(libc::SYS_bind, s, &raw const a, len);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 2;
+            }
+            a.sun_path[0] = b'.' as libc::c_char;
+            let r = libc::syscall(libc::SYS_bind, s, &raw const a, len);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 3;
+            }
+            let bound = BOUND.load(std::sync::atomic::Ordering::SeqCst);
+            let r = libc::syscall(libc::SYS_listen, bound, 4);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 4;
+            }
+        }
+        0
+    }
+    // SAFETY: as above; the fd is ours, the child inherits it.
+    let fd = unsafe {
+        let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(s >= 0);
+        let mut a: libc::sockaddr_un = std::mem::zeroed();
+        a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let name = format!("gungnir-sec-h-010-{}", std::process::id());
+        for (i, b) in name.bytes().enumerate() {
+            a.sun_path[i + 1] = b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+        assert_eq!(
+            libc::bind(s, (&raw const a).cast(), len as libc::socklen_t),
+            0
+        );
+        s
+    };
+    BOUND.store(fd, std::sync::atomic::Ordering::SeqCst);
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+    // SAFETY: our own fd.
+    unsafe { libc::close(fd) };
 }
 
 /// SEC-F-008: once sandboxed, in both modes, the process is not dumpable and cannot make

@@ -197,8 +197,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_sendmsg as u32,
         libc::SYS_recvmsg as u32,
         libc::SYS_shutdown as u32,
-        libc::SYS_bind as u32,
-        libc::SYS_listen as u32,
         libc::SYS_getsockname as u32,
         libc::SYS_getpeername as u32,
         libc::SYS_setsockopt as u32,
@@ -329,6 +327,10 @@ fn rules() -> Vec<(u32, Rule)> {
         // filter goes in, and the daemon never connects anywhere afterwards, so the
         // user's session bus or systemd manager stays out of reach (SEC-R-012).
         (libc::SYS_connect as u32, libc::EPERM),
+        // The control socket is bound and listening (or adopted from systemd) before the
+        // filter goes in: no new listener could pose as a missing session bus (SEC-H-010).
+        (libc::SYS_bind as u32, libc::EPERM),
+        (libc::SYS_listen as u32, libc::EPERM),
     ];
     let af_unix = |nr: libc::c_long| (nr as u32, Rule::UnixStream);
     // SAFETY: getpid has no preconditions.
