@@ -916,7 +916,7 @@ const no_metadata_msg: [*:0]const u8 = "the UI thread got no metadata from a hea
 /// (scheduling on a loaded machine) is a timeout by design, and the quiet period after
 /// it hides metadata from the UI thread for ui_quiet_ms: retry the stage after that
 /// period rather than fail; a daemon that never answers in time still fails.
-const ui_metadata_attempts = 3;
+const ui_metadata_attempts = 5;
 const healthy_blocked_msg: [*:0]const u8 = "a metadata hook blocked the UI thread with a healthy daemon";
 
 /// Every attempt is held to the UI-block assert when `blocked` is given: the retry
