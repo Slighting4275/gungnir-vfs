@@ -11,19 +11,45 @@ Restart=on-failure
 RestartSec=1s
 
 # Sandboxing and System Hardening (Milestone 12)
+# The daemon serves the user's own files, wherever they are: home, trash, recent files,
+# /tmp, removable volumes. So no read-only home and no private /tmp; containment comes
+# from its in-process seccomp filter (--seccomp), and this unit adds what can be set from
+# outside. ProtectHome=read-only with PrivateTmp=yes broke trash, recent and /tmp copies.
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%t/gungnir %h/.local/share/gungnir %h/.cache/gungnir
-PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=no
+PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
 MemoryDenyWriteExecute=no
 LockPersonality=yes
-SystemCallFilter=@system-service @file-system @io-uring io_uring_setup io_uring_enter io_uring_register memfd_create
+UMask=0077
+LimitCORE=0
+# By name, not by group: what the daemon calls, from src/daemon-rust/src/seccomp.rs, plus
+# what it needs before its own filter goes in. Keep the two in step.
+SystemCallFilter=accept accept4 access arch_prctl bind brk chmod chown clock_getres clock_gettime
+SystemCallFilter=clock_nanosleep clone clone3 close close_range connect copy_file_range dup dup2 dup3
+SystemCallFilter=epoll_create epoll_create1 epoll_ctl epoll_pwait epoll_wait eventfd eventfd2 execve
+SystemCallFilter=execveat exit exit_group faccessat faccessat2 fadvise64 fallocate fchmod fchmodat fchown
+SystemCallFilter=fchownat fcntl fdatasync fgetxattr flistxattr flock fork fremovexattr fsetxattr fstat
+SystemCallFilter=fstatfs fsync ftruncate futex get_robust_list getcwd getdents getdents64 getegid geteuid
+SystemCallFilter=getgid getitimer getpeername getpid getppid getrandom getrlimit getrusage getsockname
+SystemCallFilter=getsockopt gettid gettimeofday getuid getxattr io_uring_enter io_uring_register
+SystemCallFilter=io_uring_setup ioctl kill lgetxattr listen listxattr llistxattr lremovexattr lseek
+SystemCallFilter=lsetxattr lstat madvise memfd_create mincore mkdir mkdirat mmap mprotect mremap msync
+SystemCallFilter=munmap nanosleep newfstatat open openat openat2 pipe pipe2 poll ppoll prctl pread64
+SystemCallFilter=preadv preadv2 prlimit64 pselect6 pwrite64 pwritev pwritev2 read readlink readlinkat
+SystemCallFilter=readv recvfrom recvmmsg recvmsg removexattr renameat renameat2 restart_syscall rmdir
+SystemCallFilter=rseq rt_sigaction rt_sigprocmask rt_sigreturn sched_getaffinity sched_setaffinity
+SystemCallFilter=sched_yield seccomp select sendmmsg sendmsg sendto set_robust_list set_tid_address
+SystemCallFilter=setitimer setrlimit setsockopt setxattr shutdown sigaltstack signalfd signalfd4 socket
+SystemCallFilter=socketpair splice stat statfs statx symlinkat sync_file_range syncfs sysinfo tee tgkill
+SystemCallFilter=times umask unlink unlinkat utimensat utimes vfork wait4 write writev
 SystemCallErrorNumber=EPERM
 
 [Install]
