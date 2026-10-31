@@ -26,6 +26,11 @@ const BPF_RET: u16 = 0x06;
 
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+/// `seccomp_data.args[i]`, low 32 bits (little-endian). Every argument checked here is
+/// an int or a flag word the kernel reads as 32 bits, so the high half is irrelevant.
+const fn arg_lo(i: u32) -> u32 {
+    16 + 8 * i
+}
 
 /// What the filter does with one system call. Calls without a rule get the mode's
 /// default deny (`EPERM` in filter mode, kill in strict mode); the explicit denials below
@@ -36,6 +41,8 @@ enum Rule {
     Allow,
     /// Always refused with this errno.
     Errno(i32),
+    /// Allowed when argument `arg` equals `val`, else refused with `errno`.
+    ArgEq { arg: u32, val: u32, errno: i32 },
 }
 
 /// Sandboxing mode for `gungnird`.
@@ -132,7 +139,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_getitimer as u32,
         libc::SYS_setitimer as u32,
         libc::SYS_getpid as u32,
-        libc::SYS_socket as u32,
         libc::SYS_connect as u32,
         libc::SYS_accept as u32,
         libc::SYS_sendto as u32,
@@ -144,7 +150,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_listen as u32,
         libc::SYS_getsockname as u32,
         libc::SYS_getpeername as u32,
-        libc::SYS_socketpair as u32,
         libc::SYS_setsockopt as u32,
         libc::SYS_getsockopt as u32,
         libc::SYS_clone as u32,
@@ -275,8 +280,31 @@ fn rules() -> Vec<(u32, Rule)> {
         (libc::SYS_execve as u32, libc::EPERM),
         (libc::SYS_execveat as u32, libc::EPERM),
     ];
-    let mut list: Vec<(u32, Rule)> = allowed.iter().map(|&n| (n, Rule::Allow)).collect();
-    list.extend(denied.iter().map(|&(n, e)| (n, Rule::Errno(e))));
+    let af_unix = |nr: libc::c_long| {
+        (
+            nr as u32,
+            Rule::ArgEq {
+                arg: 0,
+                val: libc::AF_UNIX as u32,
+                errno: libc::EAFNOSUPPORT,
+            },
+        )
+    };
+    let checked = [
+        // AF_UNIX sockets only: the control socket and its peers (D-044 item 3).
+        af_unix(libc::SYS_socket),
+        af_unix(libc::SYS_socketpair),
+    ];
+    let mut list: Vec<(u32, Rule)> = denied.iter().map(|&(n, e)| (n, Rule::Errno(e))).collect();
+    list.extend(checked);
+    // A call with its own rule is never also plainly allowed.
+    list.extend(
+        allowed
+            .iter()
+            .filter(|&&n| !list.iter().any(|(m, _)| *m == n))
+            .map(|&n| (n, Rule::Allow))
+            .collect::<Vec<_>>(),
+    );
     list.sort_by_key(|&(n, _)| n);
     list.dedup_by_key(|&mut (n, _)| n);
     list
@@ -291,9 +319,17 @@ fn rules() -> Vec<(u32, Rule)> {
 fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
     let errno = |e: i32| bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | (e as u32));
     let allow = bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW);
+    let load = |arg: u32| bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
     match *rule {
         Rule::Allow => vec![allow],
         Rule::Errno(e) => vec![errno(e)],
+        // A = arg; A == val ? allow : errno
+        Rule::ArgEq { arg, val, errno: e } => vec![
+            load(arg),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, val, 0, 1),
+            allow,
+            errno(e),
+        ],
     }
 }
 
@@ -467,6 +503,26 @@ mod tests {
             Some(Rule::Errno(libc::EPERM))
         );
         assert_eq!(get(libc::SYS_io_uring_enter), Some(Rule::Allow));
+    }
+
+    #[test]
+    fn sockets_are_af_unix_only() {
+        let r = rules();
+        for n in [libc::SYS_socket, libc::SYS_socketpair] {
+            let got = r
+                .iter()
+                .find(|(x, _)| *x == n as u32)
+                .map(|(_, r)| r.clone());
+            assert_eq!(
+                got,
+                Some(Rule::ArgEq {
+                    arg: 0,
+                    val: libc::AF_UNIX as u32,
+                    errno: libc::EAFNOSUPPORT
+                }),
+                "syscall {n}"
+            );
+        }
     }
 
     #[test]

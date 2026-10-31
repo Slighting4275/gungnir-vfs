@@ -155,6 +155,65 @@ fn sandboxed_execve_and_execveat_get_eperm() {
     }
 }
 
+/// Once sandboxed, sockets are AF_UNIX only, in both modes: other families get
+/// EAFNOSUPPORT, AF_UNIX still works. D-044 item 3.
+#[test]
+fn sandboxed_sockets_are_af_unix_only() {
+    fn body() -> i32 {
+        let mut sv = [0i32; 2];
+        for (i, af) in [
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_NETLINK,
+            libc::AF_PACKET,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // SAFETY: plain socket creation; nothing is dereferenced.
+            let r = unsafe { libc::syscall(libc::SYS_socket, af, libc::SOCK_STREAM, 0) };
+            if errno_of(r) != Some(libc::EAFNOSUPPORT) {
+                return 10 + i as i32;
+            }
+            // SAFETY: sv has room for two fds.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_socketpair,
+                    af,
+                    libc::SOCK_STREAM,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            };
+            if errno_of(r) != Some(libc::EAFNOSUPPORT) {
+                return 20 + i as i32;
+            }
+        }
+        // SAFETY: as above.
+        let r = unsafe { libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if r < 0 {
+            return 1;
+        }
+        // SAFETY: as above.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_socketpair,
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
+        if r != 0 {
+            return 2;
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {
