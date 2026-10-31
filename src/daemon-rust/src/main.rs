@@ -188,8 +188,36 @@ fn run() -> Result<()> {
         }
     };
 
+    // Every refusal or error from here on leaves no socket and, when this start created
+    // the store, no store either (DIR-A2-F01, DIR-HC-O1): the sandbox can only go in
+    // after the threads exist, so it cannot be checked before the bind.
+    let mut fresh = FreshStore::default();
+    let r = serve_daemon(
+        &listener,
+        opts.db_path,
+        idle_timeout,
+        opts.seccomp,
+        &mut fresh,
+    );
+    if r.is_err() {
+        listener.cleanup();
+        fresh.remove();
+    }
+    // The lock is released when `listener` drops, after the cleanup.
+    r
+}
+
+/// Steps 2 to 7 of [`run`], after the bind.
+fn serve_daemon(
+    listener: &ipc::Listener,
+    db_path: Option<PathBuf>,
+    idle_timeout: Option<Duration>,
+    seccomp: Option<SeccompMode>,
+    fresh: &mut FreshStore,
+) -> Result<()> {
     // 2. Open metadata database in WAL mode
-    let db_path = resolve_db_path(opts.db_path)?;
+    let db_path = resolve_db_path(db_path)?;
+    *fresh = FreshStore::note(&db_path);
     let db = store::spawn(
         Store::open(&db_path, StoreConfig::default())?,
         DbConfig::default(),
@@ -212,8 +240,7 @@ fn run() -> Result<()> {
     monitor.set_sink(Arc::downgrade(&sink));
 
     // 4. File operations (milestone 8)
-    let seccomp_mode = opts
-        .seccomp
+    let seccomp_mode = seccomp
         .or_else(seccomp_from_env)
         .unwrap_or(SeccompMode::Disabled);
     let (mut engine, why) = ops::choose_engine(env::var_os(ops::NO_URING_ENV).as_deref());
@@ -263,6 +290,13 @@ fn run() -> Result<()> {
         // Every first worker has its ring before the filter goes in; a worker on plain
         // syscalls under a uring engine would be a silent fallback: refuse to start.
         let (made, uring) = ops.wait_workers_ready(workers, Duration::from_secs(5));
+        #[cfg(feature = "test-hooks")]
+        let uring = if env::var_os("GUNGNIR_TEST_MIXED_RINGS").is_some() {
+            // Fault injection for the mixed-engine refusal (DIR-A2-F01).
+            uring.saturating_sub(1)
+        } else {
+            uring
+        };
         if made < workers || uring < workers {
             let msg = format!(
                 "only {uring} of {workers} file op workers on restricted io_uring rings \
@@ -284,6 +318,8 @@ fn run() -> Result<()> {
         eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
         seccomp::apply_sandbox(seccomp_mode)?;
     }
+    // From here the store is in use: an error no longer removes it.
+    *fresh = FreshStore::default();
 
     // 6. Serve with signal handling and idle shutdown multiplexing (milestone 11)
     let cfg = ipc::Config {
@@ -340,7 +376,7 @@ fn run() -> Result<()> {
                 if let Err(e) = db.flush_and_checkpoint() {
                     eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
                 }
-                if let Err(e) = ipc::perform_live_upgrade(&listener) {
+                if let Err(e) = ipc::perform_live_upgrade(listener) {
                     eprintln!("gungnird: live upgrade failed, still serving: {e}");
                 }
             }
@@ -348,6 +384,60 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The store files a start created, removed if that start fails (DIR-A2-F01).
+#[derive(Default)]
+struct FreshStore {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+impl FreshStore {
+    /// What a start with the store at `db` would create: nothing if it exists.
+    fn note(db: &std::path::Path) -> Self {
+        // The temp ledger next to the store (BC-A2-F03) is created by every start.
+        let ledger = db.with_file_name("ops-pending");
+        let new_ledger = std::fs::symlink_metadata(&ledger).is_err();
+        if std::fs::symlink_metadata(db).is_ok() {
+            return Self {
+                files: if new_ledger { vec![ledger] } else { Vec::new() },
+                dirs: Vec::new(),
+            };
+        }
+        let mut files = vec![db.to_path_buf(), ledger];
+        for sfx in ["-wal", "-shm", "-journal"] {
+            let mut p = db.as_os_str().to_os_string();
+            p.push(sfx);
+            files.push(PathBuf::from(p));
+        }
+        let mut dirs = Vec::new();
+        let mut d = db.parent();
+        while let Some(p) = d {
+            if p.as_os_str().is_empty() || std::fs::symlink_metadata(p).is_ok() {
+                break;
+            }
+            dirs.push(p.to_path_buf());
+            d = p.parent();
+        }
+        Self { files, dirs }
+    }
+
+    /// Remove the new store, and the directories created for it if they are empty.
+    fn remove(&self) {
+        let mut n = 0;
+        for f in &self.files {
+            if std::fs::remove_file(f).is_ok() && !f.ends_with("ops-pending") {
+                n += 1;
+            }
+        }
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir(d);
+        }
+        if n > 0 {
+            eprintln!("gungnird: removed the store this failed start created");
+        }
+    }
 }
 
 /// Longest a live upgrade under seccomp waits for running file ops before it exits.

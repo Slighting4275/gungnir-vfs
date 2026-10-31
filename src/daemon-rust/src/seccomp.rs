@@ -598,6 +598,11 @@ pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
     // Every thread of the process, at once (TSYNC): the daemon installs the filter after
     // its workers, monitor and DB threads exist. No single-thread fallback: if any thread
     // cannot be synchronized, or the kernel lacks TSYNC, fail closed (SEC-R-011).
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("GUNGNIR_TEST_TSYNC_FAIL").is_some() {
+        // Fault injection for the refusal path (DIR-A2-F01): as if TSYNC were missing.
+        return tsync_result(-1, io::Error::from_raw_os_error(libc::EINVAL));
+    }
     // SAFETY: `prog` points at `filter`, which outlives the call.
     let ret = unsafe {
         libc::syscall(
