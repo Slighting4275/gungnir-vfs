@@ -315,7 +315,7 @@ fn file_ops_over_the_real_socket_on_both_engines() -> R {
         drop(d);
         let log = fs::read_to_string(dir.join(&format!("gungnird-{no_uring}.log")))?;
         let engine = if no_uring { "Threads" } else { "Uring" };
-        let uring_ok = ops::io::probe().is_ok();
+        let uring_ok = no_uring || ops::io::uring_for_tests_env("engine log check");
         if no_uring || uring_ok {
             assert!(log.contains(&format!("file ops engine: {engine}")), "{log}");
         }

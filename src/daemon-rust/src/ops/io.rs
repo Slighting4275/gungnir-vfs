@@ -382,6 +382,40 @@ pub fn probe() -> io::Result<()> {
     }
 }
 
+/// Set (to anything but "" or "0") where io_uring must work, e.g. the CI job that tests
+/// the io_uring engine: tests then fail instead of skipping when it is unavailable.
+pub const REQUIRE_URING_ENV: &str = "GUNGNIR_REQUIRE_URING";
+
+/// Whether a test may use the io_uring engine here: `true` if [`probe`] passes. If it
+/// fails, `Err` with the reason when [`REQUIRE_URING_ENV`] is set (the test must fail),
+/// else `Ok(false)` after a skip note on stderr. `require` is the variable's value.
+///
+/// # Errors
+/// io_uring is unavailable and required.
+pub fn uring_for_tests(what: &str, require: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    match probe() {
+        Ok(()) => Ok(true),
+        Err(e) if require.is_some_and(|v| !v.is_empty() && v != "0") => Err(format!(
+            "{REQUIRE_URING_ENV} is set but io_uring is unavailable here ({e}): {what}"
+        )),
+        Err(e) => {
+            eprintln!("note: io_uring unavailable here ({e}): {what} skipped");
+            Ok(false)
+        }
+    }
+}
+
+/// [`uring_for_tests`] with the environment's [`REQUIRE_URING_ENV`]; panics (fails the
+/// test) when io_uring is required but unavailable.
+///
+/// # Panics
+/// As described.
+#[must_use]
+pub fn uring_for_tests_env(what: &str) -> bool {
+    uring_for_tests(what, std::env::var_os(REQUIRE_URING_ENV).as_deref())
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
 impl UringIo {
     /// # Errors
     /// The ring could not be created.
@@ -637,8 +671,11 @@ mod tests {
     /// leaked for good: 1 MiB buffer, ring fd and mappings per stuck request).
     #[test]
     fn abandoned_rings_are_freed_once_the_kernel_completes_their_request() -> io::Result<()> {
-        if probe().is_err() || std::env::var_os("GUNGNIR_NO_URING").is_some_and(|v| v != "0") {
-            eprintln!("note: io_uring unavailable or disabled: skipped");
+        if std::env::var_os("GUNGNIR_NO_URING").is_some_and(|v| v != "0") {
+            eprintln!("note: io_uring disabled: skipped");
+            return Ok(());
+        }
+        if !uring_for_tests_env("abandoned ring test") {
             return Ok(());
         }
         let mut u = UringIo::new(4096)?;
@@ -659,6 +696,30 @@ mod tests {
         Ok(())
     }
 
+    /// GUNGNIR_REQUIRE_URING turns the skip into a failure (D-061); unset or "0" keeps the
+    /// skip. Checked against this machine's probe result either way.
+    #[test]
+    fn require_uring_turns_a_skip_into_a_failure() {
+        use std::ffi::OsStr;
+        let up = probe().is_ok();
+        for (req, fails) in [
+            (None, false),
+            (Some(OsStr::new("")), false),
+            (Some(OsStr::new("0")), false),
+            (Some(OsStr::new("1")), true),
+        ] {
+            let got = uring_for_tests("switch test", req);
+            match (up, fails) {
+                (true, _) => assert_eq!(got, Ok(true), "{req:?}"),
+                (false, false) => assert_eq!(got, Ok(false), "{req:?}"),
+                (false, true) => assert!(
+                    got.as_ref().is_err_and(|e| e.contains(REQUIRE_URING_ENV)),
+                    "{req:?}: {got:?}"
+                ),
+            }
+        }
+    }
+
     /// Closing a ring interrupts the closing thread once, a little later, without a
     /// signal. A frame receive with a timeout (what every client does) must not fail
     /// with EINTR because of it; the file-ops itest hid this by retrying the whole
@@ -667,8 +728,7 @@ mod tests {
     fn closing_a_ring_does_not_fail_a_timed_frame_receive() -> io::Result<()> {
         use crate::ipc::{self, Frame};
         use std::os::unix::net::UnixStream;
-        if probe().is_err() {
-            eprintln!("note: io_uring unavailable: skipped");
+        if !uring_for_tests_env("io_uring test") {
             return Ok(());
         }
         for _ in 0..20 {

@@ -259,6 +259,10 @@ rust:test:
   extends: .rust
   timeout: 25 minutes
   needs: ["rust:build"]
+  variables:
+    # The io_uring engine tests must run here: fail, never skip, if io_uring is
+    # unavailable (ENOSYS/EPERM/ENOMEM in the runner's container). D-061.
+    GUNGNIR_REQUIRE_URING: "1"
   script:
     # --no-fail-fast: one failing test binary must not hide the results of the others.
     - cargo test --release --no-fail-fast
