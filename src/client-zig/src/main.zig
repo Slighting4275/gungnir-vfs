@@ -275,6 +275,7 @@ test {
     _ = health;
     _ = fileop;
     _ = volmon;
+    _ = @import("mountfilter.zig");
 }
 
 test "daemon state starts as connecting" {

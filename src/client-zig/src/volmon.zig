@@ -9,6 +9,7 @@
 //! health.zig flag hung or gone network/FUSE mounts.
 const std = @import("std");
 const c = @import("c");
+const mountfilter = @import("mountfilter.zig");
 const health = @import("health.zig");
 
 pub const monitor_type_name = "GungnirVolumeMonitor";
@@ -48,48 +49,7 @@ pub fn unescape(input: []const u8, out: []u8) []const u8 {
 
 // ---- Mount filtering ---------------------------------------------------------
 
-pub fn isStorageFs(fstype: []const u8, mount_point: []const u8) bool {
-    // Virtual filesystems to ignore
-    const ignored = [_][]const u8{
-        "proc",
-        "sysfs",
-        "devpts",
-        "cgroup",
-        "cgroup2",
-        "pstore",
-        "bpf",
-        "autofs",
-        "hugetlbfs",
-        "mqueue",
-        "debugfs",
-        "tracefs",
-        "securityfs",
-        "configfs",
-        "fusectl",
-        "devtmpfs",
-        "binfmt_misc",
-        "efivarfs",
-        "nsfs",
-        "rpc_pipefs",
-    };
-    for (ignored) |ig| {
-        if (std.mem.eql(u8, fstype, ig)) return false;
-    }
-    // tmpfs: only treat as a storage mount if mounted at /tmp, /run/media, /media, /mnt
-    if (std.mem.eql(u8, fstype, "tmpfs")) {
-        if (std.mem.eql(u8, mount_point, "/tmp") or
-            std.mem.startsWith(u8, mount_point, "/media") or
-            std.mem.startsWith(u8, mount_point, "/run/media") or
-            std.mem.startsWith(u8, mount_point, "/mnt"))
-        {
-            return true;
-        }
-        return false;
-    }
-    // Ignore internal docker overlay layers
-    if (std.mem.startsWith(u8, mount_point, "/var/lib/docker")) return false;
-    return true;
-}
+pub const isStorageFs = mountfilter.isStorageFs;
 
 pub fn isNetworkFs(fstype: []const u8) bool {
     const net_types = [_][]const u8{

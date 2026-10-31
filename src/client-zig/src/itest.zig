@@ -34,6 +34,7 @@ const ipc = @import("ipc.zig");
 const md = @import("md.zig");
 const health = @import("health.zig");
 const link = @import("link.zig");
+const mountfilter = @import("mountfilter.zig");
 const linux = std.os.linux;
 
 /// The GIO calling thread must get its VFS and answer local file queries in this time,
@@ -1762,15 +1763,13 @@ fn countIn(self: [*c]u8, dir: [*:0]const u8, variant: [*:0]const u8) ?Count {
 }
 
 /// The reference set for the Gungnir monitor (D-062): the file URIs of the mount points
-/// of /proc/self/mountinfo that the module's documented filter accepts (volmon.zig
-/// isStorageFs), parsed and filtered here independently of the module. Each mount
-/// point once.
+/// of /proc/self/mountinfo that the shared filter accepts (mountfilter.zig), with
+/// mountinfo parsed here independently of the module. Each mount point once.
 fn referenceRoots(out: *c.GHashTable) bool {
     var raw: [*c]u8 = null;
     var len: c.gsize = 0;
     if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return false;
     defer c.g_free(raw);
-    const ignored = [_][]const u8{ "proc", "sysfs", "devpts", "cgroup", "cgroup2", "pstore", "bpf", "autofs", "hugetlbfs", "mqueue", "debugfs", "tracefs", "securityfs", "configfs", "fusectl", "devtmpfs", "binfmt_misc", "efivarfs", "nsfs", "rpc_pipefs" };
     var lines = std.mem.splitScalar(u8, raw[0..len], '\n');
     while (lines.next()) |line| {
         var f = std.mem.tokenizeScalar(u8, line, ' ');
@@ -1797,13 +1796,7 @@ fn referenceRoots(out: *c.GHashTable) bool {
         }
         buf[n] = 0;
         const mp = buf[0..n];
-        const skip = for (ignored) |ig| {
-            if (std.mem.eql(u8, fstype, ig)) break true;
-        } else if (std.mem.eql(u8, fstype, "tmpfs"))
-            !(std.mem.eql(u8, mp, "/tmp") or std.mem.startsWith(u8, mp, "/media") or std.mem.startsWith(u8, mp, "/run/media") or std.mem.startsWith(u8, mp, "/mnt"))
-        else
-            std.mem.startsWith(u8, mp, "/var/lib/docker");
-        if (skip) continue;
+        if (!mountfilter.isStorageFs(fstype, mp)) continue;
         const uri = c.g_filename_to_uri(@ptrCast(&buf), null, null) orelse continue;
         _ = c.g_hash_table_add(out, uri);
     }
