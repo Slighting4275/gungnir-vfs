@@ -84,8 +84,8 @@ mod daemon {
     use gungnird::{
         md::{Client, MSG_MD_REPLY, ST_OK, Value},
         ops::{
-            self, Done, FLAG_ALL_METADATA, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, OpKind,
-            OpRequest,
+            self, Done, FLAG_ALL_METADATA, FLAG_NOFOLLOW_SYMLINKS, FLAG_OVERWRITE, MSG_OP_DONE,
+            MSG_OP_PROGRESS, MSG_OP_START, OpKind, OpRequest,
         },
     };
 
@@ -277,15 +277,77 @@ mod daemon {
         assert_eq!(done.result, Ok(()), "delete-tree, {what}\n{}", d.log_text());
         assert!(!dir.join("tree").exists(), "{what}");
 
+        // Symlinks (AUD-02): copying one recreates it with symlinkat, also over an
+        // existing file; then move and delete one.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink("src", &link)?;
+        let lcopy = dir.join("link-copy");
+        let done = run(
+            &mut c,
+            OpKind::Copy,
+            FLAG_NOFOLLOW_SYMLINKS | FLAG_ALL_METADATA,
+            &link,
+            Some(&lcopy),
+        )?;
+        assert_eq!(
+            done.result,
+            Ok(()),
+            "symlink copy, {what}\n{}",
+            d.log_text()
+        );
+        assert_eq!(fs::read_link(&lcopy)?, Path::new("src"), "{what}");
+        let over = dir.join("over");
+        fs::write(&over, b"old")?;
+        let done = run(
+            &mut c,
+            OpKind::Copy,
+            FLAG_NOFOLLOW_SYMLINKS | FLAG_OVERWRITE,
+            &link,
+            Some(&over),
+        )?;
+        assert_eq!(
+            done.result,
+            Ok(()),
+            "symlink copy over a file, {what}\n{}",
+            d.log_text()
+        );
+        assert_eq!(fs::read_link(&over)?, Path::new("src"), "{what}");
+        let lmoved = dir.join("sub/link-moved");
+        let done = run(
+            &mut c,
+            OpKind::Move,
+            FLAG_NOFOLLOW_SYMLINKS,
+            &lcopy,
+            Some(&lmoved),
+        )?;
+        assert_eq!(
+            done.result,
+            Ok(()),
+            "symlink move, {what}\n{}",
+            d.log_text()
+        );
+        assert_eq!(fs::read_link(&lmoved)?, Path::new("src"), "{what}");
+        let done = run(&mut c, OpKind::Delete, 0, &lmoved, None)?;
+        assert_eq!(
+            done.result,
+            Ok(()),
+            "symlink delete, {what}\n{}",
+            d.log_text()
+        );
+        assert!(
+            fs::symlink_metadata(&lmoved).is_err() && src.exists(),
+            "{what}"
+        );
+
         drop(c);
         assert!(d.alive()?, "{what}: the daemon died\n{}", d.log_text());
         Ok(())
     }
 }
 
-/// BC-HC-F02: the daemon as the shipped unit runs it (`--seccomp`, filter mode) and in
+/// BC-HC-F02, AUD-02: the daemon as the shipped unit runs it (`--seccomp`, filter mode) and in
 /// strict mode (any denied syscall kills it) serves metadata and every M8 op kind on
-/// real files, on both engines.
+/// real files, symlinks included, on both engines.
 #[test]
 fn the_sandboxed_daemon_serves_metadata_and_file_ops() -> daemon::R {
     for mode in ["filter", "strict"] {

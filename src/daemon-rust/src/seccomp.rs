@@ -196,6 +196,8 @@ fn authorized_syscalls() -> Vec<u32> {
         libc::SYS_openat as u32,
         libc::SYS_mkdirat as u32,
         libc::SYS_unlinkat as u32,
+        // Copying a symlink recreates it (ops io::symlink); AUD-02.
+        libc::SYS_symlinkat as u32,
         libc::SYS_renameat as u32,
         libc::SYS_readlinkat as u32,
         libc::SYS_fchmodat as u32,
