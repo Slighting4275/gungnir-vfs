@@ -22,6 +22,7 @@ const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
 const BPF_K: u16 = 0x00;
+const BPF_JSET: u16 = 0x40;
 const BPF_RET: u16 = 0x06;
 
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -31,6 +32,16 @@ const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 const fn arg_lo(i: u32) -> u32 {
     16 + 8 * i
 }
+
+/// Every namespace flag `clone` accepts (CLONE_NEWTIME is clone3/unshare only; in clone
+/// that bit is part of CSIGNAL).
+const CLONE_NEW_ANY: u32 = (libc::CLONE_NEWNS
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUSER
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWNET) as u32;
 
 /// What the filter does with one system call. Calls without a rule get the mode's
 /// default deny (`EPERM` in filter mode, kill in strict mode); the explicit denials below
@@ -43,6 +54,8 @@ enum Rule {
     Errno(i32),
     /// Allowed when argument `arg` equals `val`, else refused with `errno`.
     ArgEq { arg: u32, val: u32, errno: i32 },
+    /// Allowed when argument `arg` has none of the bits in `mask`, else refused.
+    ArgMaskClear { arg: u32, mask: u32, errno: i32 },
 }
 
 /// Sandboxing mode for `gungnird`.
@@ -152,7 +165,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_getpeername as u32,
         libc::SYS_setsockopt as u32,
         libc::SYS_getsockopt as u32,
-        libc::SYS_clone as u32,
         libc::SYS_fork as u32,
         libc::SYS_vfork as u32, // Live in-place upgrade re-exec handover
         libc::SYS_exit as u32,
@@ -254,7 +266,6 @@ fn rules() -> Vec<(u32, Rule)> {
         // (ops::io::prepare_sandbox_rings); afterwards only io_uring_enter (D-044).
         libc::SYS_io_uring_enter as u32,
         libc::SYS_openat2 as u32,
-        libc::SYS_clone3 as u32,
         libc::SYS_close_range as u32,
         libc::SYS_faccessat2 as u32,
         libc::SYS_rseq as u32,
@@ -279,6 +290,9 @@ fn rules() -> Vec<(u32, Rule)> {
         // No exec: a sandboxed live upgrade drains and exits instead (D-044 item 2).
         (libc::SYS_execve as u32, libc::EPERM),
         (libc::SYS_execveat as u32, libc::EPERM),
+        // clone3 passes its flags in a struct the filter cannot read: ENOSYS makes glibc
+        // fall back to clone, whose flags it can (D-044 item 4).
+        (libc::SYS_clone3 as u32, libc::ENOSYS),
     ];
     let af_unix = |nr: libc::c_long| {
         (
@@ -294,6 +308,15 @@ fn rules() -> Vec<(u32, Rule)> {
         // AF_UNIX sockets only: the control socket and its peers (D-044 item 3).
         af_unix(libc::SYS_socket),
         af_unix(libc::SYS_socketpair),
+        // Threads, not namespaces: clone with any CLONE_NEW* flag is refused (D-044 item 4).
+        (
+            libc::SYS_clone as u32,
+            Rule::ArgMaskClear {
+                arg: 0,
+                mask: CLONE_NEW_ANY,
+                errno: libc::EPERM,
+            },
+        ),
     ];
     let mut list: Vec<(u32, Rule)> = denied.iter().map(|&(n, e)| (n, Rule::Errno(e))).collect();
     list.extend(checked);
@@ -327,6 +350,17 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
         Rule::ArgEq { arg, val, errno: e } => vec![
             load(arg),
             bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, val, 0, 1),
+            allow,
+            errno(e),
+        ],
+        // A = arg; A & mask ? errno : allow
+        Rule::ArgMaskClear {
+            arg,
+            mask,
+            errno: e,
+        } => vec![
+            load(arg),
+            bpf_jump(BPF_JMP | BPF_JSET | BPF_K, mask, 1, 0),
             allow,
             errno(e),
         ],
@@ -523,6 +557,26 @@ mod tests {
                 "syscall {n}"
             );
         }
+    }
+
+    #[test]
+    fn clone_without_namespaces_clone3_enosys() {
+        let r = rules();
+        let get = |n: libc::c_long| {
+            r.iter()
+                .find(|(x, _)| *x == n as u32)
+                .map(|(_, r)| r.clone())
+        };
+        assert_eq!(get(libc::SYS_clone3), Some(Rule::Errno(libc::ENOSYS)));
+        assert_eq!(
+            get(libc::SYS_clone),
+            Some(Rule::ArgMaskClear {
+                arg: 0,
+                mask: CLONE_NEW_ANY,
+                errno: libc::EPERM
+            })
+        );
+        assert_eq!(CLONE_NEW_ANY & libc::CSIGNAL as u32, 0);
     }
 
     #[test]

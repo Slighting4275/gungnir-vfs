@@ -214,6 +214,65 @@ fn sandboxed_sockets_are_af_unix_only() {
     }
 }
 
+/// Once sandboxed, in both modes: clone with a namespace flag gets EPERM, clone3 gets
+/// ENOSYS, and threads still start (glibc falls back from clone3 to clone). D-044 item 4.
+#[test]
+fn sandboxed_clone_refuses_namespaces_and_clone3_is_enosys() {
+    fn body() -> i32 {
+        for (i, f) in [
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWCGROUP,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // SAFETY: refused before the kernel creates anything; were it allowed it
+            // would fork (no CLONE_VM), and the child exits at once below.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    (f | libc::SIGCHLD) as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if r == 0 {
+                // SAFETY: the unexpected child leaves at once.
+                unsafe { libc::_exit(99) };
+            }
+            if errno_of(r) != Some(libc::EPERM) {
+                return 10 + i as i32;
+            }
+        }
+        let mut args = [0u64; 11]; // struct clone_args, flags 0
+        args[4] = libc::SIGCHLD as u64; // exit_signal
+        // SAFETY: refused before the kernel reads the struct.
+        let r = unsafe { libc::syscall(libc::SYS_clone3, args.as_mut_ptr(), 88) };
+        if r == 0 {
+            // SAFETY: as above.
+            unsafe { libc::_exit(99) };
+        }
+        if errno_of(r) != Some(libc::ENOSYS) {
+            return 2;
+        }
+        // A thread still starts and joins.
+        if std::thread::spawn(|| 5).join().ok() != Some(5) {
+            return 3;
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {
