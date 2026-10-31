@@ -59,7 +59,25 @@ enum Rule {
     ArgEq { arg: u32, val: u32, errno: i32 },
     /// Allowed when argument `arg` has none of the bits in `mask`, else refused.
     ArgMaskClear { arg: u32, mask: u32, errno: i32 },
+    /// Allowed when argument `arg` is one of `vals`, else refused.
+    ArgIn {
+        arg: u32,
+        vals: &'static [u32],
+        errno: i32,
+    },
 }
+
+/// The ioctl requests the daemon makes, from strace of its test suites (HANDOFF-A2,
+/// evidence a2-6-ioctl-trace.txt) and the source: FIONBIO (std's set_nonblocking),
+/// FICLONE (reflink copy), FS_IOC_GETVERSION (inode generation), FS_IOC_GETFSUUID and
+/// BTRFS_IOC_INO_LOOKUP (filesystem identity). The kernel reads the request as 32 bits.
+const IOCTLS: &[u32] = &[
+    libc::FIONBIO as u32,
+    libc::FICLONE as u32,
+    libc::FS_IOC_GETVERSION as u32,
+    crate::fsid::FS_IOC_GETFSUUID,
+    crate::fsid::BTRFS_IOC_INO_LOOKUP,
+];
 
 /// Sandboxing mode for `gungnird`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +152,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_rt_sigaction as u32,
         libc::SYS_rt_sigprocmask as u32,
         libc::SYS_rt_sigreturn as u32,
-        libc::SYS_ioctl as u32,
         libc::SYS_pread64 as u32,
         libc::SYS_pwrite64 as u32,
         libc::SYS_readv as u32,
@@ -335,6 +352,17 @@ fn rules() -> Vec<(u32, Rule)> {
                 errno: libc::EPERM,
             },
         ),
+        // Only the ioctls the daemon makes; any other gets ENOTTY, what an unsupported
+        // request returns anyway, so callers degrade as on a filesystem without it
+        // (D-044 item 6).
+        (
+            libc::SYS_ioctl as u32,
+            Rule::ArgIn {
+                arg: 1,
+                vals: IOCTLS,
+                errno: libc::ENOTTY,
+            },
+        ),
         (
             libc::SYS_memfd_create as u32,
             Rule::ArgMaskClear {
@@ -369,7 +397,7 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
     let errno = |e: i32| bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | (e as u32));
     let allow = bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW);
     let load = |arg: u32| bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_lo(arg));
-    match *rule {
+    match rule.clone() {
         Rule::Allow => vec![allow],
         Rule::Errno(e) => vec![errno(e)],
         // A = arg; A == val ? allow : errno
@@ -379,6 +407,23 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
             allow,
             errno(e),
         ],
+        // A = arg; A == vals[i] for some i ? allow : errno
+        Rule::ArgIn {
+            arg,
+            vals,
+            errno: e,
+        } => {
+            let n = vals.len();
+            let mut b = vec![load(arg)];
+            for (i, &v) in vals.iter().enumerate() {
+                // From instruction i (after the load) to the allow at n + 1.
+                let jt = u8::try_from(n - i).unwrap_or(u8::MAX);
+                b.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, v, jt, 0));
+            }
+            b.push(errno(e));
+            b.push(allow);
+            b
+        }
         // A = arg; A & mask ? errno : allow
         Rule::ArgMaskClear {
             arg,
@@ -633,6 +678,86 @@ mod tests {
             None,
             "pkey_mprotect stays denied"
         );
+    }
+
+    /// A classic-BPF interpreter for the subset the builder emits, to check what the
+    /// filter decides for a given call (seccomp_data: nr, arch, ip, args).
+    fn decide(f: &[libc::sock_filter], nr: u32, args: [u64; 6]) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&AUDIT_ARCH_X86_64.to_le_bytes());
+        for (i, a) in args.iter().enumerate() {
+            data[16 + 8 * i..24 + 8 * i].copy_from_slice(&a.to_le_bytes());
+        }
+        let (mut a, mut pc) = (0u32, 0usize);
+        loop {
+            let ins = f[pc];
+            pc += 1;
+            match ins.code {
+                c if c == BPF_LD | BPF_W | BPF_ABS => {
+                    let k = ins.k as usize;
+                    a = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+                }
+                c if c == BPF_JMP | BPF_JEQ | BPF_K => {
+                    pc += usize::from(if a == ins.k { ins.jt } else { ins.jf });
+                }
+                c if c == BPF_JMP | BPF_JSET | BPF_K => {
+                    pc += usize::from(if a & ins.k != 0 { ins.jt } else { ins.jf });
+                }
+                c if c == BPF_RET | BPF_K => return ins.k,
+                c => panic!("unexpected BPF opcode {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_filter_decides_ioctls_by_request() {
+        let f = build_filter(SeccompMode::Strict).unwrap();
+        let nr = libc::SYS_ioctl as u32;
+        let enotty = libc::SECCOMP_RET_ERRNO | libc::ENOTTY as u32;
+        for &v in IOCTLS {
+            assert_eq!(
+                decide(&f, nr, [3, u64::from(v), 0, 0, 0, 0]),
+                libc::SECCOMP_RET_ALLOW
+            );
+            // The high half of the request is ignored, as by the kernel.
+            let hi = u64::from(v) | (1 << 40);
+            assert_eq!(decide(&f, nr, [3, hi, 0, 0, 0, 0]), libc::SECCOMP_RET_ALLOW);
+        }
+        for v in [libc::TCGETS, libc::TIOCSTI, 0x5451, 0] {
+            assert_eq!(decide(&f, nr, [3, v, 0, 0, 0, 0]), enotty, "{v:#x}");
+        }
+        // A call with no rule gets the mode's default, an allowed one is allowed.
+        assert_eq!(
+            decide(&f, libc::SYS_ptrace as u32, [0; 6]),
+            libc::SECCOMP_RET_KILL_PROCESS
+        );
+        assert_eq!(
+            decide(&f, libc::SYS_getpid as u32, [0; 6]),
+            libc::SECCOMP_RET_ALLOW
+        );
+    }
+
+    #[test]
+    fn ioctl_allowlist() {
+        let r = rules();
+        let got = r
+            .iter()
+            .find(|(x, _)| *x == libc::SYS_ioctl as u32)
+            .map(|(_, r)| r.clone());
+        assert_eq!(
+            got,
+            Some(Rule::ArgIn {
+                arg: 1,
+                vals: IOCTLS,
+                errno: libc::ENOTTY
+            })
+        );
+        assert_eq!(IOCTLS.len(), 5);
+        // Decoded from the strace run (evidence a2-6-ioctl-trace.txt).
+        for v in [0x5421, 0x4004_9409, 0x8008_7601, 0x8011_1500, 0xd000_9412] {
+            assert!(IOCTLS.contains(&v), "{v:#x}");
+        }
     }
 
     #[test]

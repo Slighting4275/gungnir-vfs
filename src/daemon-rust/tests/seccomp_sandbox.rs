@@ -332,6 +332,40 @@ fn sandboxed_executable_memory_is_refused() {
     }
 }
 
+/// Once sandboxed, in both modes: ioctls outside the allowlist get ENOTTY (FIOCLEX,
+/// TCGETS, TIOCSTI), allowed ones still reach the kernel (FIONBIO). D-044 item 6.
+#[test]
+fn sandboxed_ioctls_outside_the_allowlist_get_enotty() {
+    fn body() -> i32 {
+        let mut sv = [0i32; 2];
+        // SAFETY: sv has room for two fds.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+            return 1;
+        }
+        let mut on: libc::c_int = 1;
+        // SAFETY: FIONBIO reads one int.
+        if unsafe { libc::syscall(libc::SYS_ioctl, sv[0], libc::FIONBIO, &raw mut on) } != 0 {
+            return 2;
+        }
+        let mut buf = [0u8; 64];
+        for (i, req) in [0x5451, libc::TCGETS, libc::TIOCSTI]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: on our own socket, never a terminal; FIOCLEX would succeed on it
+            // unsandboxed, the terminal requests fail on a socket anyway.
+            let r = unsafe { libc::syscall(libc::SYS_ioctl, sv[0], req, buf.as_mut_ptr()) };
+            if errno_of(r) != Some(libc::ENOTTY) {
+                return 10 + i as i32;
+            }
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {
