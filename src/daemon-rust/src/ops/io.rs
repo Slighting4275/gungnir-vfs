@@ -322,6 +322,9 @@ const NEEDED: [u8; 10] = [
 /// Opcodes a ring accepts: [`NEEDED`] plus `TIMEOUT` (tests). Every ring is created
 /// disabled, restricted to these, then enabled, so a sandboxed daemon's rings cannot be
 /// driven to do anything else (D-044 item 1).
+/// `IORING_REGISTER_ENABLE_RINGS` (uapi io_uring.h): the only register rule a ring gets.
+const REGISTER_ENABLE_RINGS: u8 = 12;
+
 const ALLOWED: [u8; 11] = [
     opcode::Nop::CODE,
     opcode::OpenAt::CODE,
@@ -345,6 +348,10 @@ pub fn restricted_ring() -> io::Result<IoUring> {
     let ring = IoUring::builder().setup_r_disabled().build(RING_ENTRIES)?;
     let mut res: Vec<Restriction> = ALLOWED.iter().map(|&op| Restriction::sqe_op(op)).collect();
     res.push(Restriction::sqe_flags_allowed(0));
+    // Newer kernels (seen on 7.2, not on 6.12) police io_uring_register only when a
+    // register rule exists. Name the one op that is spent by the enable just below, so
+    // nothing can be registered on an enabled ring, on old kernels and new alike.
+    res.push(Restriction::register_op(REGISTER_ENABLE_RINGS));
     ring.submitter().register_restrictions(&mut res)?;
     ring.submitter().register_enable_rings()?;
     Ok(ring)
