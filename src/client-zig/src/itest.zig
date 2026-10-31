@@ -917,12 +917,18 @@ const no_metadata_msg: [*:0]const u8 = "the UI thread got no metadata from a hea
 /// it hides metadata from the UI thread for ui_quiet_ms: retry the stage after that
 /// period rather than fail; a daemon that never answers in time still fails.
 const ui_metadata_attempts = 3;
+const healthy_blocked_msg: [*:0]const u8 = "a metadata hook blocked the UI thread with a healthy daemon";
 
-fn runOnUiThreadWantingMetadata(ctx: *Ctx, out: *UiRun) ?[*:0]const u8 {
+/// Every attempt is held to the UI-block assert when `blocked` is given: the retry
+/// forgives lost metadata only, never a blocked UI thread (F10b).
+fn runOnUiThreadWantingMetadata(ctx: *Ctx, out: *UiRun, blocked: ?[*:0]const u8) ?[*:0]const u8 {
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         out.* = .{ .ctx = ctx, .loop = null, .want_metadata = true };
-        const what = runOnUiThread(out) orelse return null;
+        const result = runOnUiThread(out);
+        c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, attempt %u: worst %s %ld us", attempt, out.worst_what, @as(c_long, @intCast(out.worst_us)));
+        if (blocked) |msg| if (out.worst_us > ui_assert_ms * 1000) return msg;
+        const what = result orelse return null;
         if (what != no_metadata_msg or attempt == ui_metadata_attempts) return what;
         c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, no metadata on attempt %u (a slow reply started the quiet period), retrying", attempt);
         c.g_usleep((link.ui_quiet_ms + 200) * 1000);
@@ -1011,9 +1017,9 @@ fn checkUiThread(ctx: *Ctx) ?[*:0]const u8 {
     }
     // Healthy daemon: the UI thread gets the metadata, within the SLO.
     var healthy: UiRun = undefined;
-    if (runOnUiThreadWantingMetadata(ctx, &healthy)) |what| return what;
+    if (runOnUiThreadWantingMetadata(ctx, &healthy, healthy_blocked_msg)) |what| return what;
     c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, daemon answering: worst %s %ld us", healthy.worst_what, @as(c_long, @intCast(healthy.worst_us)));
-    if (healthy.worst_us > ui_assert_ms * 1000) return "a metadata hook blocked the UI thread with a healthy daemon";
+    if (healthy.worst_us > ui_assert_ms * 1000) return healthy_blocked_msg;
     if (!createFile(paths[1])) return "could not re-create the test file";
 
     _ = linux.kill(ctx.pid, .STOP);
@@ -1038,7 +1044,7 @@ fn checkUiThread(ctx: *Ctx) ?[*:0]const u8 {
     if (!createFile(paths[1])) return "could not re-create the test file";
     c.g_usleep(1200 * 1000);
     var again: UiRun = undefined;
-    if (runOnUiThreadWantingMetadata(ctx, &again)) |w| return w;
+    if (runOnUiThreadWantingMetadata(ctx, &again, null)) |w| return w;
     c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, answering again: worst %s %ld us", again.worst_what, @as(c_long, @intCast(again.worst_us)));
     return null;
 }
