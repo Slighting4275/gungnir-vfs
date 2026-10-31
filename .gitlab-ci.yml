@@ -207,8 +207,14 @@ rust:build:
   script:
     - cargo build --release
     - test -x .build/target/release/gungnird
-    # The shipped daemon must never carry the test hooks (milestone 7).
-    - "! grep -q 'TEST HOOK' .build/target/release/gungnird"
+    # The shipped daemon must never carry the test hooks (milestone 7). An explicit exit:
+    # errexit ignores a `!`-negated command, so `! grep` would stop gating as soon as a
+    # line followed it (RC-F021).
+    - |
+      if grep -q 'TEST HOOK' .build/target/release/gungnird; then
+        echo "release gungnird contains TEST HOOK code" >&2
+        exit 1
+      fi
   artifacts:
     name: gungnird
     paths: [.build/target/release/gungnird]
@@ -257,7 +263,11 @@ zig:test:
   script:
     - ./zb test --summary all
     # The itest's test-hooks daemon lives in .build/target-hooks, never over the artifact.
-    - "! grep -q 'TEST HOOK' .build/target/release/gungnird"
+    - |
+      if grep -q 'TEST HOOK' .build/target/release/gungnird; then
+        echo "release gungnird was overwritten by a TEST HOOK build" >&2
+        exit 1
+      fi
 
 # The 50k-event stress benchmark (AGENTS.md §4) with its wall-clock, p99 and peak-RSS
 # SLO asserts unchanged. Not a per-push correctness gate (shared runners make the timing
