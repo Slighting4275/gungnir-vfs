@@ -386,6 +386,73 @@ fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
     assert_eq!(in_unsandboxed_child(control), 0, "control");
 }
 
+/// SEC-F-008: once sandboxed, in both modes, the process is not dumpable and cannot make
+/// itself dumpable again, has no core limit left, and cannot open its own /proc/self/mem
+/// (root ignores the file mode, so that one check needs an ordinary user); thread naming
+/// and what the daemon reads from its own /proc still work.
+#[test]
+fn sandboxed_process_cannot_patch_itself_through_proc() {
+    fn body() -> i32 {
+        // SAFETY: flag prctls and raw opens of NUL-terminated literals.
+        unsafe {
+            if libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                return 1;
+            }
+            let r = libc::syscall(libc::SYS_prctl, libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 2;
+            }
+            if libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                return 3;
+            }
+            let mut core = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            if libc::getrlimit(libc::RLIMIT_CORE, &raw mut core) != 0
+                || core.rlim_cur != 0
+                || core.rlim_max != 0
+            {
+                return 4;
+            }
+            if libc::geteuid() != 0 {
+                for flags in [libc::O_RDONLY, libc::O_RDWR, libc::O_WRONLY] {
+                    let fd = libc::open(c"/proc/self/mem".as_ptr(), flags | libc::O_CLOEXEC);
+                    if fd >= 0 {
+                        return 5;
+                    }
+                }
+            }
+            if libc::prctl(libc::PR_SET_NAME, c"gungnir-t".as_ptr(), 0, 0, 0) != 0 {
+                return 6;
+            }
+            // The two /proc paths the daemon uses after the filter (fsid.rs, health.rs).
+            let m = libc::open(c"/proc/self/mountinfo".as_ptr(), libc::O_RDONLY);
+            if m < 0 {
+                return 7;
+            }
+            // No allocation in the forked child; the kernel refuses leading zeros in the name.
+            let mut p = *b"/proc/self/fd/\0\0\0\0";
+            let (mut n, mut digits, mut at) = (m, [0u8; 3], 0);
+            while n > 0 && at < 3 {
+                digits[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                at += 1;
+            }
+            for (i, d) in digits[..at].iter().rev().enumerate() {
+                p[14 + i] = *d;
+            }
+            if n != 0 || libc::open(p.as_ptr().cast(), libc::O_RDONLY) < 0 {
+                return 8;
+            }
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 /// Once sandboxed, in both modes: clone with a namespace flag gets EPERM, clone3 gets
 /// ENOSYS, and threads still start (glibc falls back from clone3 to clone). D-044 item 4.
 #[test]

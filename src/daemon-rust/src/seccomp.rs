@@ -69,6 +69,8 @@ enum Rule {
     Errno(i32),
     /// Allowed when argument `arg` equals `val`, else refused with `errno`.
     ArgEq { arg: u32, val: u32, errno: i32 },
+    /// Refused with `errno` when argument `arg` equals `val`, else allowed.
+    ArgNe { arg: u32, val: u32, errno: i32 },
     /// Allowed when argument `arg` has none of the bits in `mask`, else refused.
     ArgMaskClear { arg: u32, mask: u32, errno: i32 },
     /// Allowed when argument `arg` is one of `vals`, else refused.
@@ -229,7 +231,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_getegid as u32,
         libc::SYS_sigaltstack as u32,
         libc::SYS_arch_prctl as u32,
-        libc::SYS_prctl as u32,
         libc::SYS_setrlimit as u32,
         libc::SYS_statfs as u32,
         libc::SYS_fstatfs as u32,
@@ -364,6 +365,16 @@ fn rules() -> Vec<(u32, Rule)> {
                 errno: libc::EPERM,
             },
         ),
+        // Thread names stay; the dumpable flag cleared by apply_sandbox stays cleared, or
+        // /proc/self/mem would open again (SEC-F-008).
+        (
+            libc::SYS_prctl as u32,
+            Rule::ArgNe {
+                arg: 0,
+                val: libc::PR_SET_DUMPABLE as u32,
+                errno: libc::EPERM,
+            },
+        ),
         // Threads, not namespaces: clone with any CLONE_NEW* flag is refused (D-044 item 4).
         (
             libc::SYS_clone as u32,
@@ -445,6 +456,13 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
             bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, val, 0, 1),
             allow,
             errno(e),
+        ],
+        // A = arg; A == val ? errno : allow
+        Rule::ArgNe { arg, val, errno: e } => vec![
+            load(arg),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, val, 0, 1),
+            errno(e),
+            allow,
         ],
         // A = arg; A == vals[i] for some i ? allow : errno
         Rule::ArgIn {
@@ -589,6 +607,23 @@ pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
         filter: filter.as_ptr() as *mut libc::sock_filter,
     };
 
+    // Nothing to read back from a sandboxed daemon: no core file, and with dumpable off
+    // /proc/self/mem cannot be opened to patch its own code past the PROT_EXEC rules. Its
+    // /proc entries turn root-owned, but what it uses stays open to it: mountinfo is
+    // world-readable and /proc/self/fd is always open to its own thread group (SEC-F-008).
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `no_core` outlives the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const no_core) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: plain flag prctl.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
     // Ensure PR_SET_NO_NEW_PRIVS is enabled prior to applying seccomp filter
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
@@ -729,6 +764,21 @@ mod tests {
         assert_eq!(
             decide(&f, libc::SYS_sendmsg as u32, [3, 0x1000, 0, 0, 0, 0]),
             allow
+        );
+    }
+
+    /// SEC-F-008: the dumpable flag cannot be turned back on; other prctls still pass.
+    #[test]
+    fn the_filter_refuses_set_dumpable_only() {
+        let f = build_filter(SeccompMode::Strict).unwrap();
+        let nr = libc::SYS_prctl as u32;
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let dumpable = libc::PR_SET_DUMPABLE as u64;
+        assert_eq!(decide(&f, nr, [dumpable, 1, 0, 0, 0, 0]), eperm);
+        assert_eq!(decide(&f, nr, [dumpable, 0, 0, 0, 0, 0]), eperm);
+        assert_eq!(
+            decide(&f, nr, [libc::PR_SET_NAME as u64, 0x1000, 0, 0, 0, 0]),
+            libc::SECCOMP_RET_ALLOW
         );
     }
 
