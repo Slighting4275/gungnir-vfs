@@ -69,6 +69,56 @@ fn in_process_filter_verification() {
     }
 }
 
+/// Run `body` in a forked child under the filter of `mode`; the child's exit status
+/// (0 = all checks held, other = which check failed; killed = a signal).
+fn in_sandboxed_child(mode: SeccompMode, body: fn() -> i32) -> i32 {
+    // SAFETY: the child only applies the filter, makes raw syscalls and exits.
+    unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            if apply_sandbox(mode).is_err() {
+                libc::_exit(100);
+            }
+            libc::_exit(body());
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -libc::WTERMSIG(status)
+        }
+    }
+}
+
+fn errno_of(res: libc::c_long) -> Option<i32> {
+    (res == -1).then(|| io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// Once sandboxed, no new ring and no ring registration, in both modes (EPERM, not a
+/// kill: the engine falls back to plain syscalls). D-044 item 1.
+#[test]
+fn sandboxed_io_uring_setup_and_register_get_eperm() {
+    fn body() -> i32 {
+        let mut params = [0u8; 120];
+        // SAFETY: io_uring_params is 120 bytes; refused before the kernel reads it.
+        let r = unsafe { libc::syscall(libc::SYS_io_uring_setup, 8, params.as_mut_ptr()) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 1;
+        }
+        // SAFETY: refused before the kernel looks at fd or arguments.
+        let r = unsafe { libc::syscall(libc::SYS_io_uring_register, -1, 0, 0, 0) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 2;
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {
@@ -339,6 +389,13 @@ mod daemon {
             "{what}"
         );
 
+        // With io_uring usable here, the sandboxed daemon really ran its ops on
+        // restricted rings, and pre-created the rings for later workers (D-044 item 1).
+        if !no_uring && ops::io::uring_for_tests_env("sandboxed uring engine check") {
+            let log = d.log_text();
+            assert!(log.contains("file ops engine: Uring"), "{what}\n{log}");
+            assert!(!log.contains("failed ("), "{what}\n{log}");
+        }
         drop(c);
         assert!(d.alive()?, "{what}: the daemon died\n{}", d.log_text());
         Ok(())

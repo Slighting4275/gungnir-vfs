@@ -16,11 +16,14 @@ use std::{
     ffi::{CStr, CString},
     io, mem,
     os::fd::{FromRawFd, OwnedFd, RawFd},
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use io_uring::{IoUring, Probe, opcode, types};
+use io_uring::{IoUring, Probe, opcode, register::Restriction, types};
 
 /// Which engine runs the steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +319,69 @@ const NEEDED: [u8; 10] = [
     opcode::AsyncCancel::CODE,
 ];
 
+/// Opcodes a ring accepts: [`NEEDED`] plus `TIMEOUT` (tests). Every ring is created
+/// disabled, restricted to these, then enabled, so a sandboxed daemon's rings cannot be
+/// driven to do anything else (D-044 item 1).
+const ALLOWED: [u8; 11] = [
+    opcode::Nop::CODE,
+    opcode::OpenAt::CODE,
+    opcode::Statx::CODE,
+    opcode::Read::CODE,
+    opcode::Write::CODE,
+    opcode::Fsync::CODE,
+    opcode::UnlinkAt::CODE,
+    opcode::RenameAt::CODE,
+    opcode::MkDirAt::CODE,
+    opcode::AsyncCancel::CODE,
+    opcode::Timeout::CODE,
+];
+
+/// A ring that accepts only [`ALLOWED`] opcodes, no SQE flags and no registrations:
+/// created with `IORING_SETUP_R_DISABLED`, restricted, then enabled.
+///
+/// # Errors
+/// The kernel cannot create, restrict or enable it (restrictions need Linux 5.10).
+pub fn restricted_ring() -> io::Result<IoUring> {
+    let ring = IoUring::builder().setup_r_disabled().build(RING_ENTRIES)?;
+    let mut res: Vec<Restriction> = ALLOWED.iter().map(|&op| Restriction::sqe_op(op)).collect();
+    res.push(Restriction::sqe_flags_allowed(0));
+    ring.submitter().register_restrictions(&mut res)?;
+    ring.submitter().register_enable_rings()?;
+    Ok(ring)
+}
+
+/// Rings created before the seccomp filter is installed, for workers started after it
+/// (the filter refuses `io_uring_setup`). Once [`prepare_sandbox_rings`] has run, rings
+/// come only from here; when it is empty, new workers use plain syscalls.
+static POOL: Mutex<Vec<IoUring>> = Mutex::new(Vec::new());
+static POOL_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Create `n` restricted rings for workers started after the sandbox is installed, and
+/// make the pool the only ring source from now on.
+///
+/// # Errors
+/// A ring could not be created; the pool is left empty and ring creation unchanged.
+pub fn prepare_sandbox_rings(n: usize) -> io::Result<()> {
+    let mut rings = Vec::with_capacity(n);
+    for _ in 0..n {
+        rings.push(restricted_ring()?);
+    }
+    *POOL.lock().unwrap_or_else(PoisonError::into_inner) = rings;
+    POOL_ONLY.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+fn new_ring() -> io::Result<IoUring> {
+    if POOL_ONLY.load(Ordering::SeqCst) {
+        return POOL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .ok_or_else(|| io::Error::other("no pre-created io_uring ring left (sandboxed)"));
+    }
+    restricted_ring()
+}
+
 /// Abandoned engines still waiting for the kernel to complete their request.
 static GRAVEYARD: Mutex<Vec<(IoUring, Box<Owned>)>> = Mutex::new(Vec::new());
 /// Most abandoned rings kept waiting; beyond, new workers use plain syscalls (a mount
@@ -347,7 +413,8 @@ pub struct UringIo {
 /// Check that io_uring is usable here: the ring can be created (not `ENOSYS` from an
 /// old kernel or seccomp, not `EPERM` from `io_uring_disabled` or a container policy),
 /// every opcode the engine uses is supported, and a NOP completes within 1 s (some
-/// sandboxes allow `io_uring_setup` but not `io_uring_enter`).
+/// sandboxes allow `io_uring_setup` but not `io_uring_enter`), on a restricted ring
+/// like the ones the engine uses.
 ///
 /// # Errors
 /// Why it is not usable.
@@ -361,7 +428,8 @@ pub fn probe() -> io::Result<()> {
             format!("io_uring opcode {op} not supported"),
         ));
     }
-    let mut ring = ring;
+    drop(ring);
+    let mut ring = restricted_ring()?;
     let nop = opcode::Nop::new().build().user_data(USER_OP);
     // SAFETY: a NOP references no memory.
     unsafe { ring.submission().push(&nop) }.map_err(|_| io::Error::other("sq full"))?;
@@ -426,7 +494,7 @@ impl UringIo {
             ));
         }
         Ok(Self {
-            ring: Some(IoUring::new(RING_ENTRIES)?),
+            ring: Some(new_ring()?),
             owned: Some(Box::new(Owned {
                 buf: vec![0u8; buf_size.max(4096)],
                 st: zero_statx(),
@@ -718,6 +786,39 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A restricted ring runs an allowed opcode, refuses any other with `EACCES` and
+    /// refuses registrations (D-044 item 1).
+    #[test]
+    fn a_restricted_ring_refuses_opcodes_outside_the_allowlist() -> io::Result<()> {
+        if !uring_for_tests_env("io_uring test") {
+            return Ok(());
+        }
+        let mut ring = restricted_ring()?;
+        let run = |ring: &mut IoUring, e: io_uring::squeue::Entry| -> io::Result<i32> {
+            // SAFETY: neither entry references memory.
+            unsafe { ring.submission().push(&e) }.map_err(|_| io::Error::other("sq full"))?;
+            ring.submit_and_wait(1)?;
+            ring.completion()
+                .next()
+                .map(|c| c.result())
+                .ok_or_else(|| io::Error::other("no completion"))
+        };
+        assert_eq!(run(&mut ring, opcode::Nop::new().build())?, 0);
+        // ACCEPT on fd -1 would fail with EBADF if it were allowed.
+        let accept = opcode::Accept::new(types::Fd(-1), std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(run(&mut ring, accept.build())?, -libc::EACCES);
+        let close = opcode::Close::new(types::Fd(-1));
+        assert_eq!(run(&mut ring, close.build())?, -libc::EACCES);
+        let nop_linked = opcode::Nop::new()
+            .build()
+            .flags(io_uring::squeue::Flags::IO_LINK);
+        assert_eq!(run(&mut ring, nop_linked)?, -libc::EACCES);
+        let mut p = Probe::new();
+        let err = ring.submitter().register_probe(&mut p).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+        Ok(())
     }
 
     /// Closing a ring interrupts the closing thread once, a little later, without a

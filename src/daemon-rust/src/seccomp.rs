@@ -27,6 +27,17 @@ const BPF_RET: u16 = 0x06;
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 
+/// What the filter does with one system call. Calls without a rule get the mode's
+/// default deny (`EPERM` in filter mode, kill in strict mode); the explicit denials below
+/// return their errno in both modes, so the code that makes them sees a defined error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rule {
+    /// Allowed.
+    Allow,
+    /// Always refused with this errno.
+    Errno(i32),
+}
+
 /// Sandboxing mode for `gungnird`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeccompMode {
@@ -77,11 +88,11 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-/// Retrieve the sorted, deduplicated set of authorized system call numbers
-/// for the current architecture.
+/// The rules for the current architecture: the allowed calls (sorted, deduplicated) and
+/// the explicitly refused ones.
 #[cfg(target_arch = "x86_64")]
-fn authorized_syscalls() -> Vec<u32> {
-    let mut list = vec![
+fn rules() -> Vec<(u32, Rule)> {
+    let allowed = [
         // Process & Thread lifecycle
         libc::SYS_read as u32,
         libc::SYS_write as u32,
@@ -235,9 +246,9 @@ fn authorized_syscalls() -> Vec<u32> {
         libc::SYS_preadv2 as u32,
         libc::SYS_pwritev2 as u32,
         libc::SYS_statx as u32,
-        libc::SYS_io_uring_setup as u32,
+        // Rings are created, restricted and enabled before the filter is installed
+        // (ops::io::prepare_sandbox_rings); afterwards only io_uring_enter (D-044).
         libc::SYS_io_uring_enter as u32,
-        libc::SYS_io_uring_register as u32,
         libc::SYS_openat2 as u32,
         libc::SYS_clone3 as u32,
         libc::SYS_close_range as u32,
@@ -257,14 +268,31 @@ fn authorized_syscalls() -> Vec<u32> {
         libc::SYS_setxattr as u32,
         libc::SYS_removexattr as u32,
     ];
-    list.sort_unstable();
-    list.dedup();
+    let denied = [
+        // No new rings, no ring registrations once sandboxed (D-044 item 1).
+        (libc::SYS_io_uring_setup as u32, libc::EPERM),
+        (libc::SYS_io_uring_register as u32, libc::EPERM),
+    ];
+    let mut list: Vec<(u32, Rule)> = allowed.iter().map(|&n| (n, Rule::Allow)).collect();
+    list.extend(denied.iter().map(|&(n, e)| (n, Rule::Errno(e))));
+    list.sort_by_key(|&(n, _)| n);
+    list.dedup_by_key(|&mut (n, _)| n);
     list
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn authorized_syscalls() -> Vec<u32> {
+fn rules() -> Vec<(u32, Rule)> {
     Vec::new()
+}
+
+/// BPF for one rule, run with the syscall number in A; ends in a return.
+fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
+    let errno = |e: i32| bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ERRNO | (e as u32));
+    let allow = bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW);
+    match *rule {
+        Rule::Allow => vec![allow],
+        Rule::Errno(e) => vec![errno(e)],
+    }
 }
 
 /// Build the BPF bytecode filter for the current platform and mode.
@@ -280,20 +308,13 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let target_arch = 0;
 
-    let syscalls = authorized_syscalls();
-    if syscalls.is_empty() {
+    let rules = rules();
+    if rules.is_empty() {
         // Architecture not explicitly enumerated; allow all safely
         return Ok(vec![bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW)]);
     }
 
-    if syscalls.len() > 250 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "too many syscalls for single-byte BPF jump table",
-        ));
-    }
-
-    let mut filter = Vec::with_capacity(syscalls.len() + 6);
+    let mut filter = Vec::with_capacity(rules.len() * 3 + 6);
 
     // 0: Load architecture
     filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
@@ -304,13 +325,17 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
         BPF_RET | BPF_K,
         libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32),
     ));
-    // 3: Load syscall number
-    filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
 
-    let n = syscalls.len();
-    for (i, &sc) in syscalls.iter().enumerate() {
-        let jt = (n - i) as u8;
-        filter.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, sc, jt, 0));
+    // Each rule: load the syscall number (an argument check may have replaced it in A),
+    // skip the rule's block unless it matches, else run the block (which returns).
+    for (nr, rule) in &rules {
+        let block = rule_block(rule);
+        let skip = u8::try_from(block.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seccomp rule block too long")
+        })?;
+        filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+        filter.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, *nr, 0, skip));
+        filter.extend(block);
     }
 
     // Default disallowed action:
@@ -319,9 +344,12 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
         _ => libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
     };
     filter.push(bpf_stmt(BPF_RET | BPF_K, deny_ret));
-
-    // Allowed action:
-    filter.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
+    if filter.len() > usize::from(u16::MAX).min(4096) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp filter longer than BPF_MAXINSNS",
+        ));
+    }
 
     Ok(filter)
 }
@@ -398,17 +426,44 @@ mod tests {
 
     #[test]
     fn filter_compiles_and_jump_offsets_fit() {
-        let f = build_filter(SeccompMode::Filter).unwrap();
-        assert!(!f.is_empty());
-        assert!(f.len() < 300);
-        // Verify last two instructions are DENY then ALLOW
-        let last_idx = f.len() - 1;
-        assert_eq!(f[last_idx].code, BPF_RET | BPF_K);
-        assert_eq!(f[last_idx].k, libc::SECCOMP_RET_ALLOW);
-        assert_eq!(f[last_idx - 1].code, BPF_RET | BPF_K);
+        for (mode, deny) in [
+            (
+                SeccompMode::Filter,
+                libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+            ),
+            (SeccompMode::Strict, libc::SECCOMP_RET_KILL_PROCESS),
+        ] {
+            let f = build_filter(mode).unwrap();
+            assert!(f.len() > 50 && f.len() <= 4096, "{} instructions", f.len());
+            // The last instruction is the default deny.
+            let last = f[f.len() - 1];
+            assert_eq!((last.code, last.k), (BPF_RET | BPF_K, deny));
+            // Every jump lands inside the program.
+            for (i, ins) in f.iter().enumerate() {
+                if ins.code & 0x07 == BPF_JMP {
+                    let far = i + 1 + usize::from(ins.jt.max(ins.jf));
+                    assert!(far < f.len(), "jump at {i} leaves the program");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn io_uring_setup_and_register_are_refused_enter_allowed() {
+        let r = rules();
+        let get = |n: libc::c_long| {
+            r.iter()
+                .find(|(x, _)| *x == n as u32)
+                .map(|(_, r)| r.clone())
+        };
         assert_eq!(
-            f[last_idx - 1].k,
-            libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32)
+            get(libc::SYS_io_uring_setup),
+            Some(Rule::Errno(libc::EPERM))
         );
+        assert_eq!(
+            get(libc::SYS_io_uring_register),
+            Some(Rule::Errno(libc::EPERM))
+        );
+        assert_eq!(get(libc::SYS_io_uring_enter), Some(Rule::Allow));
     }
 }

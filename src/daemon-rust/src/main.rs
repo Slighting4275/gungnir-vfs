@@ -229,6 +229,14 @@ fn run() -> Result<()> {
         .or_else(seccomp_from_env)
         .unwrap_or(SeccompMode::Disabled);
     if seccomp_mode != SeccompMode::Disabled {
+        // The filter refuses io_uring_setup: workers started later (replacing a stuck
+        // one) take a ring created and restricted now, or use plain syscalls.
+        if engine == ops::io::EngineKind::Uring {
+            let n = OpsConfig::from_env().workers.max(1) + ops::io::GRAVEYARD_MAX;
+            if let Err(e) = ops::io::prepare_sandbox_rings(n) {
+                eprintln!("gungnird: io_uring rings for later workers failed ({e}): syscalls");
+            }
+        }
         eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
         seccomp::apply_sandbox(seccomp_mode)?;
     }
