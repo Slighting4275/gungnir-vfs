@@ -2,13 +2,13 @@
 
 > Odin's spear never hesitates, never stops mid-flight, and never misses.
 
-Gungnir is a high-performance replacement for GVfs, the GNOME virtual filesystem layer. It is engineered from the ground up as a non-blocking I/O pipeline: no filesystem call or UI application thread ever blocks or hangs on a broken mount, stalled network share, or metadata lock.
+Gungnir is a high-performance replacement for GVfs, the GNOME virtual filesystem layer. It is designed as a non-blocking I/O pipeline. The design goal is that no filesystem call or UI application thread blocks or hangs on a broken mount, stalled network share, or metadata lock; that goal is not yet met in every case (G-N, BC-PR-F005 are open).
 
 ---
 
 ## Architecture & Milestones
 
-Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem operations:
+Gungnir's 12-milestone architecture aims at stall-free virtual filesystem operations (a design goal; see the open issues below):
 
 | Milestone | Subsystem | Status | Highlights |
 | :--- | :--- | :--- | :--- |
@@ -19,10 +19,10 @@ Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem opera
 | **M5** | Metadata Service over IPC | **Complete** | SQLite in WAL mode (`metadata.db`), btime staleness checks, single-thread DB worker queue. |
 | **M6** | GIO `metadata::` Attributes | **Complete** | Dynamic `GVfsClass` hooks, `local_file_moved` and `local_file_removed` tracking, live `gio set` / `gio info`. |
 | **M7** | Hang-Proof Mount Health Monitor | **Complete** | Sacrificial probe threads, automatic detection of hung/gone network and FUSE mounts, fail-fast refusal (`SuspectMount`). |
-| **M8** | Asynchronous File Operations Engine | **Complete** | Native kernel `io_uring` with POSIX fallback, reflink (`FICLONE`), sparse copying (`copy_file_range`), atomic rename, progress events & cancellation. |
+| **M8** | Asynchronous File Operations Engine | **Implemented; known open issues (INT-HIGH-001, C1, PR-F008)** | Native kernel `io_uring` with POSIX fallback, reflink (`FICLONE`), sparse copying (`copy_file_range`), atomic rename, progress events & cancellation. |
 | **M9** | Trash & Recent Items Engine | **Not on main (T-005 port pending)** | `trash://` and `recent://` are not implemented on this branch. |
 | **M10** | Volume & Mount Monitor | **Experimental, opt-in; no mount change signals yet (F01b)** | `GVolumeMonitor`, `GVolume`, `GMount` from a non-blocking mountinfo parser, active only with `GIO_USE_VOLUME_MONITOR=gungnir`; mounts and volumes are listed, but no mount-added/removed signals are emitted yet. |
-| **M11** | Daemon Lifecycle Management | **Complete** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
+| **M11** | Daemon Lifecycle Management | **Partial: shutdown is not yet graceful for in-flight ops (AUD-03, BC-HC-F06 open)** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` shutdown, which does not yet wait for or clean up in-flight file ops, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
 | **M12** | Hardening & System Release | **In review (HC-001: seccomp hardening D-044, unit hardening AUD-01)** | Zero-dependency Linux seccomp BPF filter sandbox (`--seccomp`), systemd user units (`gungnird.service` / `gungnird.socket`; their sandboxing is under review, AUD-01), Arch Linux `PKGBUILD` packaging, wire and metadata-wire fuzz tests. The 50,000-event stress benchmark is a perf job outside the default test suite; its throughput, p99 and RSS figures are not reproduced (tracked in T-010). |
 
 ---
@@ -48,7 +48,17 @@ Gungnir's 12-milestone architecture delivers zero-stall virtual filesystem opera
 
 ## Requirements
 
-- Linux kernel 5.8+ (6.8+ recommended for native `FS_IOC_GETFSUUID`)
+Supported configurations (D-025):
+
+| Dimension | Supported |
+| :--- | :--- |
+| Linux kernel | **5.8 or newer required.** 5.8 to 6.9 (no `STATX_SUBVOL` / `FS_IOC_GETFSUUID`) is **experimental**: its fallbacks are not tested on a real old kernel. |
+| GLib / GIO | **2.84 or newer** |
+| Architecture | **x86_64 only** |
+| Client and daemon | **Same revision only.** There is no capability negotiation yet. |
+
+Build requirements:
+
 - Zig master (nightly)
 - Rust stable (edition 2024)
 - GLib/GIO development packages and `pkg-config`
