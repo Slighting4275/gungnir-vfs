@@ -43,6 +43,9 @@ const CLONE_NEW_ANY: u32 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNET) as u32;
 
+/// `MFD_EXEC` (Linux 6.3): an executable memfd.
+const MFD_EXEC: u32 = 0x0010;
+
 /// What the filter does with one system call. Calls without a rule get the mode's
 /// default deny (`EPERM` in filter mode, kill in strict mode); the explicit denials below
 /// return their errno in both modes, so the code that makes them sees a defined error.
@@ -126,8 +129,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_newfstatat as u32,
         libc::SYS_poll as u32,
         libc::SYS_lseek as u32,
-        libc::SYS_mmap as u32,
-        libc::SYS_mprotect as u32,
         libc::SYS_munmap as u32,
         libc::SYS_brk as u32,
         libc::SYS_rt_sigaction as u32,
@@ -255,7 +256,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_sendmmsg as u32,
         libc::SYS_recvmmsg as u32,
         libc::SYS_getrandom as u32,
-        libc::SYS_memfd_create as u32,
         libc::SYS_seccomp as u32,
         libc::SYS_renameat2 as u32,
         libc::SYS_copy_file_range as u32,
@@ -314,6 +314,32 @@ fn rules() -> Vec<(u32, Rule)> {
             Rule::ArgMaskClear {
                 arg: 0,
                 mask: CLONE_NEW_ANY,
+                errno: libc::EPERM,
+            },
+        ),
+        // No executable memory once sandboxed: everything that needs it (the binary,
+        // its libraries) is mapped by then (D-044 item 5).
+        (
+            libc::SYS_mmap as u32,
+            Rule::ArgMaskClear {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+                errno: libc::EPERM,
+            },
+        ),
+        (
+            libc::SYS_mprotect as u32,
+            Rule::ArgMaskClear {
+                arg: 2,
+                mask: libc::PROT_EXEC as u32,
+                errno: libc::EPERM,
+            },
+        ),
+        (
+            libc::SYS_memfd_create as u32,
+            Rule::ArgMaskClear {
+                arg: 1,
+                mask: MFD_EXEC,
                 errno: libc::EPERM,
             },
         ),
@@ -577,6 +603,36 @@ mod tests {
             })
         );
         assert_eq!(CLONE_NEW_ANY & libc::CSIGNAL as u32, 0);
+    }
+
+    #[test]
+    fn no_executable_memory() {
+        let r = rules();
+        let get = |n: libc::c_long| {
+            r.iter()
+                .find(|(x, _)| *x == n as u32)
+                .map(|(_, r)| r.clone())
+        };
+        let prot = |arg| Rule::ArgMaskClear {
+            arg,
+            mask: libc::PROT_EXEC as u32,
+            errno: libc::EPERM,
+        };
+        assert_eq!(get(libc::SYS_mmap), Some(prot(2)));
+        assert_eq!(get(libc::SYS_mprotect), Some(prot(2)));
+        assert_eq!(
+            get(libc::SYS_memfd_create),
+            Some(Rule::ArgMaskClear {
+                arg: 1,
+                mask: MFD_EXEC,
+                errno: libc::EPERM
+            })
+        );
+        assert_eq!(
+            get(libc::SYS_pkey_mprotect),
+            None,
+            "pkey_mprotect stays denied"
+        );
     }
 
     #[test]

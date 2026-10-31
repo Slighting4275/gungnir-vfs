@@ -273,6 +273,65 @@ fn sandboxed_clone_refuses_namespaces_and_clone3_is_enosys() {
     }
 }
 
+/// Once sandboxed, in both modes: no PROT_EXEC mapping or protection change and no
+/// MFD_EXEC memfd (EPERM); plain read/write mappings and sealable memfds still work.
+/// D-044 item 5.
+#[test]
+fn sandboxed_executable_memory_is_refused() {
+    fn body() -> i32 {
+        let anon = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: anonymous mappings at a kernel-chosen address.
+        let p = unsafe { libc::syscall(libc::SYS_mmap, 0, 4096, rw, anon, -1, 0) };
+        if p == -1 {
+            return 1;
+        }
+        for (i, prot) in [
+            libc::PROT_EXEC,
+            libc::PROT_READ | libc::PROT_EXEC,
+            rw | libc::PROT_EXEC,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // SAFETY: as above.
+            let r = unsafe { libc::syscall(libc::SYS_mmap, 0, 4096, prot, anon, -1, 0) };
+            if errno_of(r) != Some(libc::EPERM) {
+                return 10 + i as i32;
+            }
+            // SAFETY: p is our own mapping of 4096 bytes.
+            let r = unsafe { libc::syscall(libc::SYS_mprotect, p, 4096, prot) };
+            if errno_of(r) != Some(libc::EPERM) {
+                return 20 + i as i32;
+            }
+        }
+        // SAFETY: as above.
+        if unsafe { libc::syscall(libc::SYS_mprotect, p, 4096, libc::PROT_READ) } != 0 {
+            return 2;
+        }
+        // SAFETY: a NUL-terminated name; flags only.
+        let r = unsafe { libc::syscall(libc::SYS_memfd_create, c"x".as_ptr(), 0x0010) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 3;
+        }
+        // SAFETY: as above.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"x".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if r < 0 {
+            return 4;
+        }
+        0
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {
