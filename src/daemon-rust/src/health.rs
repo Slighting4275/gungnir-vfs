@@ -1179,6 +1179,14 @@ impl Handler for HealthHandler {
     fn is_busy(&self) -> bool {
         self.inner.is_busy()
     }
+
+    fn begin_drain(&self) {
+        self.inner.begin_drain();
+    }
+
+    fn cancel_all(&self) -> usize {
+        self.inner.cancel_all()
+    }
 }
 
 struct HealthSession {

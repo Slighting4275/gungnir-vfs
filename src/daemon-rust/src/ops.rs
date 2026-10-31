@@ -673,6 +673,8 @@ struct State {
     threads: usize,
     stuck: usize,
     shutdown: bool,
+    /// Set by [`Ops::begin_drain`]: new submissions are refused (BC-A2-F03a).
+    draining: bool,
 }
 
 struct Shared {
@@ -690,6 +692,11 @@ struct Shared {
     /// (BC-A2-F01: a sandboxed daemon checks that every first worker did).
     io_made: AtomicUsize,
     io_uring: AtomicUsize,
+    /// Where copies and moves record that they may leave temp files, until they end
+    /// (see [`sweep_temp_ledger`]); none in tests.
+    /// The file, and how many recorded ops have not ended: at 0 it is emptied, so it
+    /// stays small in a long-running daemon.
+    ledger: Mutex<Option<(std::fs::File, usize)>>,
 }
 
 /// The file-operation service: queue, workers and watchdog.
@@ -720,6 +727,7 @@ impl Ops {
                 threads: 0,
                 stuck: 0,
                 shutdown: false,
+                draining: false,
             }),
             work: Condvar::new(),
             watch: Condvar::new(),
@@ -728,6 +736,7 @@ impl Ops {
             uring_failed: AtomicBool::new(false),
             io_made: AtomicUsize::new(0),
             io_uring: AtomicUsize::new(0),
+            ledger: Mutex::new(None),
         });
         for _ in 0..workers {
             spawn_worker(&sh)?;
@@ -821,7 +830,7 @@ impl Ops {
             emit_every: cfg.progress_every,
         });
         let mut s = lock(&self.sh.state);
-        if s.shutdown || s.queue.len() >= cfg.queue.max(1) {
+        if s.shutdown || s.draining || s.queue.len() >= cfg.queue.max(1) {
             return Err(OpError::Busy);
         }
         s.queue.push_back(Arc::clone(&ctl));
@@ -836,6 +845,37 @@ impl Ops {
     pub fn cancel(&self, ctl: &OpCtl) {
         ctl.request_stop(STOP_CANCEL);
         self.sh.watch.notify_one();
+    }
+
+    /// Refuse every new op from now on with [`OpError::Busy`] (the drain before an exit,
+    /// BC-A2-F03a). Ops already queued or running are not touched.
+    pub fn begin_drain(&self) {
+        lock(&self.sh.state).draining = true;
+    }
+
+    /// Cancel every queued and running op (BC-A2-F03b/c): each finishes with
+    /// [`OpError::Cancelled`] (its done event), and a running copy removes its temp file
+    /// as on any failure. Returns how many ops were asked to stop.
+    pub fn cancel_all(&self) -> usize {
+        let s = lock(&self.sh.state);
+        let mut n = 0;
+        for ctl in s.queue.iter().chain(s.running.iter()) {
+            if !ctl.is_finished() {
+                ctl.request_stop(STOP_CANCEL);
+                n += 1;
+            }
+        }
+        drop(s);
+        self.sh.watch.notify_all();
+        self.sh.work.notify_all();
+        n
+    }
+
+    /// Record copies and moves in `file` (append-only, see [`sweep_temp_ledger`]) from
+    /// now on, so that a daemon that exits with one still running (killed, or a stuck
+    /// worker abandoned at a drain) has its temp files removed by the next start.
+    pub fn set_temp_ledger(&self, file: std::fs::File) {
+        *lock(&self.sh.ledger) = Some((file, 0));
     }
 }
 
@@ -878,6 +918,35 @@ impl Shared {
         s.push((m, until));
     }
 
+    /// Record in the temp ledger that op `id` may leave temp files near `dest`; whether
+    /// it was recorded.
+    fn ledger_begin(&self, id: u64, dest: &[u8]) -> bool {
+        use std::io::Write;
+        let mut g = lock(&self.ledger);
+        let Some((f, open)) = g.as_mut() else {
+            return false;
+        };
+        // One write per line on an O_APPEND file: lines never interleave.
+        let ok = f.write_all(&ledger_start(id, dest)).is_ok();
+        if ok {
+            *open += 1;
+        }
+        ok
+    }
+
+    /// Record that op `id` (recorded by [`Self::ledger_begin`]) left no temp file.
+    fn ledger_end(&self, id: u64) {
+        use std::io::Write;
+        if let Some((f, open)) = lock(&self.ledger).as_mut() {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                let _ = f.set_len(0);
+            } else {
+                let _ = f.write_all(&ledger_end(id));
+            }
+        }
+    }
+
     fn make_io(&self) -> Box<dyn Io> {
         let io = self.make_io_inner();
         self.io_made.fetch_add(1, Ordering::SeqCst);
@@ -908,6 +977,128 @@ fn under(path: &[u8], mount: &[u8]) -> bool {
         return true;
     }
     path.starts_with(mount) && matches!(path.get(mount.len()), None | Some(&b'/'))
+}
+
+// ---------------------------------------------------------------------------------------
+// Temp ledger (BC-A2-F03b, BC-HC-F06)
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+fn ledger_start(id: u64, dest: &[u8]) -> Vec<u8> {
+    format!("S {id:016x} {}\n", hex(dest)).into_bytes()
+}
+
+fn ledger_end(id: u64) -> Vec<u8> {
+    format!("E {id:016x}\n").into_bytes()
+}
+
+/// Most directory entries the sweep looks at below one destination.
+const SWEEP_MAX_ENTRIES: usize = 100_000;
+
+/// Remove the temp files of copies and moves a previous daemon left unfinished, then
+/// empty the ledger. Runs at startup, before any op. For every op the ledger shows
+/// started and not ended, every `.gungnir-<its id>-*.tmp` next to its destination and,
+/// if the destination is a directory (a partial tree copy), below it (no symlink
+/// followed, same filesystem, at most [`SWEEP_MAX_ENTRIES`] entries) is unlinked.
+/// Returns how many files were removed.
+///
+/// # Errors
+/// The ledger cannot be read or emptied.
+pub fn sweep_temp_ledger(ledger: &std::path::Path) -> std::io::Result<usize> {
+    use std::{
+        collections::BTreeMap,
+        ffi::OsStr,
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+        path::Path,
+    };
+    let text = match std::fs::read(ledger) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut open: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&text).lines() {
+        let mut f = line.split(' ');
+        match (f.next(), f.next(), f.next()) {
+            (Some("S"), Some(id), Some(d)) if id.len() == 16 => {
+                if let Some(d) = unhex(d) {
+                    open.insert(id.to_owned(), d);
+                }
+            }
+            (Some("E"), Some(id), None) => {
+                open.remove(id);
+            }
+            _ => {}
+        }
+    }
+    let mut removed = 0usize;
+    for (id, dest) in &open {
+        let prefix = format!(".gungnir-{id}-");
+        let ours = |n: &OsStr| {
+            let n = n.as_bytes();
+            n.starts_with(prefix.as_bytes()) && n.ends_with(b".tmp")
+        };
+        let dest = Path::new(OsStr::from_bytes(dest));
+        if !dest.is_absolute() {
+            continue;
+        }
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(p) = dest.parent() {
+            dirs.push(p.to_owned());
+        }
+        let top = std::fs::symlink_metadata(dest).ok();
+        let dev = top.as_ref().map(MetadataExt::dev);
+        let mut below = top
+            .is_some_and(|m| m.is_dir())
+            .then(|| vec![dest.to_owned()]);
+        let mut seen = 0usize;
+        let mut sweep_dir = |dir: &Path, walk: &mut Option<Vec<std::path::PathBuf>>| {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                seen += 1;
+                if seen > SWEEP_MAX_ENTRIES {
+                    return;
+                }
+                let name = e.file_name();
+                let Ok(md) = e.metadata() else { continue };
+                if ours(&name) && !md.is_dir() {
+                    if std::fs::remove_file(e.path()).is_ok() {
+                        removed += 1;
+                    }
+                } else if md.is_dir()
+                    && Some(md.dev()) == dev
+                    && let Some(w) = walk.as_mut()
+                {
+                    w.push(e.path());
+                }
+            }
+        };
+        for d in &dirs {
+            sweep_dir(d, &mut None);
+        }
+        while let Some(d) = below.as_mut().and_then(Vec::pop) {
+            sweep_dir(&d, &mut below);
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(ledger)?
+        .set_len(0)?;
+    Ok(removed)
 }
 
 fn spawn_worker(sh: &Arc<Shared>) -> std::io::Result<()> {
@@ -944,7 +1135,14 @@ fn worker(sh: &Arc<Shared>) {
                 io = sh.make_io();
             }
             op.touch();
+            let ledgered = matches!(op.req.kind, OpKind::Copy | OpKind::Move)
+                && sh.ledger_begin(op.id, &op.req.dest);
             let r = run_op(sh, &mut *io, &op);
+            // Its temp files are gone (renamed or removed) by the time run_op returns:
+            // recorded before the client hears the op is done.
+            if ledgered {
+                sh.ledger_end(op.id);
+            }
             if r.is_ok() {
                 op.maybe_emit(true);
             }

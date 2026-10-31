@@ -542,6 +542,14 @@ pub trait Handler: Send + Sync + 'static {
     fn is_busy(&self) -> bool {
         false
     }
+
+    /// Refuse new background work from now on (the drain before an exit, BC-A2-F03a).
+    fn begin_drain(&self) {}
+
+    /// Cancel all background work; how many operations were asked to stop (BC-A2-F03b).
+    fn cancel_all(&self) -> usize {
+        0
+    }
 }
 
 /// Answers every request with [`crate::md::ST_UNSUPPORTED`] (pings still work).
@@ -994,6 +1002,50 @@ pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
         err.kind(),
         format!("execve {}: {err}", exe.display()),
     )))
+}
+
+/// A signalfd for `SIGINT` and `SIGTERM` (blocked process-wide by
+/// [`block_lifecycle_signals`]), so a drain can be ended by a stop request (BC-A2-F03c).
+///
+/// # Errors
+/// The signalfd cannot be created.
+pub fn stop_signal_fd() -> io::Result<OwnedFd> {
+    // SAFETY: signal set initialization; signalfd returns a new fd or -1.
+    unsafe {
+        let mut mask: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        let fd = libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Wait up to `ms` for a signal on `fd` (from [`stop_signal_fd`]); its number, if one came.
+#[must_use]
+pub fn wait_stop_signal(fd: &OwnedFd, ms: i32) -> Option<i32> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    if unsafe { libc::poll(&raw mut p, 1, ms) } <= 0 {
+        return None;
+    }
+    // SAFETY: read into a siginfo of exactly its size.
+    let mut si: libc::signalfd_siginfo = unsafe { mem::zeroed() };
+    let n = unsafe {
+        libc::read(
+            fd.as_raw_fd(),
+            (&raw mut si).cast(),
+            mem::size_of::<libc::signalfd_siginfo>(),
+        )
+    };
+    (n as usize == mem::size_of::<libc::signalfd_siginfo>()).then_some(si.ssi_signo as i32)
 }
 
 /// Block lifecycle signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`) on the calling thread

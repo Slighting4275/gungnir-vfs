@@ -196,6 +196,15 @@ impl Handler for OpsHandler {
     fn is_busy(&self) -> bool {
         self.ops.is_busy() || self.inner.is_busy()
     }
+
+    fn begin_drain(&self) {
+        self.ops.begin_drain();
+        self.inner.begin_drain();
+    }
+
+    fn cancel_all(&self) -> usize {
+        self.ops.cancel_all() + self.inner.cancel_all()
+    }
 }
 
 struct OpsSession {

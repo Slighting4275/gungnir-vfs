@@ -1,4 +1,7 @@
-use std::{env, ffi::OsString, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    env, ffi::OsString, os::unix::fs::OpenOptionsExt, path::PathBuf, process::ExitCode, sync::Arc,
+    time::Duration,
+};
 
 use gungnird::{
     Error, Result,
@@ -233,12 +236,29 @@ fn run() -> Result<()> {
         }
     }
     eprintln!("gungnird: file ops engine: {engine:?} ({why})");
+    // Temp files of copies and moves a previous run left unfinished (killed, or a stuck
+    // op abandoned at a drain): removed before any new op (BC-A2-F03b, BC-HC-F06).
+    let ledger_path = db_path.with_file_name("ops-pending");
+    match ops::sweep_temp_ledger(&ledger_path) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("gungnird: removed {n} temp file(s) left by unfinished file ops"),
+        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
+    }
     let ops = Arc::new(Ops::start(
         ops_cfg,
         engine,
         Arc::new(MonitorGate::new(Arc::clone(&monitor))),
         Arc::new(DbMeta::new(Arc::clone(&resolver), db.clone())),
     )?);
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&ledger_path)
+    {
+        Ok(f) => ops.set_temp_ledger(f),
+        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
+    }
     if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
         // Every first worker has its ring before the filter goes in; a worker on plain
         // syscalls under a uring engine would be a silent fallback: refuse to start.
@@ -302,17 +322,15 @@ fn run() -> Result<()> {
                     "gungnird: signal {sig} received; live upgrade under seccomp: \
                      draining, then exiting for the service manager to start the new binary"
                 );
-                let t0 = std::time::Instant::now();
-                while handler.is_busy() && t0.elapsed() < UPGRADE_DRAIN_MAX {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if handler.is_busy() {
-                    eprintln!("gungnird: file ops still running after {UPGRADE_DRAIN_MAX:?}");
-                }
+                let cut = drain(handler.as_ref());
                 if let Err(e) = db.flush_and_checkpoint() {
                     eprintln!("gungnird: database checkpoint before upgrade exit failed: {e}");
                 }
                 listener.cleanup();
+                if let Some(why) = cut {
+                    // Not a clean upgrade exit: some ops were cancelled (BC-A2-F03b/c).
+                    return Err(Error::Io(std::io::Error::other(why)));
+                }
                 break;
             }
             ipc::ShutdownReason::LiveUpgrade(sig) => {
@@ -334,6 +352,68 @@ fn run() -> Result<()> {
 
 /// Longest a live upgrade under seccomp waits for running file ops before it exits.
 const UPGRADE_DRAIN_MAX: Duration = Duration::from_secs(30);
+/// How long cancelled ops get to remove their temp files and report before the exit.
+const CANCEL_WAIT: Duration = Duration::from_secs(2);
+
+/// The drain bound: [`UPGRADE_DRAIN_MAX`], or `GUNGNIR_TEST_DRAIN_MS` in a test-hooks
+/// build.
+fn drain_max() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = env::var("GUNGNIR_TEST_DRAIN_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        eprintln!("gungnird: TEST HOOK: drain bound {ms} ms");
+        return Duration::from_millis(ms);
+    }
+    UPGRADE_DRAIN_MAX
+}
+
+/// Drain before an upgrade exit (D-044 item 2, BC-A2-F03): new ops are refused at once
+/// (a); running ones get until the bound to finish (b), and a SIGTERM or SIGINT ends
+/// the wait early (c). Whatever still runs then is cancelled: each op removes its temp
+/// file and sends its Cancelled done event, within [`CANCEL_WAIT`]. Returns why the
+/// exit is not clean (ops cancelled, or still stuck after the cancel), or None.
+fn drain(handler: &dyn ipc::Handler) -> Option<String> {
+    handler.begin_drain();
+    let stop = ipc::stop_signal_fd()
+        .map_err(|e| eprintln!("gungnird: no stop signal during the drain: {e}"))
+        .ok();
+    let max = drain_max();
+    let t0 = std::time::Instant::now();
+    let mut stopped = None;
+    while handler.is_busy() && t0.elapsed() < max && stopped.is_none() {
+        match &stop {
+            Some(fd) => stopped = ipc::wait_stop_signal(fd, 20),
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    if !handler.is_busy() {
+        if stopped.is_some() {
+            eprintln!("gungnird: stop signal during the drain; nothing left running");
+        }
+        return None;
+    }
+    let why = match stopped {
+        Some(sig) => format!("signal {sig} during the drain"),
+        None => format!("file ops still running after {max:?}"),
+    };
+    let n = handler.cancel_all();
+    eprintln!("gungnird: {why}: cancelling {n} file op(s)");
+    let t1 = std::time::Instant::now();
+    while handler.is_busy() && t1.elapsed() < CANCEL_WAIT {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if handler.is_busy() {
+        eprintln!(
+            "gungnird: file ops still stuck {CANCEL_WAIT:?} after the cancel; \
+             their temp files go at the next start"
+        );
+        Some(format!("{why}: {n} file op(s) cancelled, some still stuck"))
+    } else {
+        Some(format!("{why}: {n} file op(s) cancelled"))
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
