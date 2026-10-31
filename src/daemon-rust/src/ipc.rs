@@ -1016,11 +1016,15 @@ pub fn block_lifecycle_signals() -> Result<()> {
     Ok(())
 }
 
-/// Decrements the active-client count when a client thread ends (or fails to start).
-struct ClientSlot(Arc<AtomicUsize>);
+/// Decrements the active-client count when a client thread ends (or fails to start),
+/// and stamps when the last one left so the idle timeout counts from that moment
+/// (BC-HC-F09).
+struct ClientSlot(Arc<AtomicUsize>, Arc<Mutex<Instant>>);
 
 impl Drop for ClientSlot {
     fn drop(&mut self) {
+        // Stamp before decrementing: the serve loop reads the count, then the stamp.
+        *self.1.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -1089,12 +1093,17 @@ pub fn serve_counting(
     };
 
     let mut last_active = Instant::now();
+    let last_left = Arc::new(Mutex::new(last_active));
 
     loop {
         let active_cnt = active.load(Ordering::Acquire);
         let busy = active_cnt > 0 || handler.is_busy();
         if busy {
             last_active = Instant::now();
+        } else {
+            // A client that left between two samples: idle starts when it left.
+            let left = *last_left.lock().unwrap_or_else(PoisonError::into_inner);
+            last_active = last_active.max(left);
         }
 
         let timeout_ms = match cfg.idle_timeout {
@@ -1181,7 +1190,7 @@ pub fn serve_counting(
                             drop(stream);
                             continue;
                         }
-                        let slot = ClientSlot(Arc::clone(&active));
+                        let slot = ClientSlot(Arc::clone(&active), Arc::clone(&last_left));
                         let handler = Arc::clone(handler);
                         let spawned = thread::Builder::new().name("gungnird-client".into()).spawn(
                             move || {

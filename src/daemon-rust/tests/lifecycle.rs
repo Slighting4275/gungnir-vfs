@@ -697,3 +697,35 @@ fn cli_idle_shutdown_subprocess() -> R {
 
     Ok(())
 }
+
+/// BC-HC-F09: the idle timeout must count from the moment the last client left, not from
+/// the serve loop's last 500 ms sample. A raw connection (no handshake) ends its client
+/// thread at once on close, which makes the early shutdown deterministic: the client stays
+/// longer than the timeout, so the old code's last sample is already past the timeout
+/// when it leaves, and it shut down at once.
+#[test]
+fn idle_timeout_counts_from_last_disconnect() -> R {
+    let dir = Dir::new("idle-last-left")?;
+    let sock_path = dir.0.join("idle2.sock");
+    let listener = ipc::bind(&sock_path)?;
+    let handler: Arc<dyn Handler> = Arc::new(NoService);
+    let srv = thread::spawn(move || {
+        let cfg = Config {
+            idle_timeout: Some(Duration::from_millis(300)),
+            ..Config::default()
+        };
+        ipc::serve(&listener.socket, cfg, &handler)
+    });
+    let raw = UnixStream::connect(&sock_path)?;
+    thread::sleep(Duration::from_millis(400));
+    drop(raw);
+    let t0 = Instant::now();
+    let reason = srv.join().expect("thread join").expect("serve result");
+    let elapsed = t0.elapsed();
+    assert_eq!(reason, ShutdownReason::IdleTimeout);
+    assert!(
+        elapsed >= Duration::from_millis(280),
+        "idle shutdown {elapsed:?} after the last client left (timeout 300 ms)"
+    );
+    Ok(())
+}
