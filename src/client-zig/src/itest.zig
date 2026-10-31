@@ -33,6 +33,7 @@ const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
 const health = @import("health.zig");
+const link = @import("link.zig");
 const linux = std.os.linux;
 
 /// The GIO calling thread must get its VFS and answer local file queries in this time,
@@ -910,6 +911,24 @@ fn runOnUiThread(r: *UiRun) ?[*:0]const u8 {
 
 const ui_files = 40;
 
+const no_metadata_msg: [*:0]const u8 = "the UI thread got no metadata from a healthy daemon";
+/// UI-thread runs of a stage that expects metadata. One reply slower than ui_budget_ms
+/// (scheduling on a loaded machine) is a timeout by design, and the quiet period after
+/// it hides metadata from the UI thread for ui_quiet_ms: retry the stage after that
+/// period rather than fail; a daemon that never answers in time still fails.
+const ui_metadata_attempts = 3;
+
+fn runOnUiThreadWantingMetadata(ctx: *Ctx, out: *UiRun) ?[*:0]const u8 {
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        out.* = .{ .ctx = ctx, .loop = null, .want_metadata = true };
+        const what = runOnUiThread(out) orelse return null;
+        if (what != no_metadata_msg or attempt == ui_metadata_attempts) return what;
+        c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, no metadata on attempt %u (a slow reply started the quiet period), retrying", attempt);
+        c.g_usleep((link.ui_quiet_ms + 200) * 1000);
+    }
+}
+
 fn uiCalls(r: *UiRun) ?[*:0]const u8 {
     const dir = c.g_file_new_for_path(r.ctx.tmp_dir);
     defer c.g_object_unref(dir);
@@ -928,7 +947,7 @@ fn uiCalls(r: *UiRun) ?[*:0]const u8 {
         }
         defer c.g_object_unref(info);
         if (r.want_metadata and !stringAttr(info, "metadata::k", "v") and !stringAttr(info, "metadata::k", "v2"))
-            return "the UI thread got no metadata from a healthy daemon";
+            return no_metadata_msg;
     }
     {
         const en = c.g_file_enumerate_children(dir, "standard::name,metadata::*", c.G_FILE_QUERY_INFO_NONE, null, &err) orelse {
@@ -991,8 +1010,8 @@ fn checkUiThread(ctx: *Ctx) ?[*:0]const u8 {
         return "set with a live daemon failed";
     }
     // Healthy daemon: the UI thread gets the metadata, within the SLO.
-    var healthy: UiRun = .{ .ctx = ctx, .loop = null, .want_metadata = true };
-    if (runOnUiThread(&healthy)) |what| return what;
+    var healthy: UiRun = undefined;
+    if (runOnUiThreadWantingMetadata(ctx, &healthy)) |what| return what;
     c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, daemon answering: worst %s %ld us", healthy.worst_what, @as(c_long, @intCast(healthy.worst_us)));
     if (healthy.worst_us > ui_assert_ms * 1000) return "a metadata hook blocked the UI thread with a healthy daemon";
     if (!createFile(paths[1])) return "could not re-create the test file";
@@ -1018,8 +1037,8 @@ fn checkUiThread(ctx: *Ctx) ?[*:0]const u8 {
     // And on the UI thread, at the latest after its quiet period.
     if (!createFile(paths[1])) return "could not re-create the test file";
     c.g_usleep(1200 * 1000);
-    var again: UiRun = .{ .ctx = ctx, .loop = null, .want_metadata = true };
-    if (runOnUiThread(&again)) |w| return w;
+    var again: UiRun = undefined;
+    if (runOnUiThreadWantingMetadata(ctx, &again)) |w| return w;
     c.g_log(null, c.G_LOG_LEVEL_MESSAGE, "gungnir itest: ui-thread, answering again: worst %s %ld us", again.worst_what, @as(c_long, @intCast(again.worst_us)));
     return null;
 }
