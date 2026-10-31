@@ -357,6 +357,8 @@ fn spawn_listening(
         .arg(sock)
         .arg("-d")
         .arg(db)
+        // A sandbox the caller did not ask for (CI, a shell) must not change the test.
+        .env_remove("GUNGNIR_SECCOMP")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -492,6 +494,7 @@ fn live_upgrade_after_the_binary_is_replaced() -> R {
     let t0 = Instant::now();
     let mut child = loop {
         match Command::new(&exe)
+            .env_remove("GUNGNIR_SECCOMP") // this test needs the re-exec
             .arg("-s")
             .arg(&sock)
             .arg("-d")
