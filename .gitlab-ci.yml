@@ -44,9 +44,11 @@ default:
   # job_execution_timeout is what a job hitting `timeout:` fails with; it is not covered
   # by stuck_or_timeout_failure (pending/no-updates jobs). Since GitLab 19.1 a runner
   # restart or host reclaim mid-job reports runner_interrupted, not runner_system_failure.
+  # Never script_failure: a failing build or test must fail the pipeline, not get a
+  # second try that can hide a flake (D-002, AUD-04). Network installs retry in-script.
   retry:
     max: 1
-    when: [runner_system_failure, runner_interrupted, stuck_or_timeout_failure, job_execution_timeout, script_failure]
+    when: [runner_system_failure, runner_interrupted, stuck_or_timeout_failure, job_execution_timeout]
 
 # Cargo registry + target dir, keyed on Cargo.lock. Only rust:build uploads it; every
 # other job only downloads, so parallel jobs never race to overwrite the same cache.
