@@ -453,6 +453,38 @@ fn sandboxed_process_cannot_patch_itself_through_proc() {
     }
 }
 
+/// SEC-H-009: a live i386 call (int 0x80) kills a sandboxed process in both modes where
+/// the kernel has that ABI (the control shows whether it does), and a live x32 number
+/// gets the mode's deny.
+#[test]
+fn sandboxed_other_abis_are_stopped() {
+    fn int80() -> i32 {
+        let ret: i64;
+        // SAFETY: i386 getpid (20); rcx, r8 to r11 are preserved by this entry path.
+        unsafe {
+            std::arch::asm!("int 0x80", inlateout("rax") 20i64 => ret);
+        }
+        i32::from(ret <= 0)
+    }
+    fn x32() -> i32 {
+        // SAFETY: a raw system call with no arguments.
+        let r = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+        i32::from(errno_of(r) != Some(libc::EPERM))
+    }
+    let has_ia32 = in_unsandboxed_child(int80) == 0;
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        if has_ia32 {
+            assert_eq!(in_sandboxed_child(mode, int80), -libc::SIGSYS, "{mode}");
+        }
+    }
+    assert_eq!(in_sandboxed_child(SeccompMode::Filter, x32), 0);
+    assert_eq!(
+        in_sandboxed_child(SeccompMode::Strict, x32),
+        -libc::SIGSYS,
+        "strict"
+    );
+}
+
 /// Once sandboxed, in both modes: clone with a namespace flag gets EPERM, clone3 gets
 /// ENOSYS, and threads still start (glibc falls back from clone3 to clone). D-044 item 4.
 #[test]

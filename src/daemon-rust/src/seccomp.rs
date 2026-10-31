@@ -14,13 +14,16 @@ use std::{fmt, io};
 
 /// Architecture constants for Linux audit / BPF filtering.
 pub const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
+/// Bit set in every x32 ABI system call number on x86_64.
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 const BPF_LD: u16 = 0x00;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JGE: u16 = 0x30;
 const BPF_K: u16 = 0x00;
 const BPF_JSET: u16 = 0x40;
 const BPF_RET: u16 = 0x06;
@@ -522,30 +525,35 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
         return Ok(Vec::new());
     }
 
-    #[cfg(target_arch = "x86_64")]
-    let target_arch = AUDIT_ARCH_X86_64;
-    #[cfg(target_arch = "aarch64")]
-    let target_arch = AUDIT_ARCH_AARCH64;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let target_arch = 0;
-
     let rules = rules();
     if rules.is_empty() {
-        // Architecture not explicitly enumerated; allow all safely
-        return Ok(vec![bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW)]);
+        // Rules exist for x86_64 only. An empty filter would allow everything while the
+        // daemon says it is sandboxed: refuse, the caller refuses to start (SEC-H-009).
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no seccomp rules for this architecture; refusing to run unsandboxed",
+        ));
     }
 
-    let mut filter = Vec::with_capacity(rules.len() * 3 + 6);
+    // Default disallowed action:
+    let deny_ret = match mode {
+        SeccompMode::Strict => libc::SECCOMP_RET_KILL_PROCESS,
+        _ => libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+    };
+
+    let mut filter = Vec::with_capacity(rules.len() * 3 + 8);
 
     // 0: Load architecture
     filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
     // 1: Verify arch matches expected target
-    filter.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, target_arch, 1, 0));
-    // 2: Mismatch -> return ENOSYS
-    filter.push(bpf_stmt(
-        BPF_RET | BPF_K,
-        libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32),
-    ));
+    filter.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+    // 2: Another ABI (i386 through int 0x80): the numbers below would mean other calls,
+    // and in filter mode too only a kill is safe (SEC-H-009).
+    filter.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+    // 3-5: x32 shares the x86_64 audit arch; its numbers carry a bit of their own.
+    filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    filter.push(bpf_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1));
+    filter.push(bpf_stmt(BPF_RET | BPF_K, deny_ret));
 
     // Each rule: load the syscall number (an argument check may have replaced it in A),
     // skip the rule's block unless it matches, else run the block (which returns).
@@ -559,11 +567,6 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
         filter.extend(block);
     }
 
-    // Default disallowed action:
-    let deny_ret = match mode {
-        SeccompMode::Strict => libc::SECCOMP_RET_KILL_PROCESS,
-        _ => libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
-    };
     filter.push(bpf_stmt(BPF_RET | BPF_K, deny_ret));
     if filter.len() > usize::from(u16::MAX).min(4096) {
         return Err(io::Error::new(
@@ -835,9 +838,13 @@ mod tests {
     /// A classic-BPF interpreter for the subset the builder emits, to check what the
     /// filter decides for a given call (seccomp_data: nr, arch, ip, args).
     fn decide(f: &[libc::sock_filter], nr: u32, args: [u64; 6]) -> u32 {
+        decide_arch(f, AUDIT_ARCH_X86_64, nr, args)
+    }
+
+    fn decide_arch(f: &[libc::sock_filter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
         let mut data = [0u8; 64];
         data[0..4].copy_from_slice(&nr.to_le_bytes());
-        data[4..8].copy_from_slice(&AUDIT_ARCH_X86_64.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
         for (i, a) in args.iter().enumerate() {
             data[16 + 8 * i..24 + 8 * i].copy_from_slice(&a.to_le_bytes());
         }
@@ -853,6 +860,9 @@ mod tests {
                 c if c == BPF_JMP | BPF_JEQ | BPF_K => {
                     pc += usize::from(if a == ins.k { ins.jt } else { ins.jf });
                 }
+                c if c == BPF_JMP | BPF_JGE | BPF_K => {
+                    pc += usize::from(if a >= ins.k { ins.jt } else { ins.jf });
+                }
                 c if c == BPF_ALU | BPF_AND | BPF_K => a &= ins.k,
                 c if c == BPF_JMP | BPF_JSET | BPF_K => {
                     pc += usize::from(if a & ins.k != 0 { ins.jt } else { ins.jf });
@@ -860,6 +870,36 @@ mod tests {
                 c if c == BPF_RET | BPF_K => return ins.k,
                 c => panic!("unexpected BPF opcode {c:#x}"),
             }
+        }
+    }
+
+    /// SEC-H-009: anything but the x86_64 ABI: killed in both modes on another arch, the
+    /// mode's deny for x32, before any rule can match.
+    #[test]
+    fn other_abis_never_reach_the_rules() {
+        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+        const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+        for (mode, deny) in [
+            (
+                SeccompMode::Filter,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            (SeccompMode::Strict, libc::SECCOMP_RET_KILL_PROCESS),
+        ] {
+            let f = build_filter(mode).unwrap();
+            let read = libc::SYS_read as u32;
+            for arch in [AUDIT_ARCH_I386, AUDIT_ARCH_AARCH64, 0] {
+                assert_eq!(
+                    decide_arch(&f, arch, read, [0; 6]),
+                    libc::SECCOMP_RET_KILL_PROCESS,
+                    "{mode} arch {arch:#x}"
+                );
+            }
+            for nr in [read, libc::SYS_write as u32, 512, u32::MAX] {
+                let nr = nr | X32_SYSCALL_BIT;
+                assert_eq!(decide(&f, nr, [0; 6]), deny, "{mode} nr {nr:#x}");
+            }
+            assert_eq!(decide(&f, read, [0; 6]), libc::SECCOMP_RET_ALLOW);
         }
     }
 
