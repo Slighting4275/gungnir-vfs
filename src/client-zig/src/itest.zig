@@ -1725,7 +1725,8 @@ fn findQueryModules() ?[*:0]u8 {
     return dup;
 }
 
-const Count = struct { gungnir: c_long, all: c_long, direct: c_long, distinct: c_long, registered: c_long };
+const Count = struct { gungnir: c_long, all: c_long, direct: c_long, distinct: c_long, registered: c_long, linked: c_long, ref: c_long, refeq: c_long, giolines: c_long, gioroots: c_long };
+const count_keys = [_][]const u8{ "gungnir", "all", "direct", "distinct", "registered", "linked", "ref", "refeq", "giolines", "gioroots" };
 
 /// Runs `self <dir> volmon-count <variant>` and parses its COUNT line.
 fn countIn(self: [*c]u8, dir: [*:0]const u8, variant: [*:0]const u8) ?Count {
@@ -1742,17 +1743,108 @@ fn countIn(self: [*c]u8, dir: [*:0]const u8, variant: [*:0]const u8) ?Count {
     const text = std.mem.span(out);
     const at = std.mem.indexOf(u8, text, "COUNT ") orelse return null;
     const line_end = std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len;
-    var vals: [5]c_long = undefined;
-    const keys = [_][]const u8{ "gungnir", "all", "direct", "distinct", "registered" };
+    var vals: [count_keys.len]c_long = undefined;
     var it = std.mem.tokenizeScalar(u8, text[at + "COUNT ".len .. line_end], ' ');
-    for (keys, &vals) |k, *v| {
+    for (count_keys, &vals) |k, *v| {
         const tok = it.next() orelse return null;
         if (tok.len <= k.len or !std.mem.startsWith(u8, tok, k) or tok[k.len] != '=') return null;
         v.* = std.fmt.parseInt(c_long, tok[k.len + 1 ..], 10) catch return null;
     }
-    const r: Count = .{ .gungnir = vals[0], .all = vals[1], .direct = vals[2], .distinct = vals[3], .registered = vals[4] };
-    std.debug.print("gungnir itest volmon-installed: {s}: gungnir={d} all={d} direct={d} distinct={d} registered={d}\n", .{ variant, r.gungnir, r.all, r.direct, r.distinct, r.registered });
+    const r: Count = .{ .gungnir = vals[0], .all = vals[1], .direct = vals[2], .distinct = vals[3], .registered = vals[4], .linked = vals[5], .ref = vals[6], .refeq = vals[7], .giolines = vals[8], .gioroots = vals[9] };
+    std.debug.print("gungnir itest volmon-installed: {s}: {s}\n", .{ variant, text[at + "COUNT ".len .. line_end] });
     return r;
+}
+
+/// The reference set for the Gungnir monitor (D-062): the file URIs of the mount points
+/// of /proc/self/mountinfo that the module's documented filter accepts (volmon.zig
+/// isStorageFs), parsed and filtered here independently of the module. Each mount
+/// point once.
+fn referenceRoots(out: *c.GHashTable) bool {
+    var raw: [*c]u8 = null;
+    var len: c.gsize = 0;
+    if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return false;
+    defer c.g_free(raw);
+    const ignored = [_][]const u8{ "proc", "sysfs", "devpts", "cgroup", "cgroup2", "pstore", "bpf", "autofs", "hugetlbfs", "mqueue", "debugfs", "tracefs", "securityfs", "configfs", "fusectl", "devtmpfs", "binfmt_misc", "efivarfs", "nsfs", "rpc_pipefs" };
+    var lines = std.mem.splitScalar(u8, raw[0..len], '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        var i: usize = 0;
+        var mp_raw: []const u8 = "";
+        while (i < 5) : (i += 1) mp_raw = f.next() orelse break;
+        if (i < 5) continue;
+        const fstype = while (f.next()) |t| {
+            if (std.mem.eql(u8, t, "-")) break f.next() orelse continue;
+        } else continue;
+        var buf: [1024]u8 = undefined;
+        var n: usize = 0;
+        var k: usize = 0;
+        while (k < mp_raw.len and n < buf.len - 1) : (n += 1) {
+            if (mp_raw[k] == '\\' and k + 3 < mp_raw.len) {
+                if (std.fmt.parseInt(u8, mp_raw[k + 1 .. k + 4], 8)) |b| {
+                    buf[n] = b;
+                    k += 4;
+                    continue;
+                } else |_| {}
+            }
+            buf[n] = mp_raw[k];
+            k += 1;
+        }
+        buf[n] = 0;
+        const mp = buf[0..n];
+        const skip = for (ignored) |ig| {
+            if (std.mem.eql(u8, fstype, ig)) break true;
+        } else if (std.mem.eql(u8, fstype, "tmpfs"))
+            !(std.mem.eql(u8, mp, "/tmp") or std.mem.startsWith(u8, mp, "/media") or std.mem.startsWith(u8, mp, "/run/media") or std.mem.startsWith(u8, mp, "/mnt"))
+        else
+            std.mem.startsWith(u8, mp, "/var/lib/docker");
+        if (skip) continue;
+        const uri = c.g_filename_to_uri(@ptrCast(&buf), null, null) orelse continue;
+        _ = c.g_hash_table_add(out, uri);
+    }
+    return true;
+}
+
+/// Every Gungnir mount of `vm` has a volume whose mount is that same mount (DIB-F016);
+/// returns how many do.
+fn linkedMounts(vm: *c.GVolumeMonitor) c_long {
+    var n: c_long = 0;
+    const list = c.g_volume_monitor_get_mounts(vm);
+    defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+    var curr: ?*c.GList = list;
+    while (curr) |node| : (curr = node.*.next) {
+        const m: *c.GMount = @ptrCast(@alignCast(node.*.data));
+        const name = c.g_type_name_from_instance(@ptrCast(@alignCast(m)));
+        if (name == null or !std.mem.startsWith(u8, std.mem.span(name), "Gungnir")) continue;
+        const v = c.g_mount_get_volume(m) orelse continue;
+        defer c.g_object_unref(v);
+        const back = c.g_volume_get_mount(v) orelse continue;
+        defer c.g_object_unref(back);
+        if (back == m) n += 1;
+    }
+    return n;
+}
+
+/// `gio mount -l` in this environment: how many mount lines it prints, and how many
+/// distinct roots they name (each root once: lines == roots).
+fn gioMountList(lines_out: *c_long, roots_out: *c_long) bool {
+    const r = runGio(&.{ "mount", "-l" }) orelse return false;
+    defer freeCli(r);
+    if (!r.ok or r.out == null) return false;
+    const seen = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
+    defer c.g_hash_table_destroy(seen);
+    var lines: c_long = 0;
+    var it = std.mem.splitScalar(u8, std.mem.span(r.out), '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trimStart(u8, line, " ");
+        if (!std.mem.startsWith(u8, t, "Mount(")) continue;
+        const at = std.mem.indexOf(u8, t, " -> ") orelse continue;
+        lines += 1;
+        const uri = t[at + 4 ..];
+        _ = c.g_hash_table_add(seen, c.g_strndup(uri.ptr, uri.len));
+    }
+    lines_out.* = lines;
+    roots_out.* = @intCast(c.g_hash_table_size(seen));
+    return true;
 }
 
 /// Child of volmon-installed: GIO_MODULE_DIR is the indexed copy; `variant` is none
@@ -1784,8 +1876,11 @@ fn runVolmonCount(variant: []const u8) c_int {
             if (name != null and std.mem.startsWith(u8, std.mem.span(name), "Gungnir")) mounts_gungnir += 1;
         }
     }
+    const linked = linkedMounts(vm);
     var direct: c_long = 0;
     var distinct: c_long = 0;
+    var ref: c_long = -1;
+    var refeq: c_long = 0;
     const vm_type = c.g_type_from_name("GungnirVolumeMonitor");
     if (vm_type != 0) {
         const obj = c.g_object_new(vm_type, @as(?*const u8, null)) orelse return fail("could not instantiate GungnirVolumeMonitor");
@@ -1802,8 +1897,26 @@ fn runVolmonCount(variant: []const u8) c_int {
             _ = c.g_hash_table_add(seen, c.g_file_get_uri(root));
         }
         distinct = @intCast(c.g_hash_table_size(seen));
+        const want = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
+        defer c.g_hash_table_destroy(want);
+        if (referenceRoots(want.?)) {
+            ref = @intCast(c.g_hash_table_size(want));
+            var iter: c.GHashTableIter = undefined;
+            c.g_hash_table_iter_init(&iter, want);
+            var key: c.gpointer = null;
+            refeq = @intFromBool(ref == distinct);
+            while (c.g_hash_table_iter_next(&iter, &key, null) != 0) {
+                if (c.g_hash_table_contains(seen, key) == 0) {
+                    refeq = 0;
+                    c.g_print("missing from the Gungnir monitor: %s\n", @as([*c]const u8, @ptrCast(key)));
+                }
+            }
+        }
     }
-    c.g_print("COUNT gungnir=%ld all=%ld direct=%ld distinct=%ld registered=%ld\n", mounts_gungnir, mounts_all, direct, distinct, @as(c_long, @intFromBool(vm_type != 0)));
+    var giolines: c_long = -1;
+    var gioroots: c_long = -1;
+    if (!gioMountList(&giolines, &gioroots)) c.g_print("gio mount -l failed\n");
+    c.g_print("COUNT gungnir=%ld all=%ld direct=%ld distinct=%ld registered=%ld linked=%ld ref=%ld refeq=%ld giolines=%ld gioroots=%ld\n", mounts_gungnir, mounts_all, direct, distinct, @as(c_long, @intFromBool(vm_type != 0)), linked, ref, refeq, giolines, gioroots);
     return 0;
 }
 
@@ -1811,7 +1924,9 @@ fn runVolmonCount(variant: []const u8) c_int {
 /// a module dir indexed by gio-querymodules, so GIO loads it through giomodule.cache, not
 /// by scanning the dir. With no env and with GIO_USE_VFS=gungnir only, no Gungnir mount
 /// appears; with GIO_USE_VOLUME_MONITOR=gungnir the default monitor lists exactly one
-/// mount per mount point the Gungnir monitor accepts (N > 0, no duplicates).
+/// mount per mount point the Gungnir monitor accepts (N > 0, no duplicates), N is the
+/// independently filtered /proc/self/mountinfo set, every mount's volume points back at
+/// it, and `gio mount -l` names each root once (D-062, DIB-F016).
 fn runVolmonInstalled(self: [*c]u8, module_dir: [*c]u8, tmp_arg: [*c]u8) c_int {
     const dir = privateDir(tmp_arg, "volmon-installed") orelse return fail("cannot create a private directory");
     defer c.g_free(dir);
@@ -1859,6 +1974,14 @@ fn runVolmonInstalled(self: [*c]u8, module_dir: [*c]u8, tmp_arg: [*c]u8) c_int {
     if (vol.distinct != vol.direct) return fail("the Gungnir monitor lists a mount point twice");
     if (vol.gungnir != vol.direct) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: Gungnir mounts != mount points");
     if (vol.all != vol.gungnir) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: other monitors' mounts too");
+    // D-062: the count is the filtered mountinfo set, each root once, not a fixed number.
+    if (vol.ref <= 0) return fail("could not build the mountinfo reference set");
+    if (vol.refeq != 1 or vol.direct != vol.ref) return fail("the Gungnir mounts are not exactly the filtered /proc/self/mountinfo set");
+    // DIB-F016: every mount has its volume, and that volume's mount is the same mount.
+    if (vol.linked != vol.gungnir) return fail("a Gungnir mount has no volume, or its volume's mount is another object");
+    if (vol.giolines < 0) return fail("gio mount -l failed");
+    if (vol.giolines != vol.gioroots) return fail("gio mount -l lists a mount root more than once");
+    if (vol.gioroots != vol.ref) return fail("gio mount -l does not list exactly the filtered mountinfo set");
     return 0;
 }
 

@@ -118,6 +118,8 @@ pub const GungnirMount = extern struct {
     fstype: [64]u8,
     uuid: [128]u8,
     is_network: c.gboolean,
+    /// Its GungnirVolume (strong; the volume points back weakly, so no cycle).
+    volume: ?*c.GVolume,
 };
 
 pub const GungnirMountClass = extern struct {
@@ -154,9 +156,12 @@ fn mountGetUuid(mount: ?*c.GMount) callconv(.c) [*c]u8 {
     return null;
 }
 
+/// The mount's volume, a new reference (DIB-F016: NULL here made Nemo and `gio mount -l`
+/// list every mount twice, once under its volume and once as a volume-less mount).
 fn mountGetVolume(mount: ?*c.GMount) callconv(.c) ?*c.GVolume {
-    _ = mount;
-    return null;
+    const self: *GungnirMount = @ptrCast(@alignCast(mount orelse return null));
+    const v = self.volume orelse return null;
+    return @ptrCast(c.g_object_ref(@ptrCast(v)));
 }
 
 fn mountGetDrive(mount: ?*c.GMount) callconv(.c) ?*c.GDrive {
@@ -201,9 +206,24 @@ fn mountInterfaceInit(g_iface: c.gpointer, iface_data: c.gpointer) callconv(.c) 
     iface.get_sort_key = &mountGetSortKey;
 }
 
+var mount_parent_class: ?*c.GObjectClass = null;
+
+fn mountFinalize(obj: [*c]c.GObject) callconv(.c) void {
+    const self: *GungnirMount = @ptrCast(@alignCast(obj));
+    if (self.volume) |v| {
+        self.volume = null;
+        c.g_object_unref(@ptrCast(v));
+    }
+    if (mount_parent_class) |pc| {
+        if (pc.finalize) |f| f(obj);
+    }
+}
+
 fn mountClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
-    _ = g_class;
     _ = class_data;
+    mount_parent_class = @ptrCast(@alignCast(c.g_type_class_peek_parent(g_class)));
+    const oc: *c.GObjectClass = @ptrCast(@alignCast(g_class));
+    oc.finalize = &mountFinalize;
 }
 
 fn mountInstanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callconv(.c) void {
@@ -214,6 +234,7 @@ fn mountInstanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callcon
     @memset(&self.fstype, 0);
     @memset(&self.uuid, 0);
     self.is_network = 0;
+    self.volume = null;
 }
 
 const mount_type_info = c.GTypeInfo{
@@ -236,7 +257,8 @@ pub const GungnirVolume = extern struct {
     parent_instance: c.GObject,
     name: [256]u8,
     uuid: [128]u8,
-    mount: ?*c.GMount,
+    /// Its GungnirMount, weakly: the mount owns the volume.
+    mount: c.GWeakRef,
 };
 
 pub const GungnirVolumeClass = extern struct {
@@ -271,17 +293,16 @@ fn volumeGetDrive(volume: ?*c.GVolume) callconv(.c) ?*c.GDrive {
     return null;
 }
 
+/// The volume's mount, a new reference, or NULL once the mount is gone.
 fn volumeGetMount(volume: ?*c.GVolume) callconv(.c) ?*c.GMount {
     const self: *GungnirVolume = @ptrCast(@alignCast(volume orelse return null));
-    if (self.mount) |m| {
-        return @ptrCast(c.g_object_ref(@ptrCast(m)));
-    }
-    return null;
+    return @ptrCast(@alignCast(c.g_weak_ref_get(&self.mount)));
 }
 
 fn volumeCanMount(volume: ?*c.GVolume) callconv(.c) c.gboolean {
-    const self: *GungnirVolume = @ptrCast(@alignCast(volume orelse return 0));
-    return if (self.mount == null) 1 else 0;
+    const m = volumeGetMount(volume) orelse return 1;
+    c.g_object_unref(@ptrCast(m));
+    return 0;
 }
 
 fn volumeCanEject(volume: ?*c.GVolume) callconv(.c) c.gboolean {
@@ -312,10 +333,7 @@ var volume_parent_class: ?*c.GObjectClass = null;
 
 fn volumeFinalize(obj: [*c]c.GObject) callconv(.c) void {
     const self: *GungnirVolume = @ptrCast(@alignCast(obj));
-    if (self.mount) |m| {
-        c.g_object_unref(@ptrCast(m));
-        self.mount = null;
-    }
+    c.g_weak_ref_clear(&self.mount);
     if (volume_parent_class) |pc| {
         if (pc.finalize) |f| f(obj);
     }
@@ -333,7 +351,7 @@ fn volumeInstanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callco
     const self: *GungnirVolume = @ptrCast(@alignCast(instance));
     @memset(&self.name, 0);
     @memset(&self.uuid, 0);
-    self.mount = null;
+    c.g_weak_ref_init(&self.mount, null);
 }
 
 const volume_type_info = c.GTypeInfo{
@@ -354,6 +372,13 @@ const volume_iface_info = c.GInterfaceInfo{
 
 pub const GungnirVolumeMonitor = extern struct {
     parent_instance: c.GNativeVolumeMonitor,
+    /// Guards the fields below; get_mounts/get_volumes may come from any thread.
+    lock: c.GMutex,
+    /// The mounts (strong refs; each owns its volume) parsed from `last`, so the same
+    /// mountinfo gives the same objects and a volume's mount stays alive.
+    mounts: ?*c.GList,
+    last: [*c]u8,
+    last_len: c.gsize,
 };
 
 pub const GungnirVolumeMonitorClass = extern struct {
@@ -404,8 +429,26 @@ fn parseMounts() !*c.GList {
         return error.CannotOpenMountinfo;
     }
     defer c.g_free(raw_content);
-    const content = raw_content[0..length];
+    return mountsFrom(raw_content[0..length]);
+}
 
+/// A new GungnirVolume for `gmount`, owned by it; the volume points back weakly.
+fn attachVolume(gmount: *GungnirMount) void {
+    if (volume_type == 0) return;
+    const obj = c.g_object_new(volume_type, @as(?*const u8, null)) orelse return;
+    const gvol: *GungnirVolume = @ptrCast(@alignCast(obj));
+    const name = std.mem.span(@as([*:0]const u8, @ptrCast(&gmount.name)));
+    const n = @min(name.len, gvol.name.len - 1);
+    @memcpy(gvol.name[0..n], name[0..n]);
+    gvol.name[n] = 0;
+    @memcpy(&gvol.uuid, &gmount.uuid);
+    c.g_weak_ref_set(&gvol.mount, @ptrCast(gmount));
+    gmount.volume = @ptrCast(@alignCast(obj));
+}
+
+/// One GungnirMount (with its volume) per accepted mount point of `content`. A mount
+/// point mounted over again appears once, as its topmost (last) mount.
+fn mountsFrom(content: []const u8) !*c.GList {
     var list: ?*c.GList = null;
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |line| {
@@ -459,41 +502,65 @@ fn parseMounts() !*c.GList {
         gmount.fstype[c_fs_len] = 0;
 
         gmount.is_network = if (isNetworkFs(fstype)) 1 else 0;
+        attachVolume(gmount);
 
+        // Over-mounted: drop the earlier mount at the same point.
+        var it: ?*c.GList = list;
+        while (it) |node| : (it = node.*.next) {
+            const old: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+            if (std.mem.eql(u8, std.mem.sliceTo(&old.mount_point, 0), std.mem.sliceTo(&gmount.mount_point, 0))) {
+                list = c.g_list_delete_link(list, node);
+                c.g_object_unref(@ptrCast(old));
+                break;
+            }
+        }
         list = c.g_list_prepend(list, gmount);
     }
     return c.g_list_reverse(list) orelse return error.NoMounts;
 }
 
-fn monitorGetMounts(monitor: [*c]c.GVolumeMonitor) callconv(.c) [*c]c.GList {
-    _ = monitor;
-    return parseMounts() catch null;
+fn refObject(src: c.gconstpointer, data: c.gpointer) callconv(.c) c.gpointer {
+    _ = data;
+    return c.g_object_ref(@constCast(src));
 }
 
+/// The monitor's mounts for the current mountinfo, as a new list of new references:
+/// the cached objects while mountinfo is unchanged, else freshly parsed ones.
+fn currentMounts(monitor: [*c]c.GVolumeMonitor) ?*c.GList {
+    const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(monitor orelse return null));
+    var raw: [*c]u8 = null;
+    var len: c.gsize = 0;
+    if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return null;
+    c.g_mutex_lock(&self.lock);
+    defer c.g_mutex_unlock(&self.lock);
+    if (self.last != null and self.last_len == len and std.mem.eql(u8, self.last[0..self.last_len], raw[0..len])) {
+        c.g_free(raw);
+    } else {
+        const fresh = mountsFrom(raw[0..len]) catch null;
+        c.g_list_free_full(self.mounts, @ptrCast(&c.g_object_unref));
+        c.g_free(self.last);
+        self.mounts = fresh;
+        self.last = raw;
+        self.last_len = len;
+    }
+    return c.g_list_copy_deep(self.mounts, &refObject, null);
+}
+
+fn monitorGetMounts(monitor: [*c]c.GVolumeMonitor) callconv(.c) [*c]c.GList {
+    return currentMounts(monitor);
+}
+
+/// Each mount's own volume (mount and volume point at each other, DIB-F016).
 fn monitorGetVolumes(monitor: [*c]c.GVolumeMonitor) callconv(.c) [*c]c.GList {
-    const mounts_list = monitorGetMounts(monitor);
-    if (mounts_list == null) return null;
+    const mounts_list = currentMounts(monitor) orelse return null;
     defer c.g_list_free_full(mounts_list, @ptrCast(&c.g_object_unref));
 
     var vol_list: ?*c.GList = null;
-    var curr = mounts_list;
-    while (curr != null) : (curr = curr.*.next) {
-        const m: *c.GMount = @ptrCast(@alignCast(curr.*.data));
-        const obj = c.g_object_new(volume_type, @as(?*const u8, null));
-        if (obj == null) continue;
-        const gvol: *GungnirVolume = @ptrCast(@alignCast(obj));
-
-        const name_c = c.g_mount_get_name(m);
-        defer c.g_free(name_c);
-        if (name_c != null) {
-            const name_span = std.mem.span(name_c);
-            const copy_len = @min(name_span.len, gvol.name.len - 1);
-            @memcpy(gvol.name[0..copy_len], name_span[0..copy_len]);
-            gvol.name[copy_len] = 0;
-        }
-
-        gvol.mount = @ptrCast(c.g_object_ref(@ptrCast(m)));
-        vol_list = c.g_list_prepend(vol_list, gvol);
+    var curr: ?*c.GList = mounts_list;
+    while (curr) |node| : (curr = node.*.next) {
+        const gm: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+        const v = gm.volume orelse continue;
+        vol_list = c.g_list_prepend(vol_list, c.g_object_ref(@ptrCast(v)));
     }
     return c.g_list_reverse(vol_list);
 }
@@ -536,8 +603,25 @@ fn monitorGetVolumeForUuid(monitor: [*c]c.GVolumeMonitor, uuid_c: [*c]const u8) 
     return null;
 }
 
+var monitor_parent_class: ?*c.GObjectClass = null;
+
+fn monitorFinalize(obj: [*c]c.GObject) callconv(.c) void {
+    const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(obj));
+    c.g_list_free_full(self.mounts, @ptrCast(&c.g_object_unref));
+    self.mounts = null;
+    c.g_free(self.last);
+    self.last = null;
+    c.g_mutex_clear(&self.lock);
+    if (monitor_parent_class) |pc| {
+        if (pc.finalize) |f| f(obj);
+    }
+}
+
 fn monitorClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
     _ = class_data;
+    monitor_parent_class = @ptrCast(@alignCast(c.g_type_class_peek_parent(g_class)));
+    const oc: *c.GObjectClass = @ptrCast(@alignCast(g_class));
+    oc.finalize = &monitorFinalize;
     const native_klass: *c.GNativeVolumeMonitorClass = @ptrCast(@alignCast(g_class));
     native_klass.get_mount_for_mount_path = &monitorGetMountForMountPath;
 
@@ -551,8 +635,12 @@ fn monitorClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) vo
 }
 
 fn monitorInstanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callconv(.c) void {
-    _ = instance;
     _ = g_class;
+    const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(instance));
+    c.g_mutex_init(&self.lock);
+    self.mounts = null;
+    self.last = null;
+    self.last_len = 0;
 }
 
 const monitor_type_info = c.GTypeInfo{
@@ -639,6 +727,45 @@ pub fn ensureRegisteredForTest() void {
         mount_type = c.g_type_register_static_simple(c.g_object_get_type(), "GungnirMountStatic", @sizeOf(GungnirMountClass), &mountClassInit, @sizeOf(GungnirMount), &mountInstanceInit, 0);
         c.g_type_add_interface_static(mount_type, c.g_mount_get_type(), &mount_iface_info);
     }
+    if (volume_type == 0) {
+        volume_type = c.g_type_register_static_simple(c.g_object_get_type(), "GungnirVolumeStatic", @sizeOf(GungnirVolumeClass), &volumeClassInit, @sizeOf(GungnirVolume), &volumeInstanceInit, 0);
+        c.g_type_add_interface_static(volume_type, c.g_volume_get_type(), &volume_iface_info);
+    }
+}
+
+test "a mount and its volume point at each other and are freed together (DIB-F016)" {
+    ensureRegisteredForTest();
+    const text = "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n" ++
+        "23 22 0:22 / /home rw - btrfs /dev/sda2 rw\n" ++
+        "24 22 0:23 / /home rw - btrfs /dev/sda3 rw\n" ++
+        "25 22 0:24 / /proc rw - proc proc rw\n";
+    const list = try mountsFrom(text);
+    // /home mounted twice appears once (the top one); /proc is filtered out.
+    try std.testing.expectEqual(@as(c.guint, 2), c.g_list_length(list));
+    var vol_gone: c.gpointer = null;
+    var mount_gone: c.gpointer = null;
+    {
+        const m: *c.GMount = @ptrCast(@alignCast(list.*.next.*.data));
+        const v = c.g_mount_get_volume(m) orelse return error.NoVolume;
+        const back = c.g_volume_get_mount(v) orelse return error.NoMount;
+        try std.testing.expect(back == m);
+        c.g_object_unref(back);
+        const name = c.g_volume_get_name(v);
+        defer c.g_free(name);
+        try std.testing.expectEqualStrings("home", std.mem.span(name));
+        vol_gone = @ptrCast(v);
+        mount_gone = @ptrCast(m);
+        c.g_object_add_weak_pointer(@ptrCast(@alignCast(v)), &vol_gone);
+        c.g_object_add_weak_pointer(@ptrCast(@alignCast(m)), &mount_gone);
+        // Hold only the volume: the mount stays (the list owns it); once the list is
+        // freed the mount goes, and the volume reports no mount.
+        c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+        try std.testing.expect(mount_gone == null);
+        try std.testing.expect(vol_gone != null);
+        try std.testing.expect(c.g_volume_get_mount(v) == null);
+        c.g_object_unref(@ptrCast(v));
+    }
+    try std.testing.expect(vol_gone == null);
 }
 
 test "parseMounts extracts live mounts from mountinfo" {
