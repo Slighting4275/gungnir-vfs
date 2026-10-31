@@ -1209,6 +1209,29 @@ fn delete_tree_never_descends_into_a_bind_mount_of_the_same_filesystem() -> R {
     Ok(())
 }
 
+/// A root that is itself a mount point: nothing on it is deleted, EXDEV (DIB-F001).
+#[test]
+fn delete_tree_refuses_a_root_that_is_a_mount_point() -> R {
+    if !in_mount_namespace("ops::tests::delete_tree_refuses_a_root_that_is_a_mount_point")? {
+        return Ok(());
+    }
+    for engine in engines() {
+        let t = TestDir::new("op-bindroot")?;
+        let ops = start(engine, test_cfg())?;
+        let outside = t.join("outside");
+        fs::create_dir_all(outside.join("deep"))?;
+        fs::write(outside.join("deep/precious"), b"p")?;
+        let root = t.join("mounted");
+        fs::create_dir(&root)?;
+        let m = Mount::bind(&outside, &root)?;
+        let (d, _) = run(&ops, req(OpKind::DeleteTree, 0, &root, None))?;
+        assert_eq!(os(&d), Some(libc::EXDEV), "{engine:?}: {:?}", d.result);
+        assert!(outside.join("deep/precious").exists(), "{engine:?}");
+        drop(m);
+    }
+    Ok(())
+}
+
 /// A delete-tree that fails part-way (here: deeper than MAX_DEPTH) must not report the
 /// whole tree as removed: files it never deleted keep their metadata.
 #[test]
