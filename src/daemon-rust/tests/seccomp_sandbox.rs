@@ -366,6 +366,48 @@ fn sandboxed_ioctls_outside_the_allowlist_get_enotty() {
     }
 }
 
+/// Once sandboxed (filter mode): kill and tgkill only to this process, setuid and
+/// setgid refused. D-044 item 7.
+#[test]
+fn sandboxed_signals_only_to_self_and_no_set_id() {
+    fn body() -> i32 {
+        // SAFETY: getpid/getppid have no preconditions.
+        let (me, parent) = unsafe { (libc::getpid(), libc::getppid()) };
+        // Signal 0: permission and existence check only, nothing is delivered.
+        // SAFETY: as above.
+        if unsafe { libc::syscall(libc::SYS_kill, me, 0) } != 0 {
+            return 1;
+        }
+        // SAFETY: as above; this thread is the main thread, tid == pid.
+        if unsafe { libc::syscall(libc::SYS_tgkill, me, me, 0) } != 0 {
+            return 2;
+        }
+        for (i, pid) in [parent, 0, -1, -me].into_iter().enumerate() {
+            // SAFETY: signal 0, and refused by the filter anyway.
+            let r = unsafe { libc::syscall(libc::SYS_kill, pid, 0) };
+            if errno_of(r) != Some(libc::EPERM) {
+                return 10 + i as i32;
+            }
+        }
+        // SAFETY: as above.
+        let r = unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 3;
+        }
+        // SAFETY: refused before anything changes (and a no-op to our own ids anyway).
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        if errno_of(unsafe { libc::syscall(libc::SYS_setuid, uid) }) != Some(libc::EPERM) {
+            return 4;
+        }
+        // SAFETY: as above.
+        if errno_of(unsafe { libc::syscall(libc::SYS_setgid, gid) }) != Some(libc::EPERM) {
+            return 5;
+        }
+        0
+    }
+    assert_eq!(in_sandboxed_child(SeccompMode::Filter, body), 0);
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {

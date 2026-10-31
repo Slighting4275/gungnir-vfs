@@ -187,7 +187,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_vfork as u32, // Live in-place upgrade re-exec handover
         libc::SYS_exit as u32,
         libc::SYS_wait4 as u32,
-        libc::SYS_kill as u32,
         libc::SYS_fcntl as u32,
         libc::SYS_flock as u32,
         libc::SYS_fsync as u32,
@@ -211,8 +210,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_times as u32,
         libc::SYS_getuid as u32,
         libc::SYS_getgid as u32,
-        libc::SYS_setuid as u32,
-        libc::SYS_setgid as u32,
         libc::SYS_geteuid as u32,
         libc::SYS_getegid as u32,
         libc::SYS_sigaltstack as u32,
@@ -225,7 +222,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_sched_getaffinity as u32,
         libc::SYS_restart_syscall as u32,
         libc::SYS_gettid as u32,
-        libc::SYS_tkill as u32,
         libc::SYS_futex as u32,
         libc::SYS_epoll_create as u32,
         libc::SYS_epoll_ctl as u32,
@@ -236,7 +232,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_clock_getres as u32,
         libc::SYS_clock_nanosleep as u32,
         libc::SYS_exit_group as u32,
-        libc::SYS_tgkill as u32,
         libc::SYS_utimes as u32,
         libc::SYS_openat as u32,
         libc::SYS_mkdirat as u32,
@@ -321,10 +316,30 @@ fn rules() -> Vec<(u32, Rule)> {
             },
         )
     };
+    // SAFETY: getpid has no preconditions.
+    let own_tgid = unsafe { libc::getpid() } as u32;
     let checked = [
         // AF_UNIX sockets only: the control socket and its peers (D-044 item 3).
         af_unix(libc::SYS_socket),
         af_unix(libc::SYS_socketpair),
+        // Signals only to this process (its own tgid, read when the filter is built:
+        // the sandboxed process never re-execs), e.g. raise/abort (D-044 item 7).
+        (
+            libc::SYS_kill as u32,
+            Rule::ArgEq {
+                arg: 0,
+                val: own_tgid,
+                errno: libc::EPERM,
+            },
+        ),
+        (
+            libc::SYS_tgkill as u32,
+            Rule::ArgEq {
+                arg: 0,
+                val: own_tgid,
+                errno: libc::EPERM,
+            },
+        ),
         // Threads, not namespaces: clone with any CLONE_NEW* flag is refused (D-044 item 4).
         (
             libc::SYS_clone as u32,
@@ -736,6 +751,45 @@ mod tests {
             decide(&f, libc::SYS_getpid as u32, [0; 6]),
             libc::SECCOMP_RET_ALLOW
         );
+    }
+
+    #[test]
+    fn signals_only_to_this_process_and_no_set_id() {
+        let f = build_filter(SeccompMode::Strict).unwrap();
+        let me = u64::from(std::process::id());
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let kill = libc::SYS_kill as u32;
+        let tgkill = libc::SYS_tgkill as u32;
+        assert_eq!(
+            decide(&f, kill, [me, 15, 0, 0, 0, 0]),
+            libc::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            decide(&f, tgkill, [me, me, 6, 0, 0, 0]),
+            libc::SECCOMP_RET_ALLOW
+        );
+        // Another pid, a process group (0, -1, -pgid): refused.
+        for other in [
+            me + 1,
+            1,
+            0,
+            u64::from(u32::MAX),
+            u64::from(-(me as i64) as u32),
+        ] {
+            assert_eq!(decide(&f, kill, [other, 15, 0, 0, 0, 0]), eperm, "{other}");
+            assert_eq!(
+                decide(&f, tgkill, [other, other, 6, 0, 0, 0]),
+                eperm,
+                "{other}"
+            );
+        }
+        for n in [libc::SYS_setuid, libc::SYS_setgid, libc::SYS_tkill] {
+            assert_eq!(
+                decide(&f, n as u32, [0; 6]),
+                libc::SECCOMP_RET_KILL_PROCESS,
+                "syscall {n}"
+            );
+        }
     }
 
     #[test]
