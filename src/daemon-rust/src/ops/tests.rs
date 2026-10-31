@@ -1028,10 +1028,14 @@ fn engine_choice_honours_the_environment_switch() {
     let (k, why) = choose_engine(Some(std::ffi::OsStr::new("0")));
     match io::probe() {
         Ok(()) => assert_eq!(k, EngineKind::Uring),
-        Err(_) => assert_eq!(
-            (k, why.starts_with("io_uring unavailable")),
-            (EngineKind::Threads, true)
-        ),
+        Err(_) => {
+            // Where io_uring is required this is a failure, not a thread-engine pass (RC-F027).
+            assert!(!io::uring_for_tests_env("the engine choice"));
+            assert_eq!(
+                (k, why.starts_with("io_uring unavailable")),
+                (EngineKind::Threads, true)
+            );
+        }
     }
 }
 
