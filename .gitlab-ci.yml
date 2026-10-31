@@ -14,6 +14,9 @@
 
 workflow:
   rules:
+    # Scheduled and manually started (web) pipelines always run: rust:perf runs only there,
+    # and a branch with an open MR would otherwise get no such pipeline (rule below).
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
@@ -254,3 +257,17 @@ zig:test:
     - ./zb test --summary all
     # The itest's test-hooks daemon lives in .build/target-hooks, never over the artifact.
     - "! grep -q 'TEST HOOK' .build/target/release/gungnird"
+
+# The 50k-event stress benchmark (AGENTS.md §4) with its wall-clock, p99 and peak-RSS
+# SLO asserts unchanged. Not a per-push correctness gate (shared runners make the timing
+# noisy, D-055), so it runs in scheduled and manually started pipelines only; when it
+# runs, a missed SLO fails the pipeline (no allow_failure). RC-F025.
+rust:perf:
+  stage: test
+  extends: .rust
+  timeout: 25 minutes
+  needs: ["rust:build"]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"
+  script:
+    - cargo test --release --test stress_throughput -- --ignored

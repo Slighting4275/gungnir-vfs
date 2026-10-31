@@ -23,7 +23,7 @@ Gungnir's 12-milestone architecture aims at stall-free virtual filesystem operat
 | **M9** | Trash & Recent Items Engine | **Not on main (T-005 port pending)** | `trash://` and `recent://` are not implemented on this branch. |
 | **M10** | Volume & Mount Monitor | **Experimental, opt-in; no mount change signals yet (F01b)** | `GVolumeMonitor`, `GVolume`, `GMount` from a non-blocking mountinfo parser, active only with `GIO_USE_VOLUME_MONITOR=gungnir`; mounts and volumes are listed, but no mount-added/removed signals are emitted yet. |
 | **M11** | Daemon Lifecycle Management | **Partial: shutdown is not yet graceful for in-flight ops (AUD-03, BC-HC-F06 open)** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` shutdown, which does not yet wait for or clean up in-flight file ops, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
-| **M12** | Hardening & System Release | **In review (HC-001: seccomp hardening D-044, unit hardening AUD-01)** | Zero-dependency Linux seccomp BPF filter sandbox (`--seccomp`), systemd user units (`gungnird.service` / `gungnird.socket`; their sandboxing is under review, AUD-01), Arch Linux `PKGBUILD` packaging, wire and metadata-wire fuzz tests. The 50,000-event stress benchmark is a perf job outside the default test suite; its throughput, p99 and RSS figures are not reproduced (tracked in T-010). |
+| **M12** | Hardening & System Release | **In review (HC-001: seccomp hardening D-044, unit hardening AUD-01)** | Zero-dependency Linux seccomp BPF filter sandbox (`--seccomp`), systemd user units (`gungnird.service` / `gungnird.socket`; their sandboxing is under review, AUD-01), Arch Linux `PKGBUILD` packaging, wire and metadata-wire fuzz tests. The 50,000-event stress benchmark is outside the default test suite: the CI job `rust:perf` runs it (`cargo test --release --test stress_throughput -- --ignored`, SLO asserts unchanged) in scheduled and manually started pipelines only; its throughput, p99 and RSS figures are not reproduced here (tracked in T-010). |
 
 ---
 
@@ -120,6 +120,8 @@ Every push and merge request executes [`.gitlab-ci.yml`](.gitlab-ci.yml) against
 - `cargo clippy --release --all-targets -- -D warnings`
 - `cargo test --release`, with the io_uring engine and with `GUNGNIR_NO_URING=1` (thread engine)
 - `./zb test --summary all` across all 14 integration test modes: `opt-in`, `no-opt-in`, `daemon`, `hung`, `metadata`, `gio-metadata`, `gio-cli`, `daemon-stopped`, `ui-thread`, `hung-mount`, `file-ops`, `volmon`, `volmon-off`, `volmon-installed`.
+
+Scheduled and manually started pipelines also run `rust:perf`: `cargo test --release --test stress_throughput -- --ignored`, the 50,000-event benchmark with its SLO asserts.
 
 ---
 

@@ -131,10 +131,12 @@ fn batch_removal_drops_every_linked_entry_5k() {
 
 /// The AGENTS.md §4 burst benchmark (50k events, wall-clock, p99 and peak-RSS SLOs).
 /// Wall-clock and RSS limits are not a correctness gate on shared or loaded machines, so
-/// it is out of the default suite (D-053 PR-F011, D-055): it moves to the P&R perf job,
-/// which runs it with `cargo test --release --test stress_throughput -- --ignored`.
+/// it is out of the default suite (D-053 PR-F011, D-055). The CI job `rust:perf` runs
+/// it, in scheduled and manually started pipelines only, with
+/// `cargo test --release --test stress_throughput -- --ignored`; a missed SLO fails
+/// that pipeline (RC-F025).
 #[test]
-#[ignore = "perf benchmark with wall-clock/RSS SLOs: P&R perf job (D-055)"]
+#[ignore = "perf benchmark with wall-clock/RSS SLOs: CI job rust:perf (D-055, RC-F025)"]
 fn test_batch_removal_and_throughput_benchmark_50k() {
     let db_path = temp_db_path();
     let _ = fs::remove_file(&db_path);
