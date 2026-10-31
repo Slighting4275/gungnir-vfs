@@ -24,14 +24,26 @@ const BPF_JEQ: u16 = 0x10;
 const BPF_K: u16 = 0x00;
 const BPF_JSET: u16 = 0x40;
 const BPF_RET: u16 = 0x06;
+const BPF_ALU: u16 = 0x04;
+const BPF_AND: u16 = 0x50;
 
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
-/// `seccomp_data.args[i]`, low 32 bits (little-endian). Every argument checked here is
-/// an int or a flag word the kernel reads as 32 bits, so the high half is irrelevant.
+/// `seccomp_data.args[i]`, low 32 bits (little-endian). Every argument checked here but
+/// one is an int or a flag word the kernel reads as 32 bits, so the high half is
+/// irrelevant; sendto's dest_addr pointer is checked on both halves ([`arg_hi`]).
 const fn arg_lo(i: u32) -> u32 {
     16 + 8 * i
 }
+
+/// `seccomp_data.args[i]`, high 32 bits: for the one pointer argument checked (sendto's
+/// dest_addr, which must be NULL), both halves matter.
+const fn arg_hi(i: u32) -> u32 {
+    20 + 8 * i
+}
+
+/// The socket type flags masked out before the type is compared (SEC-R-012).
+const SOCK_TYPE_FLAGS: u32 = (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32;
 
 /// Every namespace flag `clone` accepts (CLONE_NEWTIME is clone3/unshare only; in clone
 /// that bit is part of CSIGNAL).
@@ -65,6 +77,11 @@ enum Rule {
         vals: &'static [u32],
         errno: i32,
     },
+    /// `socket`/`socketpair`: allowed only for AF_UNIX (else EAFNOSUPPORT) with type
+    /// SOCK_STREAM once SOCK_CLOEXEC/SOCK_NONBLOCK are masked out (else EPERM).
+    UnixStream,
+    /// Allowed when the full 64-bit argument `arg` is 0 (a NULL pointer), else refused.
+    ArgZero64 { arg: u32, errno: i32 },
 }
 
 /// The ioctl requests the daemon makes, from strace of its test suites (HANDOFF-A2,
@@ -170,9 +187,7 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_getitimer as u32,
         libc::SYS_setitimer as u32,
         libc::SYS_getpid as u32,
-        libc::SYS_connect as u32,
         libc::SYS_accept as u32,
-        libc::SYS_sendto as u32,
         libc::SYS_recvfrom as u32,
         libc::SYS_sendmsg as u32,
         libc::SYS_recvmsg as u32,
@@ -305,23 +320,32 @@ fn rules() -> Vec<(u32, Rule)> {
         // clone3 passes its flags in a struct the filter cannot read: ENOSYS makes glibc
         // fall back to clone, whose flags it can (D-044 item 4).
         (libc::SYS_clone3 as u32, libc::ENOSYS),
+        // No new connections once sandboxed: the control socket is bound and the
+        // liveness check of an old socket (ipc::socket_is_live) has run before the
+        // filter goes in, and the daemon never connects anywhere afterwards, so the
+        // user's session bus or systemd manager stays out of reach (SEC-R-012).
+        (libc::SYS_connect as u32, libc::EPERM),
     ];
-    let af_unix = |nr: libc::c_long| {
-        (
-            nr as u32,
-            Rule::ArgEq {
-                arg: 0,
-                val: libc::AF_UNIX as u32,
-                errno: libc::EAFNOSUPPORT,
-            },
-        )
-    };
+    let af_unix = |nr: libc::c_long| (nr as u32, Rule::UnixStream);
     // SAFETY: getpid has no preconditions.
     let own_tgid = unsafe { libc::getpid() } as u32;
     let checked = [
-        // AF_UNIX sockets only: the control socket and its peers (D-044 item 3).
+        // AF_UNIX stream sockets only: the control socket and its peers (D-044 item 3);
+        // no datagram socket to send to journald, a notify socket or the like (SEC-R-012).
         af_unix(libc::SYS_socket),
         af_unix(libc::SYS_socketpair),
+        // send/write on a connected socket only: an addressed sendto (dest_addr, arg 4,
+        // not NULL) is refused (SEC-R-012). sendmsg stays: its msghdr is not readable
+        // by the filter, but every socket the daemon can have is a stream socket, which
+        // refuses an address in msg_name (EISCONN/EOPNOTSUPP); SCM_RIGHTS on the
+        // connected IPC socket keeps working.
+        (
+            libc::SYS_sendto as u32,
+            Rule::ArgZero64 {
+                arg: 4,
+                errno: libc::EPERM,
+            },
+        ),
         // Signals only to this process (its own tgid, read when the filter is built:
         // the sandboxed process never re-execs), e.g. raise/abort (D-044 item 7).
         (
@@ -439,6 +463,27 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
             b.push(allow);
             b
         }
+        // A = arg0; A == AF_UNIX ? next : EAFNOSUPPORT;
+        // A = arg1 & !flags; A == SOCK_STREAM ? allow : EPERM
+        Rule::UnixStream => vec![
+            load(0),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, libc::AF_UNIX as u32, 1, 0),
+            errno(libc::EAFNOSUPPORT),
+            load(1),
+            bpf_stmt(BPF_ALU | BPF_AND | BPF_K, !SOCK_TYPE_FLAGS),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SOCK_STREAM as u32, 0, 1),
+            allow,
+            errno(libc::EPERM),
+        ],
+        // lo == 0 && hi == 0 ? allow : errno
+        Rule::ArgZero64 { arg, errno: e } => vec![
+            load(arg),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3),
+            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_hi(arg)),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+            allow,
+            errno(e),
+        ],
         // A = arg; A & mask ? errno : allow
         Rule::ArgMaskClear {
             arg,
@@ -638,16 +683,48 @@ mod tests {
                 .iter()
                 .find(|(x, _)| *x == n as u32)
                 .map(|(_, r)| r.clone());
+            assert_eq!(got, Some(Rule::UnixStream), "syscall {n}");
+        }
+    }
+
+    /// SEC-R-012: AF_UNIX stream sockets only, no connect, no addressed sendto.
+    #[test]
+    fn the_filter_allows_only_unix_stream_sockets_and_no_new_connections() {
+        let f = build_filter(SeccompMode::Strict).unwrap();
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let eafno = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
+        let allow = libc::SECCOMP_RET_ALLOW;
+        let unix = libc::AF_UNIX as u64;
+        let stream = libc::SOCK_STREAM as u64;
+        let flags = u64::from(SOCK_TYPE_FLAGS);
+        for nr in [libc::SYS_socket as u32, libc::SYS_socketpair as u32] {
+            assert_eq!(decide(&f, nr, [unix, stream, 0, 0, 0, 0]), allow);
+            assert_eq!(decide(&f, nr, [unix, stream | flags, 0, 0, 0, 0]), allow);
+            for t in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET, libc::SOCK_RAW] {
+                let t = t as u64;
+                assert_eq!(decide(&f, nr, [unix, t, 0, 0, 0, 0]), eperm, "{t}");
+                assert_eq!(decide(&f, nr, [unix, t | flags, 0, 0, 0, 0]), eperm);
+            }
             assert_eq!(
-                got,
-                Some(Rule::ArgEq {
-                    arg: 0,
-                    val: libc::AF_UNIX as u32,
-                    errno: libc::EAFNOSUPPORT
-                }),
-                "syscall {n}"
+                decide(&f, nr, [libc::AF_INET as u64, stream, 0, 0, 0, 0]),
+                eafno
             );
         }
+        let connect = libc::SYS_connect as u32;
+        assert_eq!(decide(&f, connect, [3, 0x1000, 110, 0, 0, 0]), eperm);
+        let sendto = libc::SYS_sendto as u32;
+        assert_eq!(decide(&f, sendto, [3, 0x1000, 8, 0, 0, 0]), allow);
+        for dest in [0x1000u64, 1 << 32, (1 << 32) | 0x10, 0x7fff_0000_0000] {
+            assert_eq!(
+                decide(&f, sendto, [3, 0x1000, 8, 0, dest, 110]),
+                eperm,
+                "{dest:#x}"
+            );
+        }
+        assert_eq!(
+            decide(&f, libc::SYS_sendmsg as u32, [3, 0x1000, 0, 0, 0, 0]),
+            allow
+        );
     }
 
     #[test]
@@ -721,6 +798,7 @@ mod tests {
                 c if c == BPF_JMP | BPF_JEQ | BPF_K => {
                     pc += usize::from(if a == ins.k { ins.jt } else { ins.jf });
                 }
+                c if c == BPF_ALU | BPF_AND | BPF_K => a &= ins.k,
                 c if c == BPF_JMP | BPF_JSET | BPF_K => {
                     pc += usize::from(if a & ins.k != 0 { ins.jt } else { ins.jf });
                 }

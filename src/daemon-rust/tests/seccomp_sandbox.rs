@@ -214,6 +214,178 @@ fn sandboxed_sockets_are_af_unix_only() {
     }
 }
 
+/// SEC-R-012: once sandboxed, in both modes, no new connection to any AF_UNIX listener
+/// (a fixture listener bound and listening in the child: connect gets EPERM, while the
+/// same connect works unsandboxed), no datagram or seqpacket socket, and no addressed
+/// sendto; a connected stream still sends, and SCM_RIGHTS still passes an fd over it.
+#[test]
+fn sandboxed_daemon_cannot_reach_other_unix_sockets() {
+    /// An abstract-namespace address "\0gungnir-sec-r-012-<tag>-<pid>" and its length,
+    /// built without allocating (the child is forked from a threaded test process).
+    fn addr(tag: u8) -> (libc::sockaddr_un, libc::socklen_t) {
+        // SAFETY: sockaddr_un is plain data; all-zero is valid.
+        let mut a: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let mut n = 1; // sun_path[0] = 0: abstract
+        for &b in b"gungnir-sec-r-012-".iter().chain([tag, b'-'].iter()) {
+            a.sun_path[n] = b as libc::c_char;
+            n += 1;
+        }
+        let mut pid = std::process::id();
+        let mut digits = [0u8; 10];
+        let mut k = 0;
+        loop {
+            digits[k] = b'0' + (pid % 10) as u8;
+            k += 1;
+            pid /= 10;
+            if pid == 0 {
+                break;
+            }
+        }
+        for &d in digits[..k].iter().rev() {
+            a.sun_path[n] = d as libc::c_char;
+            n += 1;
+        }
+        let len = std::mem::size_of::<libc::sa_family_t>() + n;
+        (a, len as libc::socklen_t)
+    }
+    fn body() -> i32 {
+        // An abstract-namespace listener unique to this child: no file to clean up.
+        let (a, len) = addr(b's');
+        // SAFETY: raw socket calls on our own fds and a local sockaddr_un.
+        unsafe {
+            let l = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if l < 0 {
+                return 1;
+            }
+            if libc::bind(l, (&raw const a).cast(), len) != 0 || libc::listen(l, 4) != 0 {
+                return 2;
+            }
+            let c = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if c < 0 {
+                return 3;
+            }
+            let r = libc::syscall(libc::SYS_connect, c, (&raw const a), len);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 4;
+            }
+            for (i, t) in [
+                libc::SOCK_DGRAM,
+                libc::SOCK_SEQPACKET,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let r = libc::syscall(libc::SYS_socket, libc::AF_UNIX, t, 0);
+                if errno_of(r) != Some(libc::EPERM) {
+                    return 10 + i as i32;
+                }
+                let mut sv = [0i32; 2];
+                let r = libc::syscall(libc::SYS_socketpair, libc::AF_UNIX, t, 0, sv.as_mut_ptr());
+                if errno_of(r) != Some(libc::EPERM) {
+                    return 20 + i as i32;
+                }
+            }
+            let mut sv = [0i32; 2];
+            if libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            ) != 0
+            {
+                return 5;
+            }
+            let buf = *b"ping";
+            // Addressed sendto: refused, whatever the address and its high half.
+            let r = libc::syscall(
+                libc::SYS_sendto,
+                sv[0],
+                buf.as_ptr(),
+                4,
+                0,
+                (&raw const a),
+                len,
+            );
+            if errno_of(r) != Some(libc::EPERM) {
+                return 6;
+            }
+            let r = libc::syscall(libc::SYS_sendto, sv[0], buf.as_ptr(), 4, 0, 1u64 << 32, len);
+            if errno_of(r) != Some(libc::EPERM) {
+                return 7;
+            }
+            // Plain send on the connected pair works.
+            if libc::syscall(libc::SYS_sendto, sv[0], buf.as_ptr(), 4, 0, 0, 0) != 4 {
+                return 8;
+            }
+            let mut got = [0u8; 4];
+            if libc::read(sv[1], got.as_mut_ptr().cast(), 4) != 4 || got != buf {
+                return 9;
+            }
+            // SCM_RIGHTS over the connected stream (what the IPC socket does).
+            let fd = l;
+            let mut cbuf = [0u8; 64];
+            let mut iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut _,
+                iov_len: 1,
+            };
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &raw mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cbuf.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+            let cm = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*cm).cmsg_level = libc::SOL_SOCKET;
+            (*cm).cmsg_type = libc::SCM_RIGHTS;
+            (*cm).cmsg_len = libc::CMSG_LEN(4) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cm).cast::<i32>(), fd);
+            if libc::sendmsg(sv[0], &raw const msg, 0) != 1 {
+                return 30;
+            }
+            let mut rb = [0u8; 1];
+            let mut riov = libc::iovec {
+                iov_base: rb.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut rc = [0u8; 64];
+            let mut rmsg: libc::msghdr = std::mem::zeroed();
+            rmsg.msg_iov = &raw mut riov;
+            rmsg.msg_iovlen = 1;
+            rmsg.msg_control = rc.as_mut_ptr().cast();
+            rmsg.msg_controllen = rc.len() as _;
+            if libc::recvmsg(sv[1], &raw mut rmsg, 0) != 1 {
+                return 31;
+            }
+            let rcm = libc::CMSG_FIRSTHDR(&raw const rmsg);
+            if rcm.is_null() || (*rcm).cmsg_type != libc::SCM_RIGHTS {
+                return 32;
+            }
+            0
+        }
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+    // Control: unsandboxed, the same connect reaches the listener.
+    fn control() -> i32 {
+        let (a, len) = addr(b'c');
+        // SAFETY: as above.
+        unsafe {
+            let l = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            if libc::bind(l, (&raw const a).cast(), len) != 0 || libc::listen(l, 4) != 0 {
+                return 2;
+            }
+            let c = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            if libc::connect(c, (&raw const a).cast(), len) != 0 {
+                return 4;
+            }
+        }
+        0
+    }
+    assert_eq!(in_unsandboxed_child(control), 0, "control");
+}
+
 /// Once sandboxed, in both modes: clone with a namespace flag gets EPERM, clone3 gets
 /// ENOSYS, and threads still start (glibc falls back from clone3 to clone). D-044 item 4.
 #[test]
