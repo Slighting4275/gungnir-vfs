@@ -91,6 +91,30 @@ pub const NO_URING_ENV: &str = "GUNGNIR_NO_URING";
 /// Test hook (`test-hooks` builds only): sleep this many ms before every data chunk or
 /// directory entry, so tests can cancel an op mid-way.
 pub const SLOW_OPS_ENV: &str = "GUNGNIR_TEST_SLOW_OPS_MS";
+/// Test hook (`test-hooks` builds only): hold every copy at this point (`mid-copy`,
+/// `before-publish`) until it is stopped, so a test can interrupt it exactly there.
+pub const PAUSE_AT_ENV: &str = "GUNGNIR_TEST_PAUSE_AT";
+
+/// Where the [`PAUSE_AT_ENV`] test hook holds an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PausePoint {
+    /// After the first chunk of data reached the temp file.
+    MidCopy,
+    /// With the temp file complete, just before the rename that publishes it.
+    BeforePublish,
+}
+
+impl PausePoint {
+    /// The hook's value for `s`, if it names a point.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mid-copy" => Some(Self::MidCopy),
+            "before-publish" => Some(Self::BeforePublish),
+            _ => None,
+        }
+    }
+}
 
 /// Longest path accepted (`PATH_MAX` without the NUL).
 const MAX_PATH: usize = 4095;
@@ -598,6 +622,8 @@ pub struct OpsConfig {
     pub buf_size: usize,
     /// Test hook: sleep before every chunk / entry.
     pub slow: Duration,
+    /// Test hook: hold copies at this point until they are stopped.
+    pub pause_at: Option<PausePoint>,
     /// Tests: behave as if every rename and copy_file_range crossed filesystems.
     pub force_exdev: bool,
     /// Tests: skip FICLONE / copy_file_range, to exercise the read/write path.
@@ -621,6 +647,7 @@ impl Default for OpsConfig {
             cfr_chunk: 8 << 20,
             buf_size: 1 << 20,
             slow: Duration::ZERO,
+            pause_at: None,
             force_exdev: false,
             no_clone: false,
             no_cfr: false,
@@ -646,6 +673,17 @@ impl OpsConfig {
         #[cfg(not(feature = "test-hooks"))]
         if std::env::var_os(SLOW_OPS_ENV).is_some() {
             eprintln!("gungnird: {SLOW_OPS_ENV} ignored (built without the test-hooks feature)");
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(v) = std::env::var_os(PAUSE_AT_ENV) {
+            cfg.pause_at = v.to_str().and_then(PausePoint::parse);
+            eprintln!("gungnird: TEST HOOK: file ops pause at {:?}", cfg.pause_at);
+            // A reflink finishes in one call: mid-copy needs the chunked path.
+            cfg.no_clone = true;
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        if std::env::var_os(PAUSE_AT_ENV).is_some() {
+            eprintln!("gungnird: {PAUSE_AT_ENV} ignored (built without the test-hooks feature)");
         }
         cfg
     }
@@ -1418,6 +1456,26 @@ impl Exec<'_> {
         self.check()
     }
 
+    /// The pause hook: hold here, alive for the watchdog, until the op is stopped.
+    #[cfg(feature = "test-hooks")]
+    fn pause(&self, at: PausePoint) -> OpResult {
+        if self.cfg.pause_at != Some(at) {
+            return Ok(());
+        }
+        eprintln!("gungnird: TEST HOOK: op paused at {at:?}");
+        loop {
+            self.op.touch();
+            self.check()?;
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    #[allow(clippy::unused_self)]
+    fn pause(&self, _at: PausePoint) -> OpResult {
+        Ok(())
+    }
+
     fn copy(&mut self) -> OpResult {
         let src = self.op.req.src.clone();
         let dest = self.op.req.dest.clone();
@@ -1616,6 +1674,7 @@ impl Exec<'_> {
                 self.io.fsync(self.op, out.as_raw_fd())?;
             }
             self.check()?;
+            self.pause(PausePoint::BeforePublish)?;
             self.rename(pdir.as_raw_fd(), &tmp, pdir.as_raw_fd(), &leaf, overwrite)?;
             Ok(())
         })();
@@ -1779,6 +1838,9 @@ impl Exec<'_> {
         let mut off = start;
         while off < end {
             self.slow()?;
+            if off > start {
+                self.pause(PausePoint::MidCopy)?;
+            }
             let left = (end - off) as u64;
             if *cfr {
                 let want = left.min(self.cfg.cfr_chunk.max(4096) as u64) as usize;

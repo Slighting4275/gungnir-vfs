@@ -236,6 +236,48 @@ fn a_copy_running_at_the_drain_bound_is_cancelled_cleaned_and_the_exit_is_nonzer
     Ok(())
 }
 
+/// The pause hook holds a copy at each named point on both engines, with its temp file
+/// there and the destination not, and the drain bound still ends it cleanly.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_pause_hook_holds_a_copy_at_its_point_until_it_is_stopped() -> R {
+    for point in ["mid-copy", "before-publish"] {
+        for eng in engines() {
+            let d = Dir::new("pause")?;
+            let src = d.join("big");
+            data_file(&src, 16)?;
+            let out = d.join("out");
+            fs::create_dir(&out)?;
+            let mut dm = Daemon::start(
+                &d,
+                true,
+                &[
+                    (ops::PAUSE_AT_ENV, point),
+                    ("GUNGNIR_TEST_DRAIN_MS", "300"),
+                    eng,
+                ],
+            )?;
+            let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+            assert_eq!(start_copy(&mut c, &src, &out.join("dst"))?, ST_OK);
+            let t0 = Instant::now();
+            while !dm.text().contains("op paused at") {
+                assert!(t0.elapsed() < Duration::from_secs(5), "{point} {eng:?}");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(temps(&out).len(), 1, "{point} {eng:?}");
+            assert!(!out.join("dst").exists(), "{point} {eng:?}");
+            dm.signal(libc::SIGHUP);
+            let (st, _) = dm.wait_exit(Duration::from_secs(10))?;
+            let text = dm.text();
+            assert!(!st.success(), "{point} {eng:?}: exit {st}\n{text}");
+            assert_eq!(done_result(&mut c)?, Err(ops::OpError::Cancelled));
+            assert_eq!(temps(&out), Vec::<String>::new(), "{point} {eng:?}");
+            assert!(!out.join("dst").exists(), "{point} {eng:?}");
+        }
+    }
+    Ok(())
+}
+
 /// (a): an op sent during the drain is refused.
 #[cfg(feature = "test-hooks")]
 #[test]
