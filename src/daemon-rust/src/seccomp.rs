@@ -149,8 +149,7 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_getsockopt as u32,
         libc::SYS_clone as u32,
         libc::SYS_fork as u32,
-        libc::SYS_vfork as u32,
-        libc::SYS_execve as u32, // Live in-place upgrade re-exec handover
+        libc::SYS_vfork as u32, // Live in-place upgrade re-exec handover
         libc::SYS_exit as u32,
         libc::SYS_wait4 as u32,
         libc::SYS_kill as u32,
@@ -272,6 +271,9 @@ fn rules() -> Vec<(u32, Rule)> {
         // No new rings, no ring registrations once sandboxed (D-044 item 1).
         (libc::SYS_io_uring_setup as u32, libc::EPERM),
         (libc::SYS_io_uring_register as u32, libc::EPERM),
+        // No exec: a sandboxed live upgrade drains and exits instead (D-044 item 2).
+        (libc::SYS_execve as u32, libc::EPERM),
+        (libc::SYS_execveat as u32, libc::EPERM),
     ];
     let mut list: Vec<(u32, Rule)> = allowed.iter().map(|&n| (n, Rule::Allow)).collect();
     list.extend(denied.iter().map(|&(n, e)| (n, Rule::Errno(e))));
@@ -465,5 +467,17 @@ mod tests {
             Some(Rule::Errno(libc::EPERM))
         );
         assert_eq!(get(libc::SYS_io_uring_enter), Some(Rule::Allow));
+    }
+
+    #[test]
+    fn exec_is_refused() {
+        let r = rules();
+        for n in [libc::SYS_execve, libc::SYS_execveat] {
+            let got = r
+                .iter()
+                .find(|(x, _)| *x == n as u32)
+                .map(|(_, r)| r.clone());
+            assert_eq!(got, Some(Rule::Errno(libc::EPERM)), "syscall {n}");
+        }
     }
 }

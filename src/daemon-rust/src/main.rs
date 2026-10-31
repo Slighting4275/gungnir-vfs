@@ -270,6 +270,27 @@ fn run() -> Result<()> {
                 listener.cleanup();
                 break;
             }
+            ipc::ShutdownReason::LiveUpgrade(sig) if seccomp_mode != SeccompMode::Disabled => {
+                // The filter denies execve (D-044 item 2): no re-exec in place. Let running
+                // file ops finish, persist state and exit cleanly; the service manager
+                // starts the new binary (on the next connection, with socket activation).
+                eprintln!(
+                    "gungnird: signal {sig} received; live upgrade under seccomp: \
+                     draining, then exiting for the service manager to start the new binary"
+                );
+                let t0 = std::time::Instant::now();
+                while handler.is_busy() && t0.elapsed() < UPGRADE_DRAIN_MAX {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if handler.is_busy() {
+                    eprintln!("gungnird: file ops still running after {UPGRADE_DRAIN_MAX:?}");
+                }
+                if let Err(e) = db.flush_and_checkpoint() {
+                    eprintln!("gungnird: database checkpoint before upgrade exit failed: {e}");
+                }
+                listener.cleanup();
+                break;
+            }
             ipc::ShutdownReason::LiveUpgrade(sig) => {
                 eprintln!(
                     "gungnird: signal {sig} received; persisting state and performing live upgrade"
@@ -286,6 +307,9 @@ fn run() -> Result<()> {
 
     Ok(())
 }
+
+/// Longest a live upgrade under seccomp waits for running file ops before it exits.
+const UPGRADE_DRAIN_MAX: Duration = Duration::from_secs(30);
 
 fn main() -> ExitCode {
     match run() {

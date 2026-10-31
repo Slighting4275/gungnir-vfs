@@ -22,7 +22,7 @@ Gungnir's 12-milestone architecture aims at stall-free virtual filesystem operat
 | **M8** | Asynchronous File Operations Engine | **Implemented; known open issues (INT-HIGH-001, C1, PR-F008)** | Native kernel `io_uring` with POSIX fallback, reflink (`FICLONE`), sparse copying (`copy_file_range`), atomic rename, progress events & cancellation. |
 | **M9** | Trash & Recent Items Engine | **Not on main (T-005 port pending)** | `trash://` and `recent://` are not implemented on this branch. |
 | **M10** | Volume & Mount Monitor | **Experimental, opt-in; no mount change signals yet (F01b)** | `GVolumeMonitor`, `GVolume`, `GMount` from a non-blocking mountinfo parser, active only with `GIO_USE_VOLUME_MONITOR=gungnir`; mounts and volumes are listed, but no mount-added/removed signals are emitted yet. |
-| **M11** | Daemon Lifecycle Management | **Partial: shutdown is not yet graceful for in-flight ops (AUD-03, BC-HC-F06 open)** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` shutdown, which does not yet wait for or clean up in-flight file ops, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover), SQLite WAL checkpointing. |
+| **M11** | Daemon Lifecycle Management | **Partial: shutdown is not yet graceful for in-flight ops (AUD-03, BC-HC-F06 open)** | systemd socket activation (`LISTEN_FDS`/`LISTEN_PID`, fd 3 adoption), idle auto-shutdown (`--idle-timeout` / `GUNGNIR_IDLE_TIMEOUT_SEC`), race-free `signalfd` multiplexing (`SIGINT`/`SIGTERM` shutdown, which does not yet wait for or clean up in-flight file ops, `SIGHUP`/`SIGUSR1` live in-place upgrade re-exec handover; under `--seccomp`, which denies `execve`, they drain and exit cleanly and socket activation starts the new binary), SQLite WAL checkpointing. |
 | **M12** | Hardening & System Release | **In review (HC-001: seccomp hardening D-044, unit hardening AUD-01)** | Zero-dependency Linux seccomp BPF filter sandbox (`--seccomp`), systemd user units (`gungnird.service` / `gungnird.socket`; their sandboxing is under review, AUD-01), Arch Linux `PKGBUILD` packaging, wire and metadata-wire fuzz tests. The 50,000-event stress benchmark is outside the default test suite: the CI job `rust:perf` runs it (`cargo test --release --test stress_throughput -- --ignored`, SLO asserts unchanged) in scheduled and manually started pipelines only; its throughput, p99 and RSS figures are not reproduced here (tracked in T-010). |
 
 ---
@@ -95,7 +95,8 @@ GIO_USE_VFS=gungnir gio info -a 'metadata::*' file.txt
 # Run background daemon with custom socket, DB path, idle auto-shutdown, and seccomp BPF sandbox
 gungnird --socket /run/user/1000/gungnir/control.sock --db ~/.local/share/gungnir/metadata.db --idle-timeout 300 --seccomp
 
-# Live in-place upgrade without dropping incoming connections
+# Live in-place upgrade without dropping incoming connections (without --seccomp;
+# with it, the daemon drains and exits and the next connection starts the new binary)
 kill -HUP $(pgrep gungnird)
 
 # Enable systemd user socket activation

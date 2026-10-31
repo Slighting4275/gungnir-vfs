@@ -119,6 +119,42 @@ fn sandboxed_io_uring_setup_and_register_get_eperm() {
     }
 }
 
+/// Once sandboxed, no exec, in both modes (EPERM). D-044 item 2.
+#[test]
+fn sandboxed_execve_and_execveat_get_eperm() {
+    fn body() -> i32 {
+        let path = c"/bin/true".as_ptr();
+        let argv = [path, std::ptr::null()];
+        let envp: [*const libc::c_char; 1] = [std::ptr::null()];
+        // SAFETY: valid NUL-terminated path, argv and envp; on success the child would
+        // become /bin/true and exit 0, which the caller would see as a pass, so check
+        // the errno here and return 1 instead of falling through.
+        let r = unsafe { libc::syscall(libc::SYS_execve, path, argv.as_ptr(), envp.as_ptr()) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 1;
+        }
+        // SAFETY: as above, relative to the working directory.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                libc::AT_FDCWD,
+                path,
+                argv.as_ptr(),
+                envp.as_ptr(),
+                0,
+            )
+        };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 2;
+        }
+        7
+    }
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        // 7, not 0: an exec that went through would exit 0 from /bin/true.
+        assert_eq!(in_sandboxed_child(mode, body), 7, "{mode}");
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {

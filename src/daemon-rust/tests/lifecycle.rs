@@ -391,12 +391,11 @@ fn answers(sock: &Path, msg: &[u8]) -> bool {
 }
 
 /// SIGHUP re-execs the daemon in place; the new image answers on the same socket with
-/// the same pid, and exits cleanly on SIGTERM. Also under `--seccomp`, as the shipped
-/// unit runs it: the new image must start inside the inherited filter (BC-HC-F02:
-/// newfstatat was denied, SQLite could not open the database and the daemon died).
+/// the same pid, and exits cleanly on SIGTERM.
 #[test]
 fn signal_handling_live_upgrade_signal() -> R {
-    for seccomp in [false, true] {
+    {
+        let seccomp = false;
         let dir = Dir::new("upgrade")?;
         let sock = dir.0.join("upgrade.sock");
         let db = dir.0.join("meta.db");
@@ -429,6 +428,48 @@ fn signal_handling_live_upgrade_signal() -> R {
             status.success(),
             "seccomp {seccomp}: the re-execed daemon must exit cleanly on SIGTERM"
         );
+    }
+    Ok(())
+}
+
+/// D-044 item 2: the filter denies execve, so under `--seccomp` (as the shipped unit
+/// runs it) SIGHUP and SIGUSR1 do not re-exec: the daemon persists its state, removes
+/// its socket and exits 0, for the service manager to start the new binary.
+#[test]
+fn live_upgrade_under_seccomp_drains_and_exits() -> R {
+    for sig in [libc::SIGHUP, libc::SIGUSR1] {
+        let dir = Dir::new("upgrade-seccomp")?;
+        let sock = dir.0.join("upgrade.sock");
+        let db = dir.0.join("meta.db");
+        let log = dir.0.join("gungnird.log");
+        let mut child = spawn_listening(&sock, &db, &log, true, &[])?;
+        let mut client = Client::connect(&sock, Duration::from_secs(2))?;
+        assert_eq!(client.ping(b"pre-upgrade")?, b"pre-upgrade");
+        drop(client);
+        // SAFETY: a signal to our own child.
+        unsafe {
+            libc::kill(child.id() as i32, sig);
+        }
+        let t0 = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "signal {sig}: still running\n{}",
+                fs::read_to_string(&log)?
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let text = fs::read_to_string(&log)?;
+        assert!(status.success(), "signal {sig}: {status}\n{text}");
+        assert!(
+            text.contains("live upgrade under seccomp: draining"),
+            "{text}"
+        );
+        assert!(!text.contains("re-execing"), "{text}");
+        assert!(!sock.exists(), "socket left behind\n{text}");
     }
     Ok(())
 }
@@ -544,11 +585,15 @@ fn live_upgrade_after_the_binary_is_replaced() -> R {
 /// BC-HC-F02: if the live upgrade's exec fails, the daemon logs it and keeps serving
 /// on the same socket, with the same process and its database, and a later SIGTERM still
 /// shuts it down cleanly. The exec is made to fail with a test hook.
+///
+/// Without seccomp only: under `--seccomp` an upgrade never execs (see
+/// `live_upgrade_under_seccomp_drains_and_exits`).
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_failed_live_upgrade_keeps_serving() -> R {
     use gungnird::md::{Ident, Value};
-    for seccomp in [false, true] {
+    {
+        let seccomp = false;
         let dir = Dir::new("upgrade-fail")?;
         let sock = dir.0.join("upgrade.sock");
         let db = dir.0.join("meta.db");
