@@ -82,8 +82,8 @@ pub fn build(b: *std.Build) void {
     // volmon-installed: the module in a dir indexed by gio-querymodules, as installed: 0
     // Gungnir mounts with no env or GIO_USE_VFS only, one per mount point with
     // GIO_USE_VOLUME_MONITOR=gungnir (BC-HC-F01 v2, D-051).
-    const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "volmon", "volmon-off", "volmon-installed" }) |mode| {
+    const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris" };
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris", "volmon", "volmon-off", "volmon-installed" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());

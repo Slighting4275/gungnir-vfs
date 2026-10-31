@@ -750,6 +750,128 @@ fn contains(hay: [*c]const u8, needle: []const u8) bool {
 
 /// gio set / gio info through the module, then the same with the daemon stopped: the
 /// query still answers quickly, just without metadata, and set fails cleanly.
+fn writeText(dir: [*c]const u8, name: [*c]const u8, text: [*c]const u8) bool {
+    const p = c.g_build_filename(dir, name, @as([*c]const u8, null));
+    defer c.g_free(p);
+    return c.g_file_set_contents(p, text, -1, null) != 0;
+}
+
+fn countChildren(uri: [*c]const u8) ?usize {
+    const f = c.g_file_new_for_uri(uri);
+    defer c.g_object_unref(f);
+    const e = c.g_file_enumerate_children(f, "standard::*", c.G_FILE_QUERY_INFO_NONE, null, null);
+    if (e == null) return null;
+    defer c.g_object_unref(e);
+    var n: usize = 0;
+    while (c.g_file_enumerator_next_file(e, null, null)) |info| {
+        c.g_object_unref(info);
+        n += 1;
+    }
+    return n;
+}
+
+/// Milestone 9 through GIO and the gio tool. XDG_DATA_HOME was set before the daemon.
+/// Every scheme the module advertises must open at its root (BC-HC-F03, a permanent gate).
+fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
+    const data = c.g_getenv("XDG_DATA_HOME");
+    if (data == null) return "XDG_DATA_HOME is not set";
+    const trash = c.g_build_filename(data, "Trash", @as([*c]const u8, null));
+    defer c.g_free(trash);
+    const files = c.g_build_filename(trash, "files", @as([*c]const u8, null));
+    defer c.g_free(files);
+    const info = c.g_build_filename(trash, "info", @as([*c]const u8, null));
+    defer c.g_free(info);
+    if (c.g_mkdir_with_parents(files, 0o700) != 0 or c.g_mkdir_with_parents(info, 0o700) != 0)
+        return "could not create the trash";
+
+    const vfs = c.g_vfs_get_default();
+    const schemes = c.g_vfs_get_supported_uri_schemes(vfs);
+    var i: usize = 0;
+    while (schemes[i] != null) : (i += 1) {
+        const scheme = std.mem.span(schemes[i]);
+        if (std.mem.eql(u8, scheme, "file") or std.mem.eql(u8, scheme, "resource")) continue;
+        const uri = c.g_strdup_printf("%s:///", schemes[i]);
+        defer c.g_free(uri);
+        if (countChildren(uri) == null) return "an advertised scheme does not open at its root";
+    }
+
+    const restored = tmpPath(ctx.tmp_dir, "restored.txt");
+    defer c.g_free(restored);
+    defer removeFile(restored);
+    if (!writeText(files, "a.txt", "payload a") or !writeText(files, "b.txt", "payload b"))
+        return "could not write the payload";
+    const info_a = c.g_strdup_printf("[Trash Info]\nPath=%s\nDeletionDate=2026-10-31T10:00:00\n", restored);
+    defer c.g_free(info_a);
+    if (!writeText(info, "a.txt.trashinfo", info_a) or
+        !writeText(info, "b.txt.trashinfo", "[Trash Info]\nPath=/nowhere/b.txt\n"))
+        return "could not write the info";
+
+    if (countChildren("trash:///") != @as(?usize, 2)) return "trash:/// does not list two items";
+    {
+        const r = runGio(&.{ "list", "trash:///" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok or !contains(r.out, "h-a.txt") or !contains(r.out, "h-b.txt")) return "gio list trash:/// failed";
+    }
+    {
+        const r = runGio(&.{ "info", "-a", "standard::display-name,trash::orig-path", "trash:///h-a.txt" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok or !contains(r.out, "a.txt") or !contains(r.out, "restored.txt")) return "gio info on an item failed";
+    }
+    {
+        const r = runGio(&.{ "cat", "trash:///h-a.txt" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok or !contains(r.out, "payload a")) return "gio cat on an item failed";
+    }
+    {
+        const r = runGio(&.{ "remove", "trash:///h-b.txt" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok) return "gio remove on an item failed";
+    }
+    if (countChildren("trash:///") != @as(?usize, 1)) return "the removed item is still listed";
+    {
+        const r = runGio(&.{ "remove", "trash:///h-nothing" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (r.ok) return "gio remove on a missing item succeeded";
+    }
+    {
+        const src = c.g_file_new_for_uri("trash:///h-a.txt");
+        defer c.g_object_unref(src);
+        const dst = c.g_file_new_for_path(restored);
+        defer c.g_object_unref(dst);
+        var err: [*c]c.GError = null;
+        if (c.g_file_move(src, dst, c.G_FILE_COPY_NONE, null, null, null, &err) == 0) {
+            if (err != null) c.g_error_free(err);
+            return "moving an item out of the trash failed";
+        }
+    }
+    var text: [*c]u8 = null;
+    if (c.g_file_get_contents(restored, &text, null, null) == 0) return "the restored file is missing";
+    const same = c.g_strcmp0(text, "payload a") == 0;
+    c.g_free(text);
+    if (!same) return "the restored file differs";
+    if (countChildren("trash:///") != @as(?usize, 0)) return "the restored item is still listed";
+
+    const doc = tmpPath(ctx.tmp_dir, "doc.txt");
+    defer c.g_free(doc);
+    defer removeFile(doc);
+    if (!createFile(doc)) return "could not create the recent file";
+    const xbel = c.g_strdup_printf("<xbel version=\"1.0\">\n<bookmark href=\"file://%s\" added=\"x\"/>\n</xbel>\n", doc);
+    defer c.g_free(xbel);
+    if (!writeText(data, "recently-used.xbel", xbel)) return "could not write the recent list";
+    if (countChildren("recent:///") != @as(?usize, 1)) return "recent:/// does not list the file";
+    {
+        const r = runGio(&.{ "list", "recent:///" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok) return "gio list recent:/// failed";
+    }
+
+    ctx.stopDaemon();
+    const t0 = nowMs();
+    if (countChildren("trash:///") != null) return "trash:/// listed without a daemon";
+    if (nowMs() - t0 > 1000) return "no daemon took more than 1 s to report";
+    return null;
+}
+
 fn checkGioCli(ctx: *Ctx) ?[*:0]const u8 {
     const path = tmpPath(ctx.tmp_dir, "cli-file");
     defer c.g_free(path);
@@ -2020,6 +2142,15 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "ui-thread") and argc == 5) return runDaemon(argv[3], argv[4], "ui-thread", &checkUiThread);
     if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
     if (std.mem.eql(u8, mode, "file-ops") and argc == 5) return runDaemon(argv[3], argv[4], "file-ops", &checkFileOps);
+    if (std.mem.eql(u8, mode, "vfs-uris") and argc == 5) {
+        const base = privateDir(argv[3], "vfs-uris-data") orelse return fail("could not create the data directory");
+        defer c.g_free(base);
+        if (c.g_setenv("XDG_DATA_HOME", base, 1) == 0) return fail("g_setenv XDG_DATA_HOME");
+        const rc = runDaemon(argv[3], argv[4], "vfs-uris", &checkVfsUris);
+        var rm = [_][*c]u8{ @constCast("rm"), @constCast("-rf"), @constCast("--"), @constCast(base), null };
+        _ = c.g_spawn_sync(null, &rm, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, null, null);
+        return rc;
+    }
     if (std.mem.eql(u8, mode, "volmon") and argc == 4) return runVolmon(argv[3]);
     if (std.mem.eql(u8, mode, "volmon-off") and argc == 4) return runVolmonOff(argv[3]);
     return fail("unknown mode or wrong argument count");

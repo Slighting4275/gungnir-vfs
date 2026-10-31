@@ -10,6 +10,7 @@ const gmeta = @import("gmeta.zig");
 const health = @import("health.zig");
 /// Asynchronous file operations through the daemon: the GungnirFileOp type (milestone 8).
 const fileop = @import("fileop.zig");
+const vfsfile = @import("vfsfile.zig");
 /// Volume and mount monitoring (milestone 10).
 pub const volmon = @import("volmon.zig");
 
@@ -81,6 +82,7 @@ fn getFileForPath(vfs: [*c]c.GVfs, path: [*c]const u8) callconv(.c) ?*c.GFile {
 
 fn getFileForUri(vfs: [*c]c.GVfs, uri: [*c]const u8) callconv(.c) ?*c.GFile {
     _ = vfs;
+    if (vfsfile.forUri(uri)) |f| return f;
     return c.g_vfs_get_file_for_uri(c.g_vfs_get_local(), uri);
 }
 
@@ -98,6 +100,7 @@ fn getSupportedUriSchemes(vfs: [*c]c.GVfs) callconv(.c) [*c]const [*c]const c.gc
 
 fn parseName(vfs: [*c]c.GVfs, parse_name: [*c]const u8) callconv(.c) ?*c.GFile {
     _ = vfs;
+    if (vfsfile.forUri(parse_name)) |f| return f;
     return c.g_vfs_parse_name(c.g_vfs_get_local(), parse_name);
 }
 
@@ -240,6 +243,7 @@ pub export fn g_io_module_load(module: *c.GIOModule) void {
     _ = c.g_io_extension_point_implement(c.G_VFS_EXTENSION_POINT_NAME, gungnir_vfs_type, extension_name, vfs_priority);
     // GIO cannot route GLocalFile copy/move/delete through a GVfs: see fileop.zig.
     fileop.register(type_module);
+    vfsfile.register(type_module);
     // GVolumeMonitor subclass and GMount/GVolume implementations (milestone 10).
     volmon.register(type_module);
 }
@@ -276,6 +280,7 @@ test {
     _ = fileop;
     _ = volmon;
     _ = @import("mountfilter.zig");
+    _ = vfsfile;
 }
 
 test "daemon state starts as connecting" {

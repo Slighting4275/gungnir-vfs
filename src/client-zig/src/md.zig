@@ -270,6 +270,8 @@ pub const Client = struct {
     /// Gets the payload of every health event met while waiting for a reply (milestone
     /// 7); null drops them.
     on_event: ?*const fn (payload: []const u8) void = null,
+    /// The status of the last reply, for protocols with statuses beyond this module's.
+    last_status: u32 = 0,
 
     /// Send one request and wait for its reply. Returns the body (a slice of `reply`)
     /// on st_ok, else the status as an error. Replies to earlier, timed-out requests
@@ -302,6 +304,7 @@ pub const Client = struct {
                 reply.* = m;
                 var r: Reader = .{ .rest = reply.payload() };
                 const st = try r.int(u32);
+                c.last_status = st;
                 if (st != st_ok) return statusError(st);
                 return r.rest;
             }
