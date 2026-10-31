@@ -12,15 +12,23 @@ use gungnird::{
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Peak resident set of this process in KiB: VmHWM from /proc/self/status. Not
+/// getrusage's ru_maxrss: that carries across exec, so it reports whichever is bigger,
+/// the test or the cargo that started it (PR-F012). 0 if the line cannot be read, which
+/// the caller must treat as a failure rather than as a pass.
 fn get_peak_rss_kib() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    if ret == 0 {
-        let usage = unsafe { usage.assume_init() };
-        usage.ru_maxrss as u64
-    } else {
-        0
-    }
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("VmHWM:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+        })
+        .unwrap_or(0)
 }
 
 /// A fresh store dir for this test process under the repo's .build/tmp, created 0700 and
@@ -220,6 +228,7 @@ fn test_batch_removal_and_throughput_benchmark_50k() {
 
     // Measure RSS
     let peak_rss_kib = get_peak_rss_kib();
+    assert!(peak_rss_kib > 0, "VmHWM not readable");
     let peak_rss_mib = peak_rss_kib as f64 / 1024.0;
 
     println!(
