@@ -408,6 +408,101 @@ fn sandboxed_signals_only_to_self_and_no_set_id() {
     assert_eq!(in_sandboxed_child(SeccompMode::Filter, body), 0);
 }
 
+/// SEC-R-011: the filter covers every thread that exists when it is installed, not only
+/// the caller: a thread started before apply_sandbox gets EPERM for ptrace afterwards.
+#[test]
+fn the_filter_covers_threads_started_before_it() {
+    fn body() -> i32 {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            if go_rx.recv().is_err() {
+                return 1;
+            }
+            // SAFETY: an invalid request (-1): refused by the filter, else EIO.
+            let r = unsafe { libc::syscall(libc::SYS_ptrace, -1, 0, 0, 0) };
+            if errno_of(r) == Some(libc::EPERM) {
+                0
+            } else {
+                2
+            }
+        });
+        if apply_sandbox(SeccompMode::Filter).is_err() {
+            return 3;
+        }
+        if go_tx.send(()).is_err() {
+            return 4;
+        }
+        worker.join().unwrap_or(5)
+    }
+    // No filter before the body: it installs one after its worker thread exists.
+    assert_eq!(in_unsandboxed_child(body), 0);
+}
+
+/// SEC-R-011: if a thread cannot be synchronized, apply_sandbox fails (fail closed)
+/// instead of filtering only the calling thread. A thread with a filter of its own,
+/// not an ancestor of the caller's, makes TSYNC fail.
+#[test]
+fn apply_sandbox_fails_closed_when_a_thread_cannot_be_synchronized() {
+    fn body() -> i32 {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let allow = [libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            }];
+            let prog = libc::sock_fprog {
+                len: 1,
+                filter: allow.as_ptr().cast_mut(),
+            };
+            // SAFETY: a valid one-instruction allow-all program, on this thread only.
+            let ok = unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                    && libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER,
+                        0,
+                        &raw const prog,
+                    ) == 0
+            };
+            let _ = ready_tx.send(ok);
+            let _ = done_rx.recv();
+        });
+        if ready_rx.recv() != Ok(true) {
+            return 1;
+        }
+        let r = apply_sandbox(SeccompMode::Filter);
+        let _ = done_tx.send(());
+        match r {
+            Err(e) if e.to_string().contains("could not be synchronized") => 0,
+            Err(_) => 2,
+            Ok(()) => 3,
+        }
+    }
+    assert_eq!(in_unsandboxed_child(body), 0);
+}
+
+/// Run `body` in a forked child without applying any filter first.
+fn in_unsandboxed_child(body: fn() -> i32) -> i32 {
+    // SAFETY: the child runs `body` and exits.
+    unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            libc::_exit(body());
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -libc::WTERMSIG(status)
+        }
+    }
+}
+
 // ---- The daemon itself under the filter (BC-HC-F02) -------------------------
 
 mod daemon {

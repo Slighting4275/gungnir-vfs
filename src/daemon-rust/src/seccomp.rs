@@ -512,6 +512,22 @@ pub fn build_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>> {
     Ok(filter)
 }
 
+/// The outcome of `seccomp(SET_MODE_FILTER, TSYNC)`: 0 is success, a positive value the
+/// id of a thread that could not be synchronized, -1 an error (`err`). Anything but 0
+/// is an error: there is no fallback that would filter only the calling thread.
+fn tsync_result(ret: libc::c_long, err: io::Error) -> io::Result<()> {
+    match ret {
+        0 => Ok(()),
+        tid if tid > 0 => Err(io::Error::other(format!(
+            "seccomp TSYNC: thread {tid} could not be synchronized; refusing to run unfiltered threads"
+        ))),
+        _ => Err(io::Error::new(
+            err.kind(),
+            format!("seccomp TSYNC failed ({err}); no single-thread fallback"),
+        )),
+    }
+}
+
 /// Apply the seccomp BPF sandbox to the current process.
 pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
     if mode == SeccompMode::Disabled {
@@ -534,7 +550,10 @@ pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    // Attempt to apply seccomp with thread synchronization (TSYNC)
+    // Every thread of the process, at once (TSYNC): the daemon installs the filter after
+    // its workers, monitor and DB threads exist. No single-thread fallback: if any thread
+    // cannot be synchronized, or the kernel lacks TSYNC, fail closed (SEC-R-011).
+    // SAFETY: `prog` points at `filter`, which outlives the call.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -543,21 +562,7 @@ pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
             &prog as *const libc::sock_fprog,
         )
     };
-
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EINVAL) {
-            // Fallback to prctl
-            let prctl_ret =
-                unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) };
-            if prctl_ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        } else {
-            return Err(err);
-        }
-    }
-
+    tsync_result(ret, io::Error::last_os_error())?;
     Ok(())
 }
 
@@ -790,6 +795,24 @@ mod tests {
                 "syscall {n}"
             );
         }
+    }
+
+    #[test]
+    fn tsync_failure_of_any_kind_fails_closed() {
+        assert!(tsync_result(0, io::Error::from_raw_os_error(0)).is_ok());
+        // ENOSYS / EINVAL (no TSYNC) used to fall back to a filter on one thread.
+        for e in [
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EFAULT,
+            libc::ENOMEM,
+            libc::EACCES,
+        ] {
+            let r = tsync_result(-1, io::Error::from_raw_os_error(e));
+            assert!(r.is_err(), "errno {e}");
+        }
+        let r = tsync_result(4242, io::Error::from_raw_os_error(0)).unwrap_err();
+        assert!(r.to_string().contains("thread 4242"), "{r}");
     }
 
     #[test]
