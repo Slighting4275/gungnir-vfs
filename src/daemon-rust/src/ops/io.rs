@@ -378,6 +378,12 @@ pub fn prepare_sandbox_rings(n: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether rings come only from the pool: a sandboxed daemon, which cannot make new ones.
+#[must_use]
+pub fn sandbox_rings_only() -> bool {
+    POOL_ONLY.load(Ordering::SeqCst)
+}
+
 fn new_ring() -> io::Result<IoUring> {
     if POOL_ONLY.load(Ordering::SeqCst) {
         return POOL

@@ -278,6 +278,52 @@ fn the_pause_hook_holds_a_copy_at_its_point_until_it_is_stopped() -> R {
     Ok(())
 }
 
+/// A2-MGR-03: a sandboxed worker that needs a ring when the pool is empty never runs on
+/// plain syscalls: the daemon exits nonzero, and the next start sweeps the temp file and
+/// serves. Thread-engine daemons have no rings to lose and keep serving.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_empty_ring_pool_ends_a_sandboxed_daemon_rather_than_mixing_engines() -> R {
+    let d = Dir::new("ringloss")?;
+    let src = d.join("big");
+    data_file(&src, 16)?;
+    let out = d.join("out");
+    fs::create_dir(&out)?;
+    let uring = [(ops::RING_LOSS_ENV, "1"), (ops::NO_URING_ENV, "0")];
+    let mut dm = Daemon::start(&d, true, &uring)?;
+    let text = dm.text();
+    let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+    let started = start_copy(&mut c, &src, &out.join("dst"));
+    let (st, _) = dm.wait_exit(Duration::from_secs(10))?;
+    let log = dm.text();
+    if text.contains("thread engine") {
+        return Ok(()); // no io_uring here: nothing to lose
+    }
+    drop(started);
+    assert!(!st.success(), "exit {st}\n{log}");
+    assert!(log.contains("no restricted io_uring ring left"), "{log}");
+    assert!(!out.join("dst").exists());
+    drop(dm);
+    let dm = Daemon::start(&d, true, &[(ops::NO_URING_ENV, "0")])?;
+    let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+    assert_eq!(start_copy(&mut c, &src, &out.join("dst"))?, ST_OK);
+    assert_eq!(done_result(&mut c)?, Ok(()), "{}", dm.text());
+    assert_eq!(temps(&out), Vec::<String>::new());
+
+    let t = Dir::new("ringloss-threads")?;
+    let src = t.join("big");
+    data_file(&src, 1)?;
+    let dm = Daemon::start(
+        &t,
+        true,
+        &[(ops::RING_LOSS_ENV, "1"), (ops::NO_URING_ENV, "1")],
+    )?;
+    let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+    assert_eq!(start_copy(&mut c, &src, &t.join("dst"))?, ST_OK);
+    assert_eq!(done_result(&mut c)?, Ok(()), "{}", dm.text());
+    Ok(())
+}
+
 /// (a): an op sent during the drain is refused.
 #[cfg(feature = "test-hooks")]
 #[test]

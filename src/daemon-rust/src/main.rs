@@ -254,6 +254,13 @@ fn serve_daemon(
     // the thread engine, said once here (D-044 item 1), never a per-worker mix.
     if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
         let n = workers * 2 + ops::io::GRAVEYARD_MAX;
+        // An exhausted pool on demand, for the refusal path (A2-MGR-03).
+        #[cfg(feature = "test-hooks")]
+        let n = if env::var_os(ops::RING_LOSS_ENV).is_some() {
+            workers
+        } else {
+            n
+        };
         if let Err(e) = ops::io::prepare_sandbox_rings(n) {
             eprintln!(
                 "gungnird: restricted io_uring rings for the sandbox failed ({e}): \

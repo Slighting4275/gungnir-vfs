@@ -95,6 +95,24 @@ pub const SLOW_OPS_ENV: &str = "GUNGNIR_TEST_SLOW_OPS_MS";
 /// `before-publish`) until it is stopped, so a test can interrupt it exactly there.
 pub const PAUSE_AT_ENV: &str = "GUNGNIR_TEST_PAUSE_AT";
 
+/// Test hook (`test-hooks` builds only): the first worker to pick up an op loses its ring,
+/// as a worker replaced after a stuck mount does.
+pub const RING_LOSS_ENV: &str = "GUNGNIR_TEST_RING_LOSS";
+#[cfg(feature = "test-hooks")]
+static RING_LOSS: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`RING_LOSS_ENV`] takes this worker's ring now.
+fn ring_lost() -> bool {
+    #[cfg(feature = "test-hooks")]
+    {
+        RING_LOSS.swap(false, Ordering::SeqCst)
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        false
+    }
+}
+
 /// Where the [`PAUSE_AT_ENV`] test hook holds an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PausePoint {
@@ -678,6 +696,11 @@ impl OpsConfig {
             eprintln!("gungnird: {SLOW_OPS_ENV} ignored (built without the test-hooks feature)");
         }
         #[cfg(feature = "test-hooks")]
+        if std::env::var_os(RING_LOSS_ENV).is_some() {
+            eprintln!("gungnird: TEST HOOK: the first worker with an op loses its ring");
+            RING_LOSS.store(true, Ordering::SeqCst);
+        }
+        #[cfg(feature = "test-hooks")]
         if let Some(v) = std::env::var_os(PAUSE_AT_ENV) {
             cfg.pause_at = v.to_str().and_then(PausePoint::parse);
             eprintln!("gungnird: TEST HOOK: file ops pause at {:?}", cfg.pause_at);
@@ -1001,6 +1024,18 @@ impl Shared {
                     self.io_uring.fetch_add(1, Ordering::SeqCst);
                     return Box::new(u);
                 }
+                // No new ring can be made once sandboxed, and a worker on plain syscalls
+                // next to workers on rings is the mixed mode the sandbox refuses at start
+                // (D-077). Exit: the service manager restarts the daemon with a full
+                // pool, destinations are published by rename, and the temp ledger sweeps
+                // what running copies leave behind (A2-MGR-03).
+                Err(e) if io::sandbox_rings_only() => {
+                    eprintln!(
+                        "gungnird: error: no restricted io_uring ring left for a worker ({e}); \
+                         exiting for the service manager to restart with a full pool"
+                    );
+                    std::process::exit(1);
+                }
                 Err(e) => {
                     if !self.uring_failed.swap(true, Ordering::Relaxed) {
                         eprintln!("gungnird: io_uring ring for a worker failed ({e}): syscalls");
@@ -1172,7 +1207,7 @@ fn worker(sh: &Arc<Shared>) {
             }
         };
         if !op.is_finished() {
-            if !io.healthy() {
+            if !io.healthy() || ring_lost() {
                 io = sh.make_io();
             }
             op.touch();
