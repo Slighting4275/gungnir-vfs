@@ -250,9 +250,21 @@ rust:test:
   timeout: 25 minutes
   needs: ["rust:build"]
   script:
-    - cargo test --release
-    # Milestone 8: the thread-pool fallback engine, forced.
-    - GUNGNIR_NO_URING=1 cargo test --release
+    # --no-fail-fast: one failing test binary must not hide the results of the others.
+    - cargo test --release --no-fail-fast
+
+# Milestone 8: the thread-pool fallback engine, forced. Its own job, in every pipeline,
+# needing only rust:build, so an io_uring failure in rust:test never hides it (D-048,
+# RC-F022).
+rust:test-no-uring:
+  stage: test
+  extends: .rust
+  timeout: 25 minutes
+  needs: ["rust:build"]
+  variables:
+    GUNGNIR_NO_URING: "1"
+  script:
+    - cargo test --release --no-fail-fast
 
 zig:test:
   stage: test

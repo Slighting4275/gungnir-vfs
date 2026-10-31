@@ -118,7 +118,7 @@ systemctl --user enable --now gungnird.socket
 Every push and merge request executes [`.gitlab-ci.yml`](.gitlab-ci.yml) against a verified Arch Linux environment:
 - `cargo fmt --all --check` & `zig fmt --check src/client-zig`
 - `cargo clippy --release --all-targets -- -D warnings`
-- `cargo test --release`, with the io_uring engine and with `GUNGNIR_NO_URING=1` (thread engine)
+- `cargo test --release --no-fail-fast`, with the io_uring engine (`rust:test`) and, in its own job, with `GUNGNIR_NO_URING=1` (thread engine, `rust:test-no-uring`)
 - `./zb test --summary all` across all 14 integration test modes: `opt-in`, `no-opt-in`, `daemon`, `hung`, `metadata`, `gio-metadata`, `gio-cli`, `daemon-stopped`, `ui-thread`, `hung-mount`, `file-ops`, `volmon`, `volmon-off`, `volmon-installed`.
 
 Scheduled and manually started pipelines also run `rust:perf`: `cargo test --release --test stress_throughput -- --ignored`, the 50,000-event benchmark with its SLO asserts.
