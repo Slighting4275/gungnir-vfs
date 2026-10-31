@@ -7,8 +7,11 @@ pub mod md;
 pub mod mdsvc;
 pub mod ops;
 pub mod opsvc;
+pub mod recent;
 pub mod seccomp;
 pub mod store;
+pub mod trash;
+pub mod vfssvc;
 
 pub use store::open_db;
 

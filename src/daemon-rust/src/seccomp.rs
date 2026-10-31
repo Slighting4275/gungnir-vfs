@@ -255,6 +255,8 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_unlinkat as u32,
         // Copying a symlink recreates it (ops io::symlink); AUD-02.
         libc::SYS_symlinkat as u32,
+        // std::fs::rename, for the atomic rewrites of recently-used.xbel and directorysizes.
+        libc::SYS_rename as u32,
         libc::SYS_renameat as u32,
         libc::SYS_readlinkat as u32,
         libc::SYS_fchmodat as u32,

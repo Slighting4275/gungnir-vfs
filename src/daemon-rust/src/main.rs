@@ -12,6 +12,7 @@ use gungnird::{
     opsvc::{DbMeta, MonitorGate, OpsHandler},
     seccomp::{self, SeccompMode},
     store::{self, DbConfig, Store, StoreConfig},
+    vfssvc,
 };
 
 const HELP_TEXT: &str = "\
@@ -318,7 +319,13 @@ fn serve_daemon(
     // 5. Wire handlers
     let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db.clone()));
     let health: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
+    let vfs = vfssvc::Svc::new(
+        Arc::clone(&ops),
+        env::var_os("XDG_DATA_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    );
     let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
+    let handler: Arc<dyn ipc::Handler> = Arc::new(vfssvc::VfsHandler::new(handler, vfs));
 
     // Milestone 12: Apply Seccomp BPF Sandbox
     if seccomp_mode != SeccompMode::Disabled {
