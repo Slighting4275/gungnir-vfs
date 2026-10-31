@@ -36,8 +36,12 @@ pub const type_name = "GungnirVfs";
 /// module never makes it the default VFS. It is only selected via GIO_USE_VFS=gungnir.
 pub const vfs_priority: c.gint = -100;
 
-/// NULL-terminated list of extension points this module implements.
-const extension_points = [_][*c]const u8{ c.G_VFS_EXTENSION_POINT_NAME, null };
+/// NULL-terminated list of every extension point g_io_module_load implements. An
+/// installed module is loaded through giomodule.cache (gio-querymodules writes it from
+/// this list), and GIO loads a module only for the extension points the cache lists, so
+/// without gio-native-volume-monitor GIO_USE_VOLUME_MONITOR=gungnir finds no module
+/// (BC-HC-F01 v2, D-051).
+const extension_points = [_][*c]const u8{ c.G_VFS_EXTENSION_POINT_NAME, c.G_NATIVE_VOLUME_MONITOR_EXTENSION_POINT_NAME, null };
 
 // ---- GungnirVfs: dynamic GVfs subclass --------------------------------------
 
@@ -251,11 +255,12 @@ pub export fn g_io_module_query() [*c][*c]u8 {
     return c.g_strdupv(@ptrCast(@constCast(&extension_points)));
 }
 
-test "query lists gio-vfs" {
+test "query lists gio-vfs and gio-native-volume-monitor" {
     const eps = g_io_module_query();
     defer c.g_strfreev(eps);
     try std.testing.expectEqualStrings("gio-vfs", std.mem.span(eps[0]));
-    try std.testing.expect(eps[1] == null);
+    try std.testing.expectEqualStrings("gio-native-volume-monitor", std.mem.span(eps[1]));
+    try std.testing.expect(eps[2] == null);
 }
 
 test "priority stays below local (0) and gvfs (10)" {

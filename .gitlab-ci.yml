@@ -224,7 +224,7 @@ zig:build:
       cp .build/zig-out/lib/libgiogungnir.so .build/gio-querymodules/
       gio-querymodules .build/gio-querymodules
       cat .build/gio-querymodules/giomodule.cache
-      grep -qx 'libgiogungnir.so: gio-vfs' .build/gio-querymodules/giomodule.cache
+      grep -qx 'libgiogungnir.so: gio-vfs,gio-native-volume-monitor' .build/gio-querymodules/giomodule.cache
   artifacts:
     name: libgiogungnir
     paths: [.build/zig-out/lib/libgiogungnir.so]

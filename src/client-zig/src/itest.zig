@@ -19,6 +19,12 @@
 //!                                                            delete, fsync, errors, cancel,
 //!                                                            hung-mount refusal, no daemon
 //!                                                            (milestone 8; test-hooks build)
+//!   gungnir-itest <module-dir> volmon-installed <tmp-dir>   the module installed: a copy
+//!                                                            indexed with gio-querymodules;
+//!                                                            Gungnir mounts with no opt-in,
+//!                                                            GIO_USE_VFS only, and
+//!                                                            GIO_USE_VOLUME_MONITOR=gungnir
+//!                                                            (BC-HC-F01 v2, D-049, D-051)
 //! <module-dir> contains only libgiogungnir.so and GIO_EXTRA_MODULES is unset, so no
 //! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
 //! directory per run, created under <tmp-dir> (.build/tmp).
@@ -1676,17 +1682,184 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
     return 0;
 }
 
+/// The line gio-querymodules must write for the module: every extension point it
+/// implements, so an installed module is loaded for the volume monitor too.
+const cache_line = "libgiogungnir.so: gio-vfs,gio-native-volume-monitor";
+
+/// Path of gio-querymodules: PATH (Arch), else pkg-config's gio_querymodules (Debian keeps
+/// it in a libexec dir). g_free the result.
+fn findQueryModules() ?[*:0]u8 {
+    if (c.g_find_program_in_path("gio-querymodules")) |p| return @ptrCast(p);
+    var out: [*c]u8 = null;
+    var status: c_int = 0;
+    var argv = [_][*c]u8{ @constCast("pkg-config"), @constCast("--variable=gio_querymodules"), @constCast("gio-2.0"), null };
+    if (c.g_spawn_sync(null, &argv, null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL, null, null, &out, null, &status, null) == 0) return null;
+    defer c.g_free(out);
+    if (c.g_spawn_check_wait_status(status, null) == 0 or out == null) return null;
+    const p = std.mem.trim(u8, std.mem.span(out), " \t\r\n");
+    if (p.len == 0) return null;
+    const dup: [*:0]u8 = @ptrCast(c.g_strndup(p.ptr, p.len));
+    if (c.g_file_test(dup, c.G_FILE_TEST_IS_EXECUTABLE) == 0) {
+        c.g_free(dup);
+        return null;
+    }
+    return dup;
+}
+
+const Count = struct { gungnir: c_long, all: c_long, direct: c_long, distinct: c_long, registered: c_long };
+
+/// Runs `self <dir> volmon-count <variant>` and parses its COUNT line.
+fn countIn(self: [*c]u8, dir: [*:0]const u8, variant: [*:0]const u8) ?Count {
+    var argv = [_][*c]u8{ self, @constCast(dir), @constCast("volmon-count"), @constCast(variant), null };
+    var out: [*c]u8 = null;
+    var status: c_int = 0;
+    var err: [*c]c.GError = null;
+    if (c.g_spawn_sync(null, &argv, null, c.G_SPAWN_DEFAULT, null, null, &out, null, &status, &err) == 0) {
+        logError("spawn volmon-count", err);
+        return null;
+    }
+    defer c.g_free(out);
+    if (c.g_spawn_check_wait_status(status, null) == 0 or out == null) return null;
+    const text = std.mem.span(out);
+    const at = std.mem.indexOf(u8, text, "COUNT ") orelse return null;
+    const line_end = std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len;
+    var vals: [5]c_long = undefined;
+    const keys = [_][]const u8{ "gungnir", "all", "direct", "distinct", "registered" };
+    var it = std.mem.tokenizeScalar(u8, text[at + "COUNT ".len .. line_end], ' ');
+    for (keys, &vals) |k, *v| {
+        const tok = it.next() orelse return null;
+        if (tok.len <= k.len or !std.mem.startsWith(u8, tok, k) or tok[k.len] != '=') return null;
+        v.* = std.fmt.parseInt(c_long, tok[k.len + 1 ..], 10) catch return null;
+    }
+    const r: Count = .{ .gungnir = vals[0], .all = vals[1], .direct = vals[2], .distinct = vals[3], .registered = vals[4] };
+    std.debug.print("gungnir itest volmon-installed: {s}: gungnir={d} all={d} direct={d} distinct={d} registered={d}\n", .{ variant, r.gungnir, r.all, r.direct, r.distinct, r.registered });
+    return r;
+}
+
+/// Child of volmon-installed: GIO_MODULE_DIR is the indexed copy; `variant` is none
+/// (no GIO_* opt-in), vfs (GIO_USE_VFS=gungnir only) or volmon
+/// (GIO_USE_VOLUME_MONITOR=gungnir only). Prints the Gungnir mounts of
+/// g_volume_monitor_get(), all its mounts, the mounts of a GungnirVolumeMonitor made
+/// directly (one per mount point it accepts), their distinct mount roots, and whether the
+/// module's types are registered (the module was loaded).
+fn runVolmonCount(variant: []const u8) c_int {
+    c.g_unsetenv("GIO_USE_VFS");
+    if (std.mem.eql(u8, variant, "vfs")) {
+        if (c.g_setenv("GIO_USE_VFS", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VFS");
+    } else if (std.mem.eql(u8, variant, "volmon")) {
+        if (c.g_setenv("GIO_USE_VOLUME_MONITOR", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VOLUME_MONITOR");
+    } else if (!std.mem.eql(u8, variant, "none")) return fail("volmon-count: unknown variant");
+    // As an application does: the default VFS first, then the volume monitor.
+    _ = c.g_vfs_get_default();
+    const vm = c.g_volume_monitor_get();
+    defer c.g_object_unref(vm);
+    var mounts_gungnir: c_long = 0;
+    var mounts_all: c_long = 0;
+    {
+        const list = c.g_volume_monitor_get_mounts(vm);
+        defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+        var curr: ?*c.GList = list;
+        while (curr) |node| : (curr = node.*.next) {
+            mounts_all += 1;
+            const name = c.g_type_name_from_instance(@ptrCast(@alignCast(node.*.data)));
+            if (name != null and std.mem.startsWith(u8, std.mem.span(name), "Gungnir")) mounts_gungnir += 1;
+        }
+    }
+    var direct: c_long = 0;
+    var distinct: c_long = 0;
+    const vm_type = c.g_type_from_name("GungnirVolumeMonitor");
+    if (vm_type != 0) {
+        const obj = c.g_object_new(vm_type, @as(?*const u8, null)) orelse return fail("could not instantiate GungnirVolumeMonitor");
+        defer c.g_object_unref(obj);
+        const list = c.g_volume_monitor_get_mounts(@ptrCast(@alignCast(obj)));
+        defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+        const seen = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
+        defer c.g_hash_table_destroy(seen);
+        var curr: ?*c.GList = list;
+        while (curr) |node| : (curr = node.*.next) {
+            direct += 1;
+            const root = c.g_mount_get_root(@ptrCast(@alignCast(node.*.data))) orelse continue;
+            defer c.g_object_unref(root);
+            _ = c.g_hash_table_add(seen, c.g_file_get_uri(root));
+        }
+        distinct = @intCast(c.g_hash_table_size(seen));
+    }
+    c.g_print("COUNT gungnir=%ld all=%ld direct=%ld distinct=%ld registered=%ld\n", mounts_gungnir, mounts_all, direct, distinct, @as(c_long, @intFromBool(vm_type != 0)));
+    return 0;
+}
+
+/// volmon-installed (BC-HC-F01 v2, D-049, D-051): the module as a package installs it, in
+/// a module dir indexed by gio-querymodules, so GIO loads it through giomodule.cache, not
+/// by scanning the dir. With no env and with GIO_USE_VFS=gungnir only, no Gungnir mount
+/// appears; with GIO_USE_VOLUME_MONITOR=gungnir the default monitor lists exactly one
+/// mount per mount point the Gungnir monitor accepts (N > 0, no duplicates).
+fn runVolmonInstalled(self: [*c]u8, module_dir: [*c]u8, tmp_arg: [*c]u8) c_int {
+    const dir = privateDir(tmp_arg, "volmon-installed") orelse return fail("cannot create a private directory");
+    defer c.g_free(dir);
+    const src = tmpPath(@ptrCast(module_dir), "libgiogungnir.so");
+    defer c.g_free(src);
+    const dst = tmpPath(dir, "libgiogungnir.so");
+    defer c.g_free(dst);
+    const cache = tmpPath(dir, "giomodule.cache");
+    defer c.g_free(cache);
+    defer {
+        removeFile(dst);
+        removeFile(cache);
+        _ = linux.rmdir(dir);
+    }
+    {
+        var data: [*c]u8 = null;
+        var len: c.gsize = 0;
+        if (c.g_file_get_contents(src, &data, &len, null) == 0) return fail("cannot read the built module");
+        defer c.g_free(data);
+        if (c.g_file_set_contents(dst, data, @intCast(len), null) == 0) return fail("cannot copy the module");
+    }
+    {
+        const qm = findQueryModules() orelse return fail("gio-querymodules not found (PATH, pkg-config gio_querymodules)");
+        defer c.g_free(qm);
+        var argv = [_][*c]u8{ qm, dir, null };
+        var status: c_int = 0;
+        if (c.g_spawn_sync(null, &argv, null, c.G_SPAWN_DEFAULT, null, null, null, null, &status, null) == 0 or
+            c.g_spawn_check_wait_status(status, null) == 0) return fail("gio-querymodules failed");
+    }
+    {
+        var data: [*c]u8 = null;
+        if (c.g_file_get_contents(cache, &data, null, null) == 0) return fail("gio-querymodules wrote no giomodule.cache");
+        defer c.g_free(data);
+        std.debug.print("gungnir itest volmon-installed: giomodule.cache: {s}", .{data});
+        const text = std.mem.trimEnd(u8, std.mem.span(data), "\n");
+        if (!std.mem.eql(u8, text, cache_line)) return fail("giomodule.cache does not map the module to gio-vfs and gio-native-volume-monitor");
+    }
+    const none = countIn(self, dir, "none") orelse return fail("volmon-count none failed");
+    const vfs = countIn(self, dir, "vfs") orelse return fail("volmon-count vfs failed");
+    const vol = countIn(self, dir, "volmon") orelse return fail("volmon-count volmon failed");
+    if (none.gungnir != 0) return fail("installed module, no env: g_volume_monitor_get() lists Gungnir mounts");
+    if (vfs.gungnir != 0) return fail("installed module, GIO_USE_VFS=gungnir only: g_volume_monitor_get() lists Gungnir mounts");
+    if (vol.registered != 1) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: the module was not loaded");
+    if (vol.direct <= 0) return fail("the Gungnir monitor accepts no mount point at all");
+    if (vol.distinct != vol.direct) return fail("the Gungnir monitor lists a mount point twice");
+    if (vol.gungnir != vol.direct) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: Gungnir mounts != mount points");
+    if (vol.all != vol.gungnir) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: other monitors' mounts too");
+    return 0;
+}
+
 pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (argc < 3) return fail("usage: gungnir-itest <module-dir> <mode> [args]");
     const mode = std.mem.span(argv[2]);
 
     if (c.g_setenv("GIO_MODULE_DIR", argv[1], 1) == 0) return fail("g_setenv GIO_MODULE_DIR");
+    // A volmon-installed child gets its indexed dir as argv[1], so this is the right dir.
     // GIO also scans every dir in GIO_EXTRA_MODULES; an inherited value (Flatpak, Nix,
     // custom sessions) could load gvfs's GDaemonVfs (priority 10) and break no-opt-in.
     c.g_unsetenv("GIO_EXTRA_MODULES");
     // Only the volmon mode opts in to the volume monitor; an inherited value must not.
     c.g_unsetenv("GIO_USE_VOLUME_MONITOR");
 
+    if (std.mem.eql(u8, mode, "volmon-count") and argc == 4) return runVolmonCount(std.mem.span(argv[3]));
+    if (std.mem.eql(u8, mode, "volmon-installed") and argc == 4) {
+        c.g_unsetenv("GIO_USE_VFS");
+        return runVolmonInstalled(argv[0], argv[1], argv[3]);
+    }
     if (std.mem.eql(u8, mode, "no-opt-in")) {
         if (argc != 3) return fail("usage: no-opt-in takes no arguments");
         c.g_unsetenv("GIO_USE_VFS");
