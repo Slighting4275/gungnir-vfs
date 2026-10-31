@@ -76,8 +76,11 @@ pub fn build(b: *std.Build) void {
     // hung-mount: gungnird with a fake hung mount; the module learns it from the health
     // events and fails GIO calls under it within 100 ms (milestone 7).
     // file-ops: the GungnirFileOp type against gungnird (milestone 8).
+    // volmon: the volume monitor with GIO_USE_VOLUME_MONITOR=gungnir (milestone 10).
+    // volmon-off: without it the monitor is never active (D-004, BC-HC-F01); no-opt-in
+    // checks the same without GIO_USE_VFS.
     const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "volmon" }) |mode| {
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "volmon", "volmon-off" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());

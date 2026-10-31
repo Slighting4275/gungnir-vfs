@@ -360,8 +360,17 @@ pub const GungnirVolumeMonitorClass = extern struct {
     parent_class: c.GNativeVolumeMonitorClass,
 };
 
+/// Environment variable and value that select this monitor (D-004: opt-in only).
+pub const opt_in_env = "GIO_USE_VOLUME_MONITOR";
+pub const opt_in_value = "gungnir";
+
+/// D-004: the monitor is never active unless the user names it. GIO already prefers
+/// GUnixVolumeMonitor (priority 0) over this one (-100) on the native extension point;
+/// answering "unsupported" without GIO_USE_VOLUME_MONITOR=gungnir keeps it off even if
+/// some caller enumerates the extension point itself (BC-HC-F01).
 fn monitorIsSupported() callconv(.c) c.gboolean {
-    return 1;
+    const v = c.g_getenv(opt_in_env) orelse return 0;
+    return @intFromBool(std.mem.eql(u8, std.mem.span(v), opt_in_value));
 }
 
 fn monitorGetConnectedDrives(monitor: [*c]c.GVolumeMonitor) callconv(.c) [*c]c.GList {
@@ -573,8 +582,11 @@ pub fn register(module: *c.GTypeModule) void {
 
     volume_monitor_type = c.g_type_module_register_type(module, c.g_native_volume_monitor_get_type(), monitor_type_name, &monitor_type_info, 0);
     if (volume_monitor_type != 0) {
-        _ = c.g_io_extension_point_implement(c.G_NATIVE_VOLUME_MONITOR_EXTENSION_POINT_NAME, volume_monitor_type, "gungnir", -100);
-        _ = c.g_io_extension_point_implement(c.G_VOLUME_MONITOR_EXTENSION_POINT_NAME, volume_monitor_type, "gungnir", -100);
+        // Native extension point only, below GUnixVolumeMonitor: GIO picks it only for
+        // GIO_USE_VOLUME_MONITOR=gungnir. Never G_VOLUME_MONITOR_EXTENSION_POINT_NAME:
+        // GUnionVolumeMonitor adds every supported monitor there to every GIO process,
+        // so the module would be live without any opt-in (D-004, BC-HC-F01).
+        _ = c.g_io_extension_point_implement(c.G_NATIVE_VOLUME_MONITOR_EXTENSION_POINT_NAME, volume_monitor_type, opt_in_value, -100);
     } else {
         c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir: failed to register %s", monitor_type_name.ptr);
     }

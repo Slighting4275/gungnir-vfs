@@ -1581,9 +1581,67 @@ fn runMissing(tmp_arg: [*c]u8) c_int {
     return 0;
 }
 
-fn runVolmon(tmp_arg: [*c]u8) c_int {
+/// Mounts plus volumes of `vm` that are Gungnir objects (GungnirMount, GungnirVolume).
+fn gungnirObjects(vm: *c.GVolumeMonitor) usize {
+    var n: usize = 0;
+    for ([_][*c]c.GList{ c.g_volume_monitor_get_mounts(vm), c.g_volume_monitor_get_volumes(vm) }) |list| {
+        defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+        var curr: ?*c.GList = list;
+        while (curr) |node| : (curr = node.*.next) {
+            const name = c.g_type_name_from_instance(@ptrCast(@alignCast(node.*.data)));
+            if (name != null and std.mem.startsWith(u8, std.mem.span(name), "Gungnir")) n += 1;
+        }
+    }
+    return n;
+}
+
+/// D-004 / BC-HC-F01: without GIO_USE_VOLUME_MONITOR=gungnir the module's volume monitor
+/// is never active: registered only on the native extension point at -100 (never on the
+/// one GUnionVolumeMonitor adds to every process), unsupported, and g_volume_monitor_get()
+/// shows no Gungnir mount or volume. Call after the modules are loaded.
+fn checkVolmonOff() ?[*:0]const u8 {
+    if (c.g_getenv("GIO_USE_VOLUME_MONITOR") != null) return "GIO_USE_VOLUME_MONITOR is set";
+    const union_ep = c.g_io_extension_point_lookup(c.G_VOLUME_MONITOR_EXTENSION_POINT_NAME);
+    if (union_ep != null and c.g_io_extension_point_get_extension_by_name(union_ep, "gungnir") != null)
+        return "the volume monitor is registered on the union (every process) extension point";
+    const native_ep = c.g_io_extension_point_lookup(c.G_NATIVE_VOLUME_MONITOR_EXTENSION_POINT_NAME);
+    const ext = c.g_io_extension_point_get_extension_by_name(native_ep, "gungnir") orelse
+        return "the volume monitor is not registered on the native extension point";
+    if (c.g_io_extension_get_priority(ext) != -100) return "the native volume monitor priority is not -100";
+    const klass: *c.GVolumeMonitorClass = @ptrCast(@alignCast(c.g_io_extension_ref_class(ext)));
+    defer c.g_type_class_unref(klass);
+    if (klass.is_supported.?() != 0) return "the volume monitor says it is supported without the opt-in";
+    const vm = c.g_volume_monitor_get();
+    defer c.g_object_unref(vm);
+    if (gungnirObjects(vm) != 0) return "g_volume_monitor_get() lists Gungnir mounts or volumes without the opt-in";
+    return null;
+}
+
+/// volmon-off: the VFS opted in (GIO_USE_VFS=gungnir), the volume monitor not.
+fn runVolmonOff(tmp_arg: [*c]u8) c_int {
     _ = tmp_arg;
     if (checkGungnirFast()) |what| return fail(what);
+    if (checkVolmonOff()) |what| return fail(what);
+    return 0;
+}
+
+/// volmon: GIO_USE_VOLUME_MONITOR=gungnir makes it the native monitor of
+/// g_volume_monitor_get(), and the type works on its own.
+fn runVolmon(tmp_arg: [*c]u8) c_int {
+    _ = tmp_arg;
+    if (c.g_setenv("GIO_USE_VOLUME_MONITOR", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VOLUME_MONITOR");
+    if (checkGungnirFast()) |what| return fail(what);
+    {
+        const native_ep = c.g_io_extension_point_lookup(c.G_NATIVE_VOLUME_MONITOR_EXTENSION_POINT_NAME);
+        const ext = c.g_io_extension_point_get_extension_by_name(native_ep, "gungnir") orelse
+            return fail("the volume monitor is not registered on the native extension point");
+        const klass: *c.GVolumeMonitorClass = @ptrCast(@alignCast(c.g_io_extension_ref_class(ext)));
+        defer c.g_type_class_unref(klass);
+        if (klass.is_supported.?() == 0) return fail("the volume monitor is unsupported with GIO_USE_VOLUME_MONITOR=gungnir");
+        const dvm = c.g_volume_monitor_get();
+        defer c.g_object_unref(dvm);
+        if (gungnirObjects(dvm) == 0) return fail("g_volume_monitor_get() lists no Gungnir mount with GIO_USE_VOLUME_MONITOR=gungnir");
+    }
     const vm_type = c.g_type_from_name("GungnirVolumeMonitor");
     if (vm_type == 0) return fail("GungnirVolumeMonitor type is not registered");
     const vm_obj = c.g_object_new(vm_type, @as(?*const u8, null));
@@ -1626,11 +1684,15 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     // GIO also scans every dir in GIO_EXTRA_MODULES; an inherited value (Flatpak, Nix,
     // custom sessions) could load gvfs's GDaemonVfs (priority 10) and break no-opt-in.
     c.g_unsetenv("GIO_EXTRA_MODULES");
+    // Only the volmon mode opts in to the volume monitor; an inherited value must not.
+    c.g_unsetenv("GIO_USE_VOLUME_MONITOR");
 
     if (std.mem.eql(u8, mode, "no-opt-in")) {
         if (argc != 3) return fail("usage: no-opt-in takes no arguments");
         c.g_unsetenv("GIO_USE_VFS");
         if (checkVfs("GLocalVfs")) |what| return fail(what);
+        c.g_unsetenv("GIO_USE_VOLUME_MONITOR");
+        if (checkVolmonOff()) |what| return fail(what);
         return 0;
     }
     if (c.g_setenv("GIO_USE_VFS", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VFS");
@@ -1645,5 +1707,6 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
     if (std.mem.eql(u8, mode, "file-ops") and argc == 5) return runDaemon(argv[3], argv[4], "file-ops", &checkFileOps);
     if (std.mem.eql(u8, mode, "volmon") and argc == 4) return runVolmon(argv[3]);
+    if (std.mem.eql(u8, mode, "volmon-off") and argc == 4) return runVolmonOff(argv[3]);
     return fail("unknown mode or wrong argument count");
 }
