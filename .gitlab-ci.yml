@@ -103,9 +103,14 @@ default:
     - *private-tmp
     - *pacman
     - |
+      # Three attempts, then fail the job here (RC-F023), not later on a missing tool.
       for attempt in 1 2 3; do
         if pacman -Syuu --noconfirm --needed rust gcc pkgconf; then
           break
+        fi
+        if [ "$attempt" = 3 ]; then
+          echo "pacman install failed 3 times" >&2
+          exit 1
         fi
         echo "pacman install attempt $attempt failed; retrying in 5s..." >&2
         sleep 5
@@ -123,9 +128,14 @@ default:
     - *private-tmp
     - *pacman
     - |
+      # Three attempts, then fail the job here (RC-F023), not later on a missing tool.
       for attempt in 1 2 3; do
         if pacman -Syuu --noconfirm --needed rust gcc glib2 pkgconf binutils minisign jq curl xz tar; then
           break
+        fi
+        if [ "$attempt" = 3 ]; then
+          echo "pacman install failed 3 times" >&2
+          exit 1
         fi
         echo "pacman install attempt $attempt failed; retrying in 5s..." >&2
         sleep 5
