@@ -39,7 +39,7 @@ Gungnir's 12-milestone architecture aims at stall-free virtual filesystem operat
 ## Key Design Principles
 
 - **Zero-Copy IPC & Futex Signaling**: Client and daemon communicate through sealed `memfd` shared memory rings. Process-shared futexes (`FUTEX_WAIT` / `FUTEX_WAKE`) eliminate CPU spin and latency. D-Bus is completely excluded from the data plane.
-- **Persistent Inode-Resilient Metadata**: Stored in SQLite in WAL mode. Rows are uniquely keyed by filesystem UUID, subvolume ID, inode number, and generation number—metadata follows file renames and moves seamlessly and survives inode recycling via birth-time (`btime`) checks.
+- **Persistent Inode-Resilient Metadata**: Stored in SQLite in WAL mode. Rows are uniquely keyed by filesystem UUID, subvolume ID, inode number, and generation number. Metadata follows renames and moves within one filesystem; a move to another filesystem loses it. It survives inode recycling via birth-time (`btime`) checks.
 - **Fail-Fast Mount Health Protection**: A dedicated sacrificial thread monitor probes network (NFS, SMB/CIFS, 9P, Ceph) and FUSE mounts. Mounts exceeding deadlines or exhibiting kernel stalls are marked suspect; subsequent requests are rejected immediately with `SuspectMount` before any syscall touches them.
 - **High-Performance Async File Operations**: Direct `io_uring` queues execute file copies, moves, and deletions with zero main-thread overhead. Transparently uses Btrfs/XFS reflink (`FICLONE`), sparse extent skipping (`SEEK_DATA` / `SEEK_HOLE`), and atomic temporary file swapping.
 - **Strict Host Security**: Build and test outputs are confined to `.build/` to honor hardened `noexec` `/tmp` environments. Zero personal data or host credentials in code or commits.
