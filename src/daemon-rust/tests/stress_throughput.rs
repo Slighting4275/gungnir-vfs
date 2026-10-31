@@ -23,14 +23,118 @@ fn get_peak_rss_kib() -> u64 {
     }
 }
 
+/// A fresh store dir for this test process under the repo's .build/tmp, created 0700 and
+/// set to exactly 0700 whatever the umask: with umask 0000 a plain create_dir_all made it
+/// 0777, and the store (rightly) refuses a group/world-writable directory.
 fn temp_db_path() -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(".build/tmp/stress-bench");
-    fs::create_dir_all(&dir).unwrap();
-    dir.join(format!("stress_{id}_{}.db", std::process::id()))
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.build/tmp")
+        .join(format!("stress-bench-{}", std::process::id()));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    dir.join(format!("stress_{id}.db"))
 }
 
+fn remove_db(db_path: &std::path::Path) {
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+    if let Some(dir) = db_path.parent() {
+        let _ = fs::remove_dir(dir); // only once empty: the other test may still use it
+    }
+}
+
+fn ident(i: usize) -> Ident {
+    Ident {
+        fs_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+        subvol_id: 0,
+        inode_num: (100_000 + i) as u64,
+        generation: 1,
+        btime_sec: 0,
+        btime_nsec: 0,
+    }
+}
+
+/// Correctness only (default suite, no wall-clock or RSS limits): seed 5,000 linked
+/// entries, update half of them, then remove them through `removed_paths` in batches;
+/// every entry is gone afterwards and the counts add up.
 #[test]
+fn batch_removal_drops_every_linked_entry_5k() {
+    const N: usize = 5_000;
+    const BATCH: usize = 500;
+    let db_path = temp_db_path();
+    let mut store = Store::open(&db_path, StoreConfig::default()).expect("open store");
+    let paths: Vec<(Vec<u8>, bool)> = (0..N)
+        .map(|i| (format!("/bench/dir/file_{i}.txt").into_bytes(), false))
+        .collect();
+    for (i, (p, _)) in paths.iter().enumerate() {
+        store
+            .set_linked(
+                &ident(i),
+                "metadata::tag",
+                b"\x01important",
+                Some((p.as_slice(), 1)),
+            )
+            .expect("seed");
+    }
+    for (i, (p, _)) in paths.iter().enumerate().step_by(2) {
+        store
+            .set_linked(
+                &ident(i),
+                "metadata::viewed",
+                b"\x01recent",
+                Some((p.as_slice(), 1)),
+            )
+            .expect("update");
+    }
+    for i in [0, 1, N / 2, N - 1] {
+        assert!(
+            store
+                .get(&ident(i), "metadata::tag")
+                .expect("get")
+                .is_some(),
+            "entry {i} seeded"
+        );
+    }
+    let mut dropped = 0;
+    for chunk in paths.chunks(BATCH) {
+        dropped += store.removed_paths(chunk).expect("batch removal");
+    }
+    assert!(
+        dropped as usize >= N,
+        "dropped {dropped} of {N} linked entries"
+    );
+    for i in 0..N {
+        assert!(
+            store
+                .get(&ident(i), "metadata::tag")
+                .expect("get")
+                .is_none()
+                && store
+                    .get(&ident(i), "metadata::viewed")
+                    .expect("get")
+                    .is_none(),
+            "entry {i} survived its path's removal"
+        );
+    }
+    // Removing them again finds nothing.
+    assert_eq!(store.removed_paths(&paths[..BATCH]).expect("again"), 0);
+    drop(store);
+    remove_db(&db_path);
+}
+
+/// The AGENTS.md §4 burst benchmark (50k events, wall-clock, p99 and peak-RSS SLOs).
+/// Wall-clock and RSS limits are not a correctness gate on shared or loaded machines, so
+/// it is out of the default suite (D-053 PR-F011, D-055): it moves to the P&R perf job,
+/// which runs it with `cargo test --release --test stress_throughput -- --ignored`.
+#[test]
+#[ignore = "perf benchmark with wall-clock/RSS SLOs: P&R perf job (D-055)"]
 fn test_batch_removal_and_throughput_benchmark_50k() {
     let db_path = temp_db_path();
     let _ = fs::remove_file(&db_path);
@@ -140,7 +244,6 @@ fn test_batch_removal_and_throughput_benchmark_50k() {
         peak_rss_mib
     );
 
-    let _ = fs::remove_file(&db_path);
-    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
-    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+    drop(store);
+    remove_db(&db_path);
 }
