@@ -209,14 +209,50 @@ fn run() -> Result<()> {
     monitor.set_sink(Arc::downgrade(&sink));
 
     // 4. File operations (milestone 8)
-    let (engine, why) = ops::choose_engine(env::var_os(ops::NO_URING_ENV).as_deref());
+    let seccomp_mode = opts
+        .seccomp
+        .or_else(seccomp_from_env)
+        .unwrap_or(SeccompMode::Disabled);
+    let (mut engine, why) = ops::choose_engine(env::var_os(ops::NO_URING_ENV).as_deref());
+    let ops_cfg = OpsConfig::from_env();
+    let workers = ops_cfg.workers.max(1);
+    // The filter refuses io_uring_setup. Every worker ring, the first workers' included,
+    // is created and restricted here, before Ops::start spawns them: a worker creating
+    // its own ring raced the filter install and fell back to syscalls (BC-A2-F01).
+    // Twice the workers covers replacements of stuck ones; GRAVEYARD_MAX more cover the
+    // rings still waiting for the kernel. If the rings cannot be made, every worker uses
+    // the thread engine, said once here (D-044 item 1), never a per-worker mix.
+    if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
+        let n = workers * 2 + ops::io::GRAVEYARD_MAX;
+        if let Err(e) = ops::io::prepare_sandbox_rings(n) {
+            eprintln!(
+                "gungnird: restricted io_uring rings for the sandbox failed ({e}): \
+                 thread engine for every worker"
+            );
+            engine = ops::io::EngineKind::Threads;
+        }
+    }
     eprintln!("gungnird: file ops engine: {engine:?} ({why})");
     let ops = Arc::new(Ops::start(
-        OpsConfig::from_env(),
+        ops_cfg,
         engine,
         Arc::new(MonitorGate::new(Arc::clone(&monitor))),
         Arc::new(DbMeta::new(Arc::clone(&resolver), db.clone())),
     )?);
+    if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
+        // Every first worker has its ring before the filter goes in; a worker on plain
+        // syscalls under a uring engine would be a silent fallback: refuse to start.
+        let (made, uring) = ops.wait_workers_ready(workers, Duration::from_secs(5));
+        if made < workers || uring < workers {
+            let msg = format!(
+                "only {uring} of {workers} file op workers on restricted io_uring rings \
+                 ({made} started); refusing to start sandboxed"
+            );
+            eprintln!("gungnird: error: {msg}");
+            return Err(Error::Io(std::io::Error::other(msg)));
+        }
+        eprintln!("gungnird: {uring} of {workers} file op workers on restricted io_uring rings");
+    }
 
     // 5. Wire handlers
     let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db.clone()));
@@ -224,19 +260,7 @@ fn run() -> Result<()> {
     let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
 
     // Milestone 12: Apply Seccomp BPF Sandbox
-    let seccomp_mode = opts
-        .seccomp
-        .or_else(seccomp_from_env)
-        .unwrap_or(SeccompMode::Disabled);
     if seccomp_mode != SeccompMode::Disabled {
-        // The filter refuses io_uring_setup: workers started later (replacing a stuck
-        // one) take a ring created and restricted now, or use plain syscalls.
-        if engine == ops::io::EngineKind::Uring {
-            let n = OpsConfig::from_env().workers.max(1) + ops::io::GRAVEYARD_MAX;
-            if let Err(e) = ops::io::prepare_sandbox_rings(n) {
-                eprintln!("gungnird: io_uring rings for later workers failed ({e}): syscalls");
-            }
-        }
         eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
         seccomp::apply_sandbox(seccomp_mode)?;
     }

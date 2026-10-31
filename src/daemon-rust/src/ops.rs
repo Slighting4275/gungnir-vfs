@@ -49,7 +49,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -686,6 +686,10 @@ struct Shared {
     next_id: AtomicU64,
     suspects: Mutex<Vec<(PathBuf, Instant)>>,
     uring_failed: AtomicBool,
+    /// Workers that have built their engine, and how many of those got an io_uring ring
+    /// (BC-A2-F01: a sandboxed daemon checks that every first worker did).
+    io_made: AtomicUsize,
+    io_uring: AtomicUsize,
 }
 
 /// The file-operation service: queue, workers and watchdog.
@@ -722,6 +726,8 @@ impl Ops {
             next_id: AtomicU64::new(1),
             suspects: Mutex::new(Vec::new()),
             uring_failed: AtomicBool::new(false),
+            io_made: AtomicUsize::new(0),
+            io_uring: AtomicUsize::new(0),
         });
         for _ in 0..workers {
             spawn_worker(&sh)?;
@@ -736,6 +742,20 @@ impl Ops {
     #[must_use]
     pub fn engine(&self) -> EngineKind {
         self.sh.engine
+    }
+
+    /// Wait (at most `max`) until `n` workers have built their engine; returns how many
+    /// have, and how many of those run on an io_uring ring.
+    #[must_use]
+    pub fn wait_workers_ready(&self, n: usize, max: Duration) -> (usize, usize) {
+        let t0 = Instant::now();
+        loop {
+            let made = self.sh.io_made.load(Ordering::SeqCst);
+            if made >= n || t0.elapsed() >= max {
+                return (made, self.sh.io_uring.load(Ordering::SeqCst));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[must_use]
@@ -859,9 +879,18 @@ impl Shared {
     }
 
     fn make_io(&self) -> Box<dyn Io> {
+        let io = self.make_io_inner();
+        self.io_made.fetch_add(1, Ordering::SeqCst);
+        io
+    }
+
+    fn make_io_inner(&self) -> Box<dyn Io> {
         if self.engine == EngineKind::Uring {
             match UringIo::new(self.cfg.buf_size) {
-                Ok(u) => return Box::new(u),
+                Ok(u) => {
+                    self.io_uring.fetch_add(1, Ordering::SeqCst);
+                    return Box::new(u);
+                }
                 Err(e) => {
                     if !self.uring_failed.swap(true, Ordering::Relaxed) {
                         eprintln!("gungnird: io_uring ring for a worker failed ({e}): syscalls");

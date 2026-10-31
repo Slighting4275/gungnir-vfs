@@ -779,6 +779,20 @@ mod daemon {
             let log = d.log_text();
             assert!(log.contains("file ops engine: Uring"), "{what}\n{log}");
             assert!(!log.contains("failed ("), "{what}\n{log}");
+            // Every first worker took a restricted ring before the filter went in, none
+            // fell back to syscalls (BC-A2-F01).
+            let counted = log
+                .lines()
+                .find_map(|l| {
+                    let l = l.strip_suffix(" file op workers on restricted io_uring rings")?;
+                    let (on, of) = l.strip_prefix("gungnird: ")?.split_once(" of ")?;
+                    Some((on.parse::<usize>().ok()?, of.parse::<usize>().ok()?))
+                })
+                .ok_or_else(|| format!("{what}: no worker count in the log\n{log}"))?;
+            assert!(
+                counted.0 == counted.1 && counted.0 >= 1,
+                "{what}: workers on restricted rings {counted:?}\n{log}"
+            );
         }
         drop(c);
         assert!(d.alive()?, "{what}: the daemon died\n{}", d.log_text());
