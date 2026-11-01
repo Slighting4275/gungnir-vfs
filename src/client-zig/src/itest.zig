@@ -773,6 +773,11 @@ fn countChildren(uri: [*c]const u8) ?usize {
 
 /// Milestone 9 through GIO and the gio tool. XDG_DATA_HOME was set before the daemon.
 /// Every scheme the module advertises must open at its root (BC-HC-F03, a permanent gate).
+fn hasIcons(i: *c.GFileInfo) bool {
+    return c.g_file_info_has_attribute(i, "standard::icon") != 0 and
+        c.g_file_info_has_attribute(i, "standard::symbolic-icon") != 0;
+}
+
 const Seen = struct {
     last: c.GFileMonitorEvent = 0,
     hits: u32 = 0,
@@ -956,6 +961,27 @@ fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
         if (!r.ok) return "gio list recent:/// failed";
     }
 
+    {
+        // File managers read the icon without asking whether it is there, on the root
+        // and on every entry a listing gives them.
+        const root = c.g_file_new_for_uri("trash:///");
+        defer c.g_object_unref(root);
+        const q = c.g_file_query_info(root, "standard::*", c.G_FILE_QUERY_INFO_NONE, null, null) orelse return "could not query the root";
+        defer c.g_object_unref(q);
+        if (!hasIcons(q)) return "the root has no icon";
+        const e = c.g_file_enumerate_children(root, "standard::*,thumbnail::*", c.G_FILE_QUERY_INFO_NONE, null, null);
+        if (e == null) return "could not list the root";
+        defer c.g_object_unref(e);
+        while (true) {
+            const row = c.g_file_enumerator_next_file(e, null, null) orelse break;
+            defer c.g_object_unref(row);
+            if (!hasIcons(row)) return "a listed item has no icon";
+            // Neither a path nor "failed": a file manager retries such an item for ever.
+            if (c.g_file_info_get_attribute_boolean(row, "thumbnail::failed") == 0 and
+                c.g_file_info_get_attribute_byte_string(row, "thumbnail::path") == null)
+                return "a listed item says nothing about its thumbnail";
+        }
+    }
     {
         // Inside a trashed folder: browse, read and copy out, but change nothing.
         const dir = c.g_build_filename(files, "tree", @as([*c]const u8, null));

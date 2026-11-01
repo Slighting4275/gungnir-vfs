@@ -340,17 +340,22 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
 
     if (r.kind == kind_dir) {
         c.g_file_info_set_content_type(info, "inode/directory");
+        setIcons(info, "inode/directory");
     } else {
         const guess = c.g_content_type_guess(show_raw, null, 0, null);
         defer c.g_free(guess);
         c.g_file_info_set_content_type(info, guess);
+        setIcons(info, guess);
     }
     if (r.target.len != 0) {
         const tz = dupz(r.target);
         defer c.g_free(tz);
         const uri = c.g_filename_to_uri(tz, null, null);
         defer c.g_free(uri);
-        if (uri != null) c.g_file_info_set_attribute_string(info, "standard::target-uri", uri);
+        if (uri != null) {
+            c.g_file_info_set_attribute_string(info, "standard::target-uri", uri);
+            setThumbnail(info, uri);
+        }
     }
     if (scheme == scheme_trash) {
         const o = dupz(r.orig);
@@ -441,6 +446,14 @@ fn rootInfo(scheme: u8, count: c.guint) ?*c.GFileInfo {
     c.g_file_info_set_display_name(info, if (scheme == scheme_recent) "Recent" else "Trash");
     c.g_file_info_set_file_type(info, c.G_FILE_TYPE_DIRECTORY);
     c.g_file_info_set_content_type(info, "inode/directory");
+    const name: [*c]const u8 = if (scheme == scheme_recent) "document-open-recent" else "user-trash";
+    const sym: [*c]const u8 = if (scheme == scheme_recent) "document-open-recent-symbolic" else "user-trash-symbolic";
+    const icon = c.g_themed_icon_new(name);
+    defer c.g_object_unref(icon);
+    const symbolic = c.g_themed_icon_new(sym);
+    defer c.g_object_unref(symbolic);
+    c.g_file_info_set_icon(info, icon);
+    c.g_file_info_set_symbolic_icon(info, symbolic);
     c.g_file_info_set_size(info, 0);
     c.g_file_info_set_is_hidden(info, 0);
     c.g_file_info_set_attribute_boolean(info, "standard::is-backup", 0);
@@ -449,6 +462,35 @@ fn rootInfo(scheme: u8, count: c.guint) ?*c.GFileInfo {
     c.g_file_info_set_attribute_boolean(info, "access::can-delete", 0);
     if (scheme == scheme_trash) c.g_file_info_set_attribute_uint32(info, "trash::item-count", count);
     return info;
+}
+
+/// File managers read these unconditionally, and GLib logs a critical for each that is absent.
+fn setIcons(info: *c.GFileInfo, content_type: [*c]const u8) void {
+    const icon = c.g_content_type_get_icon(content_type);
+    defer c.g_object_unref(icon);
+    const symbolic = c.g_content_type_get_symbolic_icon(content_type);
+    defer c.g_object_unref(symbolic);
+    c.g_file_info_set_icon(info, icon);
+    c.g_file_info_set_symbolic_icon(info, symbolic);
+}
+
+/// The file's thumbnail from the shared cache, keyed by the URI of the file itself. With
+/// none, say so: a file manager would otherwise try to make one for a `trash:` URI, get
+/// nowhere, reload the item and try again, several times a second, for ever.
+fn setThumbnail(info: *c.GFileInfo, uri: [*c]const u8) void {
+    const sum = c.g_compute_checksum_for_string(c.G_CHECKSUM_MD5, uri, -1);
+    defer c.g_free(sum);
+    const name = c.g_strconcat(sum, ".png", @as([*c]const u8, null));
+    defer c.g_free(name);
+    for ([_][*c]const u8{ "x-large", "large", "normal" }) |size| {
+        const path = c.g_build_filename(c.g_get_user_cache_dir(), "thumbnails", size, name, @as([*c]const u8, null));
+        defer c.g_free(path);
+        if (c.g_file_test(path, c.G_FILE_TEST_IS_REGULAR) != 0) {
+            c.g_file_info_set_attribute_byte_string(info, "thumbnail::path", path);
+            return;
+        }
+    }
+    c.g_file_info_set_attribute_boolean(info, "thumbnail::failed", 1);
 }
 
 /// One item's info, as a new reference. Asked for by name: the daemon looks at this one
