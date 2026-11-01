@@ -1,14 +1,16 @@
 //! `trash:///` and `recent:///` as GFiles (milestone 9), served by gungnird
 //! (`src/daemon-rust/src/vfssvc.rs` is the other half of the protocol).
 //!
-//! A `GungnirFile` is the root of a scheme or one item in it. Every call opens its own
+//! A `GungnirFile` is the root of a scheme, one item in it, or an entry inside a trashed
+//! folder (`<item>/<path>`, read-only: the trash only has records of whole items). Every call opens its own
 //! connection, so a long empty or delete never holds the shared metadata link, and every
 //! wait is bounded. These are GIO's blocking calls, made on the caller's thread: file
 //! managers run them on worker threads. A daemon that is not there gives
 //! `G_IO_ERROR_NOT_SUPPORTED`, never a hang.
 //!
-//! Known limits: no change monitoring (a view of the trash does not refresh by itself),
-//! and the folders inside a trashed folder are not browsable through `trash:///`.
+//! A monitor on a root polls a cheap change stamp from the daemon on its own thread and
+//! emits what changed. An item is read through a stream whose every call has a deadline
+//! on a worker thread, so a mount that hangs under a read costs that thread, not the caller.
 
 const std = @import("std");
 const health = @import("health.zig");
@@ -19,6 +21,9 @@ const md = @import("md.zig");
 const msg_list: u32 = 40;
 const msg_delete: u32 = 41;
 const msg_restore: u32 = 42;
+const msg_stat: u32 = 45;
+const msg_children: u32 = 46;
+const msg_stamp: u32 = 47;
 
 const scheme_trash: u8 = 0;
 const scheme_recent: u8 = 1;
@@ -67,6 +72,8 @@ const GungnirEnumClass = extern struct {
 
 var file_type: c.GType = 0;
 var enum_type: c.GType = 0;
+var monitor_type: c.GType = 0;
+var stream_type: c.GType = 0;
 
 fn asSelf(f: ?*c.GFile) *GungnirFile {
     return @ptrCast(@alignCast(f));
@@ -112,7 +119,12 @@ pub fn forUri(uri: [*c]const u8) ?*c.GFile {
         return newFile(scheme, none);
     }
     defer c.g_free(z);
-    return newFile(scheme, z);
+    // `trash:///h-dir/` is the folder: children are built on the name, one slash apart.
+    const clean = std.mem.trimEnd(u8, std.mem.span(z), "/");
+    if (clean.len == 0) return newFile(scheme, null);
+    const name = dupz(clean);
+    defer c.g_free(name);
+    return newFile(scheme, name);
 }
 
 // ---- talking to the daemon --------------------------------------------------------
@@ -282,13 +294,16 @@ fn setCommon(info: *c.GFileInfo) void {
 
 fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
     const info = c.g_file_info_new() orelse return null;
-    const name = dupz(r.name);
+    // Inside a folder the name is the last part: g_file_get_child builds the rest.
+    const inner = std.mem.indexOfScalar(u8, r.name, '/') != null;
+    const name = dupz(lastComponent(r.name));
     defer c.g_free(name);
     c.g_file_info_set_name(info, name);
 
     // What the user sees: the original name; for a degraded item, the entry's.
     const shown = dupz(blk: {
         if (r.orig.len != 0) break :blk lastComponent(r.orig);
+        if (inner) break :blk lastComponent(r.name);
         if (std.mem.indexOfScalar(u8, r.name, '-')) |at| break :blk r.name[at + 1 ..];
         break :blk r.name;
     });
@@ -314,6 +329,7 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
     c.g_file_info_set_attribute_uint64(info, "time::modified", @intCast(@max(r.mtime, 0)));
     c.g_file_info_set_attribute_boolean(info, "access::can-delete", 1);
     setCommon(info);
+    if (inner) c.g_file_info_set_attribute_boolean(info, "access::can-delete", 0);
     if (r.kind == kind_symlink) {
         c.g_file_info_set_is_symlink(info, 1);
         // g_file_copy with NOFOLLOW recreates the link from this, instead of reading it.
@@ -354,17 +370,38 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
 /// Every item of `scheme` as GFileInfos, in a new array owning them.
 /// Everything listed; `partial` says it may not be everything there is.
 fn fetch(scheme: u8, partial: ?*bool, err: [*c][*c]c.GError) ?*c.GPtrArray {
+    return fetchFrom(scheme, null, partial, err);
+}
+
+/// A page of a root's list, or of the folder `dir` inside the trash.
+fn pageRequest(buf: []u8, scheme: u8, dir: ?[]const u8, cursor: u32) ?struct { kind: u32, len: usize } {
+    if (dir) |d| {
+        if (d.len + 6 > buf.len) return null;
+        std.mem.writeInt(u32, buf[0..4], cursor, .little);
+        std.mem.writeInt(u16, buf[4..6], @intCast(d.len), .little);
+        @memcpy(buf[6 .. 6 + d.len], d);
+        return .{ .kind = msg_children, .len = 6 + d.len };
+    }
+    buf[0] = scheme;
+    std.mem.writeInt(u32, buf[1..5], cursor, .little);
+    return .{ .kind = msg_list, .len = 5 };
+}
+
+fn fetchFrom(scheme: u8, dir: ?[]const u8, partial: ?*bool, err: [*c][*c]c.GError) ?*c.GPtrArray {
     var link: Link = undefined;
     if (!link.open(list_timeout_ms, err)) return null;
     defer link.close();
     const out: *c.GPtrArray = c.g_ptr_array_new_with_free_func(&c.g_object_unref) orelse return null;
     var cursor: u32 = 0;
     while (true) {
-        var req: [5]u8 = undefined;
-        req[0] = scheme;
-        std.mem.writeInt(u32, req[1..5], cursor, .little);
+        var req: [ipc.payload_max]u8 = undefined;
+        const r0 = pageRequest(&req, scheme, dir, cursor) orelse {
+            setError(err, c.G_IO_ERROR_NOT_FOUND, "no such item");
+            _ = c.g_ptr_array_free(out, 1);
+            return null;
+        };
         var reply: ipc.Msg = undefined;
-        const body = requestRetry(&link, msg_list, &req, &reply) catch |e| {
+        const body = requestRetry(&link, r0.kind, req[0..r0.len], &reply) catch |e| {
             failure(&link.client, &reply, e, err);
             _ = c.g_ptr_array_free(out, 1);
             return null;
@@ -414,20 +451,36 @@ fn rootInfo(scheme: u8, count: c.guint) ?*c.GFileInfo {
     return info;
 }
 
-/// One item's info, as a new reference.
+/// One item's info, as a new reference. Asked for by name: the daemon looks at this one
+/// entry, whatever the size of the trash.
 fn findInfo(self: *GungnirFile, err: [*c][*c]c.GError) ?*c.GFileInfo {
-    const all = fetch(self.scheme, null, err) orelse return null;
-    defer _ = c.g_ptr_array_free(all, 1);
-    var i: c.guint = 0;
-    while (i < all.*.len) : (i += 1) {
-        const info: *c.GFileInfo = @ptrCast(@alignCast(all.*.pdata[i]));
-        if (c.g_strcmp0(c.g_file_info_get_name(info), self.name) == 0) {
-            _ = c.g_object_ref(info);
-            return info;
-        }
+    const name = std.mem.span(self.name);
+    var req: [ipc.payload_max]u8 = undefined;
+    if (name.len + 3 > req.len) {
+        setError(err, c.G_IO_ERROR_NOT_FOUND, "no such item");
+        return null;
     }
-    setError(err, c.G_IO_ERROR_NOT_FOUND, "no such item");
-    return null;
+    req[0] = self.scheme;
+    std.mem.writeInt(u16, req[1..3], @intCast(name.len), .little);
+    @memcpy(req[3 .. 3 + name.len], name);
+    var link: Link = undefined;
+    if (!link.open(list_timeout_ms, err)) return null;
+    defer link.close();
+    var reply: ipc.Msg = undefined;
+    const body = requestRetry(&link, msg_stat, req[0 .. 3 + name.len], &reply) catch |e| {
+        failure(&link.client, &reply, e, err);
+        return null;
+    };
+    if (body.len < 7) {
+        setError(err, c.G_IO_ERROR_FAILED, "bad reply from gungnird");
+        return null;
+    }
+    var p: Parser = .{ .rest = body[7..] };
+    const row = p.row() orelse {
+        setError(err, c.G_IO_ERROR_FAILED, "bad reply from gungnird");
+        return null;
+    };
+    return infoFor(self.scheme, &row);
 }
 
 // ---- GFile -------------------------------------------------------------------------
@@ -477,26 +530,40 @@ fn fileGetPath(f: ?*c.GFile) callconv(.c) [*c]u8 {
 fn fileUri(f: ?*c.GFile) callconv(.c) [*c]u8 {
     const s = asSelf(f);
     if (s.name == null) return c.g_strconcat(schemeName(s.scheme), ":///", @as([*c]const u8, null));
-    const esc = c.g_uri_escape_string(s.name, null, 1);
+    // A leading slash marks a name that failed unescaping: it must not read as a path.
+    const keep: [*c]const u8 = if (s.name[0] == '/') null else "/";
+    const esc = c.g_uri_escape_string(s.name, keep, 1);
     defer c.g_free(esc);
     return c.g_strconcat(schemeName(s.scheme), ":///", esc, @as([*c]const u8, null));
 }
 
 fn fileParent(f: ?*c.GFile) callconv(.c) ?*c.GFile {
     const s = asSelf(f);
-    return if (s.name != null) newFile(s.scheme, null) else null;
+    if (s.name == null) return null;
+    const n = std.mem.span(s.name);
+    const at = std.mem.lastIndexOfScalar(u8, n, '/') orelse return newFile(s.scheme, null);
+    if (at == 0) return newFile(s.scheme, null); // a name that failed unescaping
+    const up = dupz(n[0..at]);
+    defer c.g_free(up);
+    return newFile(s.scheme, up);
 }
 
 fn filePrefixMatches(prefix: ?*c.GFile, f: ?*c.GFile) callconv(.c) c.gboolean {
     if (!isOurs(f)) return 0;
     const p = asSelf(prefix);
     const s = asSelf(f);
-    return @intFromBool(p.scheme == s.scheme and p.name == null and s.name != null);
+    if (p.scheme != s.scheme or s.name == null) return 0;
+    if (p.name == null) return 1;
+    const n = std.mem.span(s.name);
+    const q = std.mem.span(p.name);
+    return @intFromBool(n.len > q.len + 1 and n[q.len] == '/' and std.mem.startsWith(u8, n, q));
 }
 
 fn fileRelative(parent: ?*c.GFile, d: ?*c.GFile) callconv(.c) [*c]u8 {
     if (filePrefixMatches(parent, d) == 0) return null;
-    return c.g_strdup(asSelf(d).name);
+    const p = asSelf(parent);
+    const n = std.mem.span(asSelf(d).name);
+    return c.g_strdup(if (p.name == null) n.ptr else n[c.strlen(p.name) + 1 ..].ptr);
 }
 
 fn fileResolve(f: ?*c.GFile, rel: [*c]const u8) callconv(.c) ?*c.GFile {
@@ -504,8 +571,8 @@ fn fileResolve(f: ?*c.GFile, rel: [*c]const u8) callconv(.c) ?*c.GFile {
     const r = std.mem.trim(u8, std.mem.span(rel), "/");
     if (r.len == 0 or std.mem.eql(u8, r, ".")) return newFile(s.scheme, s.name);
     if (s.name != null) {
-        // No browsing inside an item, but a child must never alias it: a name with a
-        // slash is no item, so every use of this file answers not-found.
+        // A child must never alias its item: a name with a slash is read-only, and only
+        // ever means what is really there.
         const rz = dupz(r);
         defer c.g_free(rz);
         const child = c.g_strconcat(s.name, "/", rz, @as([*c]const u8, null));
@@ -535,12 +602,12 @@ fn fileEnumerate(
     _ = flags;
     _ = cancellable;
     const s = asSelf(f);
-    if (s.name != null) {
-        setError(err, c.G_IO_ERROR_NOT_DIRECTORY, "folders inside the trash cannot be browsed");
+    if (s.name != null and s.scheme != scheme_trash) {
+        setError(err, c.G_IO_ERROR_NOT_DIRECTORY, "this item is no folder");
         return null;
     }
     var partial = false;
-    const infos = fetch(s.scheme, &partial, err) orelse return null;
+    const infos = fetchFrom(s.scheme, if (s.name != null) std.mem.span(s.name) else null, &partial, err) orelse return null;
     const raw = c.g_object_new(enum_type, "container", f, @as([*c]const u8, null));
     if (raw == null) {
         _ = c.g_ptr_array_free(infos, 1);
@@ -695,7 +762,28 @@ fn targetBlocked(t: *c.GFile, err: [*c][*c]c.GError) bool {
 fn fileRead(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) [*c]c.GFileInputStream {
     const t = targetFile(asSelf(f), err) orelse return null;
     defer c.g_object_unref(t);
-    return readBounded(t, cancellable, err);
+    retryUnclosed();
+    // The place comes first: once a file is open, giving up on it means a close, and on a
+    // hung FUSE mount a close can block for ever.
+    if (streams_running.fetchAdd(1, .acq_rel) >= streams_running_max) {
+        _ = streams_running.fetchSub(1, .acq_rel);
+        setError(err, c.G_IO_ERROR_BUSY, "too many open files here are stuck");
+        return null;
+    }
+    const inner = readBounded(t, cancellable, err);
+    if (inner == null) {
+        _ = streams_running.fetchSub(1, .acq_rel);
+        return null;
+    }
+    return boundedStream(inner, err);
+}
+
+/// Inside a trashed folder: nothing there has a record of its own to act on.
+fn inside(s: *GungnirFile, err: [*c][*c]c.GError) bool {
+    const n = std.mem.span(s.name);
+    if (n.len == 0 or n[0] == '/' or std.mem.indexOfScalar(u8, n, '/') == null) return false;
+    setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "only a whole item can be changed; restore the folder first");
+    return true;
 }
 
 fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) c.gboolean {
@@ -704,6 +792,7 @@ fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GErr
         setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "the root cannot be deleted");
         return 0;
     }
+    if (inside(s, err)) return 0;
     const name = std.mem.span(s.name);
     var req: [ipc.payload_max]u8 = undefined;
     if (name.len + 3 > req.len) {
@@ -742,6 +831,7 @@ fn fileMove(
         setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "only a move out of the trash, without overwriting");
         return 0;
     }
+    if (inside(s, err)) return 0;
     const path = c.g_file_get_path(dest);
     if (path == null) {
         setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "the destination is not a local file");
@@ -773,6 +863,650 @@ fn fileMove(
     return 1;
 }
 
+// ---- a stream whose every call has a deadline ---------------------------------------
+
+/// Reads and seeks stuck past this fail, and the stream with them. A mount that hangs
+/// under an open file blocks in the kernel, where no cancel reaches.
+const stream_timeout_us = 30 * std.time.us_per_s;
+const stream_chunk = 1 << 20;
+var streams_running: std.atomic.Value(u32) = .init(0);
+const streams_running_max = 32;
+
+const StreamOp = enum(c_int) { none, read, seek, info, close, exit };
+
+/// Shared by a stream and its worker. Two owners; the worker's buffer outlives a caller
+/// that gave up on it.
+const StreamIo = struct {
+    refs: std.atomic.Value(u32) = .init(2),
+    inner: [*c]c.GFileInputStream,
+    lock: c.GMutex = undefined,
+    cond: c.GCond = undefined,
+    op: StreamOp = .none,
+    done: bool = false,
+    /// A call gave up: the worker is stuck, or will find this and leave.
+    dead: bool = false,
+    closed: bool = false,
+    buf: [*c]u8,
+    count: usize = 0,
+    offset: i64 = 0,
+    whence: c.GSeekType = c.G_SEEK_SET,
+    attrs: [*c]u8 = null,
+    cancellable: [*c]c.GCancellable = null,
+    got: isize = 0,
+    info: ?*c.GFileInfo = null,
+    err: [*c]c.GError = null,
+
+    fn unref(j: *StreamIo) void {
+        if (j.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (j.err != null) c.g_error_free(j.err);
+        if (j.info != null) c.g_object_unref(j.info);
+        if (j.cancellable != null) c.g_object_unref(j.cancellable);
+        c.g_free(j.attrs);
+        c.g_free(j.buf);
+        c.g_mutex_clear(&j.lock);
+        c.g_cond_clear(&j.cond);
+        c.g_free(j);
+    }
+};
+
+const GungnirStream = extern struct {
+    parent: c.GFileInputStream,
+    io: ?*anyopaque,
+    pos: i64,
+    timeout_us: i64,
+    /// What the file behind it can do: asked once, before any worker exists.
+    seekable: c.gboolean,
+};
+
+const GungnirStreamClass = extern struct {
+    parent_class: c.GFileInputStreamClass,
+};
+
+fn streamWorker(data: c.gpointer) callconv(.c) c.gpointer {
+    const j: *StreamIo = @ptrCast(@alignCast(data));
+    const seekable: *c.GSeekable = @ptrCast(@alignCast(j.inner));
+    const input: *c.GInputStream = @ptrCast(@alignCast(j.inner));
+    c.g_mutex_lock(&j.lock);
+    while (true) {
+        while (j.op == .none and !j.dead) c.g_cond_wait(&j.cond, &j.lock);
+        if (j.dead or j.op == .exit) break;
+        const op = j.op;
+        const k = j.cancellable;
+        c.g_mutex_unlock(&j.lock);
+        var e: [*c]c.GError = null;
+        var got: isize = 0;
+        var info: ?*c.GFileInfo = null;
+        switch (op) {
+            .read => got = c.g_input_stream_read(input, j.buf, j.count, k, &e),
+            .seek => got = c.g_seekable_seek(seekable, j.offset, j.whence, k, &e),
+            .info => info = c.g_file_input_stream_query_info(j.inner, j.attrs, k, &e),
+            .close => got = c.g_input_stream_close(input, k, &e),
+            else => {},
+        }
+        c.g_mutex_lock(&j.lock);
+        j.got = got;
+        j.info = info;
+        j.err = e;
+        j.done = true;
+        j.op = .none;
+        c.g_cond_signal(&j.cond);
+        if (op == .close) break;
+    }
+    c.g_mutex_unlock(&j.lock);
+    c.g_object_unref(j.inner);
+    _ = streams_running.fetchSub(1, .acq_rel);
+    j.unref();
+    return null;
+}
+
+/// Run one call on the worker. False: it failed or timed out; `err` says so. On true the
+/// results are in `j`, and the caller may read them until its next call.
+fn streamCall(s: *GungnirStream, op: StreamOp, k: [*c]c.GCancellable, err: [*c][*c]c.GError, setup: anytype) bool {
+    const j: *StreamIo = @ptrCast(@alignCast(s.io orelse {
+        setError(err, c.G_IO_ERROR_CLOSED, "the stream is closed");
+        return false;
+    }));
+    c.g_mutex_lock(&j.lock);
+    defer c.g_mutex_unlock(&j.lock);
+    if (j.dead or j.closed) {
+        setError(err, c.G_IO_ERROR_TIMED_OUT, "the file stopped answering");
+        return false;
+    }
+    if (j.cancellable != null) c.g_object_unref(j.cancellable);
+    j.cancellable = if (k != null) @ptrCast(@alignCast(c.g_object_ref(k))) else null;
+    if (j.err != null) {
+        c.g_error_free(j.err);
+        j.err = null;
+    }
+    if (j.info != null) {
+        c.g_object_unref(j.info);
+        j.info = null;
+    }
+    setup.apply(j);
+    j.done = false;
+    j.op = op;
+    c.g_cond_signal(&j.cond);
+    const deadline = c.g_get_monotonic_time() + s.timeout_us;
+    while (!j.done) {
+        // In slices: a cancel gets an answer even while the kernel does not.
+        const slice = @min(deadline, c.g_get_monotonic_time() + 100 * std.time.us_per_ms);
+        _ = c.g_cond_wait_until(&j.cond, &j.lock, slice);
+        if (j.done) break;
+        if (k != null and c.g_cancellable_is_cancelled(k) != 0) {
+            j.dead = true;
+            c.g_cond_signal(&j.cond);
+            setError(err, c.G_IO_ERROR_CANCELLED, "cancelled");
+            return false;
+        }
+        if (c.g_get_monotonic_time() >= deadline) {
+            j.dead = true;
+            c.g_cond_signal(&j.cond);
+            setError(err, c.G_IO_ERROR_TIMED_OUT, "the file stopped answering");
+            return false;
+        }
+    }
+    if (j.err != null) {
+        if (err != null) {
+            err.* = j.err;
+            j.err = null;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn streamRead(i: [*c]c.GInputStream, buffer: ?*anyopaque, count: usize, k: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) isize {
+    const s: *GungnirStream = @ptrCast(@alignCast(i));
+    const n = @min(count, stream_chunk);
+    if (!streamCall(s, .read, k, err, struct {
+        n: usize,
+        fn apply(a: @This(), j: *StreamIo) void {
+            j.count = a.n;
+        }
+    }{ .n = n })) return -1;
+    const j: *StreamIo = @ptrCast(@alignCast(s.io));
+    const got = j.got;
+    if (got > 0) {
+        @memcpy(@as([*]u8, @ptrCast(buffer))[0..@intCast(got)], j.buf[0..@intCast(got)]);
+        s.pos += got;
+    }
+    return got;
+}
+
+fn streamTell(f: [*c]c.GFileInputStream) callconv(.c) c.goffset {
+    const s: *GungnirStream = @ptrCast(@alignCast(f));
+    return s.pos;
+}
+
+fn streamCanSeek(f: [*c]c.GFileInputStream) callconv(.c) c.gboolean {
+    const s: *GungnirStream = @ptrCast(@alignCast(f));
+    return s.seekable;
+}
+
+fn streamSeek(f: [*c]c.GFileInputStream, offset: c.goffset, whence: c.GSeekType, k: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) c.gboolean {
+    const s: *GungnirStream = @ptrCast(@alignCast(f));
+    const Set = struct {
+        off: i64,
+        w: c.GSeekType,
+        fn apply(a: @This(), j: *StreamIo) void {
+            j.offset = a.off;
+            j.whence = a.w;
+        }
+    };
+    if (!streamCall(s, .seek, k, err, Set{ .off = offset, .w = whence })) return 0;
+    const j: *StreamIo = @ptrCast(@alignCast(s.io));
+    if (j.got == 0) return 0;
+    // Where it landed: the file's end is only known to the file.
+    const seekable: *c.GSeekable = @ptrCast(@alignCast(j.inner));
+    s.pos = c.g_seekable_tell(seekable);
+    return 1;
+}
+
+fn streamQueryInfo(f: [*c]c.GFileInputStream, attrs: [*c]const u8, k: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) ?*c.GFileInfo {
+    const s: *GungnirStream = @ptrCast(@alignCast(f));
+    const Set = struct {
+        a: [*c]const u8,
+        fn apply(x: @This(), j: *StreamIo) void {
+            c.g_free(j.attrs);
+            j.attrs = c.g_strdup(x.a);
+        }
+    };
+    if (!streamCall(s, .info, k, err, Set{ .a = attrs })) return null;
+    const j: *StreamIo = @ptrCast(@alignCast(s.io));
+    const info = j.info;
+    j.info = null;
+    return info;
+}
+
+const NoSetup = struct {
+    fn apply(_: @This(), _: *StreamIo) void {}
+};
+
+fn streamClose(i: [*c]c.GInputStream, k: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) c.gboolean {
+    const s: *GungnirStream = @ptrCast(@alignCast(i));
+    const io = s.io orelse return 1;
+    const j: *StreamIo = @ptrCast(@alignCast(io));
+    c.g_mutex_lock(&j.lock);
+    const dead = j.dead;
+    c.g_mutex_unlock(&j.lock);
+    // Stuck: the worker closes what it holds, whenever the kernel lets it go.
+    var ok = true;
+    if (!dead) ok = streamCall(s, .close, k, err, NoSetup{});
+    if (ok and !dead) {
+        c.g_mutex_lock(&j.lock);
+        j.closed = true;
+        c.g_mutex_unlock(&j.lock);
+    }
+    return @intFromBool(ok or dead);
+}
+
+/// Dropped without a close: GInputStream's own dispose would close, and wait. Let the
+/// worker do that instead, whenever the file lets it.
+fn streamDispose(obj: [*c]c.GObject) callconv(.c) void {
+    const s: *GungnirStream = @ptrCast(@alignCast(obj));
+    if (s.io) |io| {
+        const j: *StreamIo = @ptrCast(@alignCast(io));
+        c.g_mutex_lock(&j.lock);
+        if (j.op == .none and !j.dead and !j.closed) j.op = .exit;
+        j.dead = true;
+        c.g_cond_signal(&j.cond);
+        c.g_mutex_unlock(&j.lock);
+        j.unref();
+        s.io = null;
+    }
+    const parent: *c.GObjectClass = @ptrCast(@alignCast(c.g_type_class_peek_parent(c.g_type_class_peek(stream_type))));
+    if (parent.dispose) |d| d(obj);
+}
+
+fn streamClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
+    _ = class_data;
+    const k: *GungnirStreamClass = @ptrCast(@alignCast(g_class));
+    k.parent_class.tell = &streamTell;
+    k.parent_class.can_seek = &streamCanSeek;
+    k.parent_class.seek = &streamSeek;
+    k.parent_class.query_info = &streamQueryInfo;
+    k.parent_class.parent_class.read_fn = &streamRead;
+    k.parent_class.parent_class.close_fn = &streamClose;
+    const o: *c.GObjectClass = @ptrCast(@alignCast(g_class));
+    o.dispose = &streamDispose;
+}
+
+/// Opened files with no worker to close them, each still holding its place. A plain stream
+/// would have no deadline, and closing one here could block the caller for ever.
+var unclosed_lock: c.GMutex = std.mem.zeroes(c.GMutex);
+var unclosed: ?*c.GPtrArray = null;
+
+fn closeUnclosed(data: c.gpointer) callconv(.c) c.gpointer {
+    _ = data;
+    while (true) {
+        c.g_mutex_lock(&unclosed_lock);
+        const list = unclosed;
+        const f: ?*c.GObject = if (list != null and list.?.*.len != 0)
+            @ptrCast(@alignCast(c.g_ptr_array_steal_index_fast(list, list.?.*.len - 1)))
+        else
+            null;
+        c.g_mutex_unlock(&unclosed_lock);
+        const obj = f orelse return null;
+        c.g_object_unref(obj);
+        _ = streams_running.fetchSub(1, .acq_rel);
+    }
+}
+
+/// Another try at closing those: thread creation failing is usually passing.
+fn retryUnclosed() void {
+    c.g_mutex_lock(&unclosed_lock);
+    const any = unclosed != null and unclosed.?.*.len != 0;
+    c.g_mutex_unlock(&unclosed_lock);
+    if (!any) return;
+    const th = c.g_thread_try_new("gungnir-close", closeUnclosed, null, null);
+    if (th != null) c.g_thread_unref(th);
+}
+
+fn keepUnclosed(inner: [*c]c.GFileInputStream) void {
+    c.g_mutex_lock(&unclosed_lock);
+    defer c.g_mutex_unlock(&unclosed_lock);
+    if (unclosed == null) unclosed = c.g_ptr_array_new();
+    c.g_ptr_array_add(unclosed, inner);
+}
+
+/// Wrap an opened target, whose place in `streams_running` the caller holds. No stream
+/// leaves here without its worker: without one the open fails and the file waits above.
+fn boundedStream(inner: [*c]c.GFileInputStream, err: [*c][*c]c.GError) [*c]c.GFileInputStream {
+    const raw = c.g_object_new(stream_type, null);
+    if (raw == null) {
+        keepUnclosed(inner);
+        setError(err, c.G_IO_ERROR_BUSY, "no resources for a stream");
+        return null;
+    }
+    const s: *GungnirStream = @ptrCast(@alignCast(raw));
+    s.timeout_us = stream_timeout_us;
+    s.seekable = c.g_seekable_can_seek(@ptrCast(@alignCast(inner)));
+    if (envValue("GUNGNIR_TEST_READ_TIMEOUT_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| {
+            s.timeout_us = std.math.clamp(ms, 1, 3_600_000) * std.time.us_per_ms;
+        } else |_| {}
+    }
+    const j: *StreamIo = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(StreamIo))));
+    j.* = .{ .inner = inner, .buf = @ptrCast(c.g_malloc(stream_chunk)) };
+    c.g_mutex_init(&j.lock);
+    c.g_cond_init(&j.cond);
+    const th = c.g_thread_try_new("gungnir-stream", streamWorker, j, null);
+    if (th == null) {
+        keepUnclosed(inner);
+        j.unref();
+        j.unref();
+        c.g_object_unref(raw);
+        setError(err, c.G_IO_ERROR_BUSY, "no thread for a stream");
+        return null;
+    }
+    c.g_thread_unref(th);
+    s.io = j;
+    return @ptrCast(@alignCast(raw));
+}
+
+// ---- a monitor on a root ------------------------------------------------------------
+
+const monitor_poll_ms = 2_000;
+const monitor_slice_us = 100 * std.time.us_per_ms;
+var monitors_running: std.atomic.Value(u32) = .init(0);
+const monitors_running_max = 16;
+const monitor_queue_max = 256;
+const baseline_pending: u32 = 0;
+const baseline_ready: u32 = 1;
+/// The creator stopped waiting, so a view may have listed before the baseline.
+const baseline_late: u32 = 2;
+const baseline_wait_ui_us = 3 * std.time.us_per_ms;
+const baseline_wait_us = 200 * std.time.us_per_ms;
+
+/// Shared by a monitor and its thread, which holds no reference to the monitor: dropping
+/// the last one is how a monitor ends.
+const Watch = struct {
+    refs: std.atomic.Value(u32) = .init(2),
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Changes waiting for the creator's main context.
+    queued: std.atomic.Value(u32) = .init(0),
+    scheme: u8,
+    /// Only the thread uses this, and it lets go on leaving: a queued change refers to the
+    /// watch and sits in the context, so the watch must not keep the context alive.
+    ctx: ?*c.GMainContext,
+    weak: c.GWeakRef = undefined,
+    /// How the first listing went: see `baseline_*`.
+    baseline: std.atomic.Value(u32) = .init(baseline_pending),
+
+    fn ref(w: *Watch) void {
+        _ = w.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn unref(w: *Watch) void {
+        if (w.refs.fetchSub(1, .acq_rel) != 1) return;
+        c.g_weak_ref_clear(&w.weak);
+        c.g_free(w);
+    }
+};
+
+const GungnirMonitor = extern struct {
+    parent: c.GFileMonitor,
+    watch: ?*anyopaque,
+};
+
+const GungnirMonitorClass = extern struct {
+    parent_class: c.GFileMonitorClass,
+};
+
+const Change = struct {
+    watch: *Watch,
+    child: ?*c.GFile,
+    event: c.GFileMonitorEvent,
+};
+
+fn changeRun(data: c.gpointer) callconv(.c) c.gboolean {
+    const e: *Change = @ptrCast(@alignCast(data));
+    const m = c.g_weak_ref_get(&e.watch.weak);
+    if (m != null) {
+        defer c.g_object_unref(m);
+        c.g_file_monitor_emit_event(@ptrCast(@alignCast(m)), e.child, null, e.event);
+    }
+    return 0;
+}
+
+fn changeFree(data: c.gpointer) callconv(.c) void {
+    const e: *Change = @ptrCast(@alignCast(data));
+    if (e.child) |f| c.g_object_unref(f);
+    _ = e.watch.queued.fetchSub(1, .acq_rel);
+    e.watch.unref();
+    c.g_free(e);
+}
+
+fn emitChange(w: *Watch, name: [*c]const u8, event: c.GFileMonitorEvent) void {
+    const e: *Change = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(Change))));
+    w.ref();
+    _ = w.queued.fetchAdd(1, .acq_rel);
+    e.* = .{ .watch = w, .child = newFile(w.scheme, name), .event = event };
+    // Always a source, never g_main_context_invoke: that may run it right here, on this
+    // thread, and handlers belong on the creator's.
+    const src = c.g_idle_source_new();
+    c.g_source_set_priority(src, c.G_PRIORITY_DEFAULT);
+    c.g_source_set_callback(src, &changeRun, e, &changeFree);
+    _ = c.g_source_attach(src, w.ctx);
+    c.g_source_unref(src);
+}
+
+fn stampOf(scheme: u8) ?u64 {
+    var link: Link = undefined;
+    if (!link.open(list_timeout_ms, null)) return null;
+    defer link.close();
+    var reply: ipc.Msg = undefined;
+    const req = [1]u8{scheme};
+    const body = requestRetry(&link, msg_stamp, &req, &reply) catch return null;
+    if (body.len != 8) return null;
+    return std.mem.readInt(u64, body[0..8], .little);
+}
+
+/// The names now, as a set of new strings; null when the daemon would not say.
+fn namesNow(scheme: u8, partial: ?*bool) ?*c.GHashTable {
+    const all = fetch(scheme, partial, null) orelse return null;
+    defer _ = c.g_ptr_array_free(all, 1);
+    const set = c.g_hash_table_new_full(&c.g_str_hash, &c.g_str_equal, &c.g_free, null) orelse return null;
+    var i: c.guint = 0;
+    while (i < all.*.len) : (i += 1) {
+        const info: *c.GFileInfo = @ptrCast(@alignCast(all.*.pdata[i]));
+        _ = c.g_hash_table_add(set, c.g_strdup(c.g_file_info_get_name(info)));
+    }
+    return set;
+}
+
+/// What the daemon says of `name`. Only "no such item" means gone.
+fn lookup(scheme: u8, name: [*c]const u8) enum { there, gone, unknown } {
+    const f = newFile(scheme, name) orelse return .unknown;
+    defer c.g_object_unref(f);
+    var e: [*c]c.GError = null;
+    const info = findInfo(asSelf(f), &e);
+    if (info != null) {
+        c.g_object_unref(info);
+        return .there;
+    }
+    defer if (e != null) c.g_error_free(e);
+    if (e != null and c.g_error_matches(e, c.g_io_error_quark(), c.G_IO_ERROR_NOT_FOUND) != 0) return .gone;
+    return .unknown;
+}
+
+fn watchSleep(w: *Watch) void {
+    var left: i64 = monitor_poll_ms * std.time.us_per_ms;
+    while (left > 0 and !w.stop.load(.acquire)) : (left -= monitor_slice_us) c.g_usleep(monitor_slice_us);
+}
+
+fn monitorThread(data: c.gpointer) callconv(.c) c.gpointer {
+    const w: *Watch = @ptrCast(@alignCast(data));
+    var last = stampOf(w.scheme);
+    var fresh = namesNow(w.scheme, null);
+    // Too late to be sure no view listed first, or no listing at all: start from nothing,
+    // so the first round reports everything there is. A view ignores what it already has.
+    const on_time = w.baseline.cmpxchgStrong(baseline_pending, baseline_ready, .acq_rel, .acquire) == null;
+    if ((!on_time or fresh == null) and fresh != null) {
+        c.g_hash_table_unref(fresh);
+        fresh = null;
+    }
+    if (fresh == null) last = null;
+    const known = fresh orelse c.g_hash_table_new_full(&c.g_str_hash, &c.g_str_equal, &c.g_free, null) orelse {
+        _ = monitors_running.fetchSub(1, .acq_rel);
+        if (w.ctx) |x| c.g_main_context_unref(x);
+        w.ctx = null;
+        w.unref();
+        return null;
+    };
+    while (!w.stop.load(.acquire)) {
+        if (last != null) watchSleep(w) else c.g_usleep(monitor_slice_us);
+        if (w.stop.load(.acquire)) break;
+        // Nobody is dispatching: the changes wait in the next round, not in memory.
+        if (w.queued.load(.acquire) >= monitor_queue_max) {
+            watchSleep(w);
+            continue;
+        }
+        const now = stampOf(w.scheme) orelse {
+            watchSleep(w);
+            continue;
+        };
+        if (last != null and last.? == now) continue;
+        var partial = false;
+        const names = namesNow(w.scheme, &partial) orelse {
+            watchSleep(w);
+            continue;
+        };
+        defer c.g_hash_table_unref(names);
+        // `known` follows what was really reported, so a round cut short by the queue
+        // bound resumes where it stopped.
+        var whole = true;
+        var it: c.GHashTableIter = undefined;
+        var key: c.gpointer = null;
+        // Removals first: `known` only grows once it holds nothing that is gone, so it stays
+        // the size of the real list however a round is cut short.
+        // Missing from a list that may not be whole says nothing about being gone, so such
+        // an item is asked about by name, a bounded number per round.
+        var asked: u32 = 0;
+        var unsure = false;
+        c.g_hash_table_iter_init(&it, known);
+        while (c.g_hash_table_iter_next(&it, &key, null) != 0) {
+            if (c.g_hash_table_contains(names, key) != 0) continue;
+            if (partial) {
+                if (asked >= monitor_queue_max) {
+                    unsure = true;
+                    continue;
+                }
+                asked += 1;
+                switch (lookup(w.scheme, @ptrCast(key))) {
+                    .there => continue,
+                    .unknown => {
+                        unsure = true;
+                        continue;
+                    },
+                    .gone => {},
+                }
+            }
+            if (w.queued.load(.acquire) >= monitor_queue_max) {
+                whole = false;
+                break;
+            }
+            emitChange(w, @ptrCast(key), c.G_FILE_MONITOR_EVENT_DELETED);
+            c.g_hash_table_iter_remove(&it);
+        }
+        if (whole) {
+            c.g_hash_table_iter_init(&it, names);
+            while (c.g_hash_table_iter_next(&it, &key, null) != 0) {
+                if (c.g_hash_table_contains(known, key) != 0) continue;
+                if (w.queued.load(.acquire) >= monitor_queue_max) {
+                    whole = false;
+                    break;
+                }
+                emitChange(w, @ptrCast(key), c.G_FILE_MONITOR_EVENT_CREATED);
+                _ = c.g_hash_table_add(known, c.g_strdup(@ptrCast(key)));
+            }
+        }
+        last = if (whole and !unsure) now else null;
+        // Answers still owed: the next round is the normal one, not a tight loop.
+        if (unsure) watchSleep(w);
+    }
+    c.g_hash_table_unref(known);
+    if (w.ctx) |x| c.g_main_context_unref(x);
+    w.ctx = null;
+    _ = monitors_running.fetchSub(1, .acq_rel);
+    w.unref();
+    return null;
+}
+
+fn monitorCancel(m: [*c]c.GFileMonitor) callconv(.c) c.gboolean {
+    const s: *GungnirMonitor = @ptrCast(@alignCast(m));
+    if (s.watch) |p| {
+        const w: *Watch = @ptrCast(@alignCast(p));
+        w.stop.store(true, .release);
+    }
+    return 1;
+}
+
+fn monitorFinalize(obj: [*c]c.GObject) callconv(.c) void {
+    const s: *GungnirMonitor = @ptrCast(@alignCast(obj));
+    if (s.watch) |p| {
+        const w: *Watch = @ptrCast(@alignCast(p));
+        w.stop.store(true, .release);
+        w.unref();
+        s.watch = null;
+    }
+    const parent: *c.GObjectClass = @ptrCast(@alignCast(c.g_type_class_peek_parent(c.g_type_class_peek(monitor_type))));
+    if (parent.finalize) |fin| fin(obj);
+}
+
+fn monitorClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void {
+    _ = class_data;
+    const k: *GungnirMonitorClass = @ptrCast(@alignCast(g_class));
+    k.parent_class.cancel = &monitorCancel;
+    const o: *c.GObjectClass = @ptrCast(@alignCast(g_class));
+    o.finalize = &monitorFinalize;
+}
+
+fn fileMonitor(f: ?*c.GFile, flags: c.GFileMonitorFlags, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) [*c]c.GFileMonitor {
+    _ = flags;
+    _ = cancellable;
+    const s = asSelf(f);
+    if (s.name != null) {
+        setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "only the whole trash can be watched");
+        return null;
+    }
+    if (monitors_running.fetchAdd(1, .acq_rel) >= monitors_running_max) {
+        _ = monitors_running.fetchSub(1, .acq_rel);
+        setError(err, c.G_IO_ERROR_BUSY, "too many monitors");
+        return null;
+    }
+    // The thread runs this module's code: never unload it under one.
+    _ = c.g_type_class_ref(monitor_type);
+    const raw = c.g_object_new(monitor_type, null);
+    if (raw == null) {
+        _ = monitors_running.fetchSub(1, .acq_rel);
+        setError(err, c.G_IO_ERROR_FAILED, "cannot create a monitor");
+        return null;
+    }
+    const w: *Watch = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(Watch))));
+    w.* = .{ .scheme = s.scheme, .ctx = c.g_main_context_ref_thread_default() };
+    c.g_weak_ref_init(&w.weak, raw);
+    const th = c.g_thread_try_new("gungnir-monitor", monitorThread, w, err);
+    if (th == null) {
+        _ = monitors_running.fetchSub(1, .acq_rel);
+        if (w.ctx) |x| c.g_main_context_unref(x);
+        w.unref();
+        w.unref();
+        c.g_object_unref(raw);
+        return null;
+    }
+    c.g_thread_unref(th);
+    const m: *GungnirMonitor = @ptrCast(@alignCast(raw));
+    m.watch = w;
+    // A view usually lists right after this, and the baseline should come first. The wait
+    // is short, on a UI thread very short: past it the thread makes up for it.
+    const ui = c.g_main_context_is_owner(c.g_main_context_default()) != 0;
+    const end = c.g_get_monotonic_time() + @as(i64, if (ui) baseline_wait_ui_us else baseline_wait_us);
+    while (w.baseline.load(.acquire) == baseline_pending and c.g_get_monotonic_time() < end) c.g_usleep(500);
+    _ = w.baseline.cmpxchgStrong(baseline_pending, baseline_late, .acq_rel, .acquire);
+    return @ptrCast(@alignCast(raw));
+}
+
 fn fileIfaceInit(g_iface: c.gpointer, iface_data: c.gpointer) callconv(.c) void {
     _ = iface_data;
     const i: *c.GFileIface = @ptrCast(@alignCast(g_iface));
@@ -796,6 +1530,8 @@ fn fileIfaceInit(g_iface: c.gpointer, iface_data: c.gpointer) callconv(.c) void 
     i.read_fn = &fileRead;
     i.delete_file = &fileDelete;
     i.move = &fileMove;
+    i.monitor_dir = &fileMonitor;
+    i.monitor_file = &fileMonitor;
 }
 
 fn fileFinalize(obj: [*c]c.GObject) callconv(.c) void {
@@ -874,6 +1610,20 @@ const enum_type_info = c.GTypeInfo{
     .instance_size = @sizeOf(GungnirEnum),
 };
 
+const monitor_type_info = c.GTypeInfo{
+    .class_size = @sizeOf(GungnirMonitorClass),
+    .class_init = &monitorClassInit,
+    .class_finalize = &classFinalize,
+    .instance_size = @sizeOf(GungnirMonitor),
+};
+
+const stream_type_info = c.GTypeInfo{
+    .class_size = @sizeOf(GungnirStreamClass),
+    .class_init = &streamClassInit,
+    .class_finalize = &classFinalize,
+    .instance_size = @sizeOf(GungnirStream),
+};
+
 const file_iface_info = c.GInterfaceInfo{
     .interface_init = &fileIfaceInit,
     .interface_finalize = null,
@@ -890,6 +1640,14 @@ pub fn register(module: *c.GTypeModule) void {
     enum_type = c.g_type_module_register_type(module, c.g_file_enumerator_get_type(), "GungnirFileEnumerator", &enum_type_info, 0);
     if (enum_type == 0) {
         c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir: failed to register GungnirFileEnumerator");
+    }
+    monitor_type = c.g_type_module_register_type(module, c.g_file_monitor_get_type(), "GungnirFileMonitor", &monitor_type_info, 0);
+    if (monitor_type == 0) {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir: failed to register GungnirFileMonitor");
+    }
+    stream_type = c.g_type_module_register_type(module, c.g_file_input_stream_get_type(), "GungnirFileStream", &stream_type_info, 0);
+    if (stream_type == 0) {
+        c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir: failed to register GungnirFileStream");
     }
 }
 

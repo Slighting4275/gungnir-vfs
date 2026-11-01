@@ -683,6 +683,188 @@ pub fn sweep_if_empty(d: &TrashDir) -> bool {
     })
 }
 
+/// The directory `rel` (`a/b`, may be empty) below the payload `entry`, walked with no link
+/// followed. A name that could not be an entry anywhere is simply not there.
+fn open_below(files: &OwnedFd, entry: &[u8], rel: &[u8]) -> io::Result<OwnedFd> {
+    let mut cur: Option<OwnedFd> = None;
+    let parts = std::iter::once(entry).chain(rel.split(|&b| b == b'/').filter(|p| !p.is_empty()));
+    for part in parts {
+        if !valid_entry(part) {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        let at = cur.as_ref().unwrap_or(files).as_raw_fd();
+        cur = Some(open_at(at, &c_path(part)?, DIR | libc::O_NOFOLLOW)?);
+    }
+    cur.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+/// One entry inside a trashed folder. Only looked at: nothing inside an item can be
+/// deleted or restored on its own, the item is what the trash has a record of.
+fn inner_item(
+    dir: RawFd,
+    leaf: &[u8],
+    name: Vec<u8>,
+    orig: &[u8],
+    target: Vec<u8>,
+) -> io::Result<Item> {
+    let cleaf = c_path(leaf)?;
+    let st = stat_at(dir, &cleaf)?;
+    let kind = kind_of(&st);
+    let link = if kind == KIND_SYMLINK {
+        read_link_at(dir, &cleaf).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let orig = if orig.is_empty() {
+        Vec::new()
+    } else {
+        [orig, b"/", leaf].concat()
+    };
+    Ok(Item {
+        name,
+        entry: Vec::new(),
+        orig,
+        target,
+        kind,
+        size: st.st_size as u64,
+        mtime: st.st_mtime,
+        deleted: Vec::new(),
+        link,
+    })
+}
+
+fn joined(base: &[u8], rel: &[u8]) -> Vec<u8> {
+    if rel.is_empty() {
+        base.to_vec()
+    } else {
+        [base, b"/", rel].concat()
+    }
+}
+
+/// The entry `rel` inside the trashed folder `entry`; `name` is the whole URI name.
+///
+/// # Errors
+/// It is not there, or a component is no directory.
+pub fn child_item(
+    d: &TrashDir,
+    pins: &Pins,
+    entry: &[u8],
+    rel: &[u8],
+    name: &[u8],
+) -> io::Result<Item> {
+    let top = item_in(d, pins, entry);
+    let (dir_rel, leaf) = match rel.iter().rposition(|&b| b == b'/') {
+        Some(at) => (&rel[..at], &rel[at + 1..]),
+        None => (&rel[..0], rel),
+    };
+    if !valid_entry(leaf) {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let dir = open_below(&pins.files, entry, dir_rel)?;
+    let orig = if top.orig.is_empty() {
+        Vec::new()
+    } else {
+        joined(&top.orig, dir_rel)
+    };
+    let target = joined(&joined(&top.target, dir_rel), leaf);
+    inner_item(dir.as_raw_fd(), leaf, name.to_vec(), &orig, target)
+}
+
+/// What is in the folder `rel` of the payload `entry`, out of a budget of text.
+///
+/// # Errors
+/// It is not there, or no directory.
+pub fn children_of(
+    d: &TrashDir,
+    pins: &Pins,
+    entry: &[u8],
+    rel: &[u8],
+    name: &[u8],
+    left: &mut usize,
+    skip: &dyn Fn(&[u8]) -> bool,
+) -> io::Result<Vec<Item>> {
+    let top = item_in(d, pins, entry);
+    if !rel.is_empty() && !valid_entry(rel.rsplit(|&b| b == b'/').next().unwrap_or_default()) {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let dir = open_below(&pins.files, entry, rel)?;
+    let orig = if top.orig.is_empty() {
+        Vec::new()
+    } else {
+        joined(&top.orig, rel)
+    };
+    let base = joined(&top.target, rel);
+    let mut items = Vec::new();
+    for (n, e) in fs::read_dir(fd_path(&dir))?.enumerate() {
+        // Entries read, not entries kept: one that vanished still used up the scan.
+        if n >= SCAN_MAX {
+            *left = 0;
+        }
+        if *left == 0 {
+            break;
+        }
+        let leaf = e?.file_name();
+        let leaf = leaf.as_bytes();
+        let target = joined(&base, leaf);
+        // A mount known hung is not to be touched, not even by a stat.
+        let looked = if skip(&target) {
+            Err(io::Error::from_raw_os_error(libc::ETIMEDOUT))
+        } else {
+            inner_item(
+                dir.as_raw_fd(),
+                leaf,
+                joined(name, leaf),
+                &orig,
+                target.clone(),
+            )
+        };
+        let it = match looked {
+            Ok(it) => it,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // gone since the listing
+            // There, but it cannot be looked at: still an entry, as in the trash itself.
+            Err(_) => Item {
+                name: joined(name, leaf),
+                entry: Vec::new(),
+                orig: joined(&orig, leaf),
+                target,
+                kind: KIND_SPECIAL,
+                size: 0,
+                mtime: 0,
+                deleted: Vec::new(),
+                link: Vec::new(),
+            },
+        };
+        *left =
+            left.saturating_sub(it.name.len() + it.orig.len() + it.target.len() + it.link.len());
+        items.push(it);
+    }
+    Ok(items)
+}
+
+/// What changes when anything is added to or removed from `d`.
+#[must_use]
+pub fn stamp(d: &TrashDir) -> u64 {
+    let mut h = fnv(0xcbf2_9ce4_8422_2325, d.dir.as_os_str().as_bytes());
+    if let Ok(pins) = d.pins() {
+        for fd in [&pins.files, &pins.info] {
+            if let Ok(st) = stat_at(fd.as_raw_fd(), c"") {
+                h = fnv(h, &st.st_mtime.to_le_bytes());
+                h = fnv(h, &st.st_mtime_nsec.to_le_bytes());
+            }
+        }
+    }
+    h
+}
+
+/// FNV-1a: a change detector, kept in memory only.
+#[must_use]
+pub fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// Whether `d` holds an orphan that should have gone, with `items` its listing. An orphan
 /// is on no list, so this is the only way a client can hear of one. Clears what it can.
 #[must_use]
@@ -1258,6 +1440,85 @@ mod tests {
         assert_eq!(scan_capped(&d, &mut 1).unwrap().len(), 1);
         assert_eq!(scan_capped(&d, &mut (1 << 20)).unwrap().len(), 5);
         assert!(scan_capped(&d, &mut 0).unwrap().is_empty());
+    }
+
+    /// Inside a trashed folder: looked at through descriptors, no link followed.
+    #[test]
+    fn a_trashed_folder_can_be_read_into() {
+        let t = T::new("inner");
+        let d = t.trash();
+        item(&d, "dir", "/o/dir");
+        let f = d.files().join("dir");
+        fs::remove_file(&f).ok();
+        fs::create_dir_all(f.join("sub")).unwrap();
+        fs::write(f.join("sub/leaf"), b"hello").unwrap();
+        symlink("/etc", f.join("out")).unwrap();
+        let pins = d.pins().unwrap();
+        let mut left = 1 << 20;
+        let mut got: Vec<_> = children_of(&d, &pins, b"dir", b"", b"h-dir", &mut left, &|_| false)
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.name, i.kind))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (b"h-dir/out".to_vec(), KIND_SYMLINK),
+                (b"h-dir/sub".to_vec(), KIND_DIR)
+            ]
+        );
+        let leaf = child_item(&d, &pins, b"dir", b"sub/leaf", b"h-dir/sub/leaf").unwrap();
+        assert_eq!((leaf.kind, leaf.size), (KIND_FILE, 5));
+        assert_eq!(leaf.orig, b"/o/dir/sub/leaf");
+        assert!(leaf.target.ends_with(b"files/dir/sub/leaf"));
+        // A link is not walked through, and no name climbs out.
+        assert!(child_item(&d, &pins, b"dir", b"out/passwd", b"x").is_err());
+        assert!(children_of(&d, &pins, b"dir", b"out", b"x", &mut left, &|_| false).is_err());
+        assert!(child_item(&d, &pins, b"dir", b"sub/../../x", b"x").is_err());
+        assert!(child_item(&d, &pins, b"dir", b"..", b"x").is_err());
+        assert!(children_of(&d, &pins, b"dir", b"sub/..", b"x", &mut left, &|_| false).is_err());
+    }
+
+    /// A folder that lists but cannot be searched shows its entries, degraded.
+    #[test]
+    fn unexaminable_children_are_listed() {
+        let t = T::new("no-search");
+        let d = t.trash();
+        item(&d, "dir", "/o/dir");
+        let f = d.files().join("dir");
+        fs::remove_file(&f).ok();
+        fs::create_dir_all(&f).unwrap();
+        fs::write(f.join("a"), b"x").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        let pins = d.pins().unwrap();
+        let got = children_of(&d, &pins, b"dir", b"", b"h-dir", &mut (1 << 20), &|_| false);
+        let skipped = children_of(&d, &pins, b"dir", b"", b"h-dir", &mut (1 << 20), &|_| true);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(got.unwrap()[0].kind, KIND_SPECIAL);
+        }
+        assert_eq!(
+            skipped.unwrap()[0].kind,
+            KIND_SPECIAL,
+            "a hung child is not touched"
+        );
+    }
+
+    /// The stamp moves with the trash, and stays put without it.
+    #[test]
+    fn the_stamp_follows_changes() {
+        let t = T::new("stamp");
+        let d = t.trash();
+        let a = stamp(&d);
+        assert_eq!(a, stamp(&d));
+        let then = std::time::SystemTime::now() - Duration::from_secs(5);
+        File::open(d.files()).unwrap().set_modified(then).unwrap();
+        let b = stamp(&d);
+        assert_ne!(a, b);
+        fs::write(d.files().join("n"), b"x").unwrap();
+        assert_ne!(b, stamp(&d));
     }
 
     /// An orphan stuck beside live items still reaches the client; a live item is none.

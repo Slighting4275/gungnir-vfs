@@ -773,6 +773,34 @@ fn countChildren(uri: [*c]const u8) ?usize {
 
 /// Milestone 9 through GIO and the gio tool. XDG_DATA_HOME was set before the daemon.
 /// Every scheme the module advertises must open at its root (BC-HC-F03, a permanent gate).
+const Seen = struct {
+    last: c.GFileMonitorEvent = 0,
+    hits: u32 = 0,
+
+    /// Run this thread's main context until `event` comes, within 6 s.
+    fn wait(s: *Seen, event: c.GFileMonitorEvent) bool {
+        const end = c.g_get_monotonic_time() + 6 * std.time.us_per_s;
+        while (c.g_get_monotonic_time() < end) {
+            if (s.hits != 0 and s.last == event) {
+                s.hits = 0;
+                return true;
+            }
+            _ = c.g_main_context_iteration(null, 0);
+            c.g_usleep(10 * std.time.us_per_ms);
+        }
+        return false;
+    }
+};
+
+fn onChanged(m: ?*c.GFileMonitor, f: ?*c.GFile, o: ?*c.GFile, e: c.GFileMonitorEvent, data: c.gpointer) callconv(.c) void {
+    _ = m;
+    _ = f;
+    _ = o;
+    const s: *Seen = @ptrCast(@alignCast(data));
+    s.last = e;
+    s.hits += 1;
+}
+
 fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
     const data = c.g_getenv("XDG_DATA_HOME");
     if (data == null) return "XDG_DATA_HOME is not set";
@@ -928,6 +956,133 @@ fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
         if (!r.ok) return "gio list recent:/// failed";
     }
 
+    {
+        // Inside a trashed folder: browse, read and copy out, but change nothing.
+        const dir = c.g_build_filename(files, "tree", @as([*c]const u8, null));
+        defer c.g_free(dir);
+        const sub = c.g_build_filename(dir, "sub", @as([*c]const u8, null));
+        defer c.g_free(sub);
+        if (c.g_mkdir_with_parents(sub, 0o700) != 0 or !writeText(sub, "leaf.txt", "leaf payload"))
+            return "could not write the trashed folder";
+        const leaf = c.g_build_filename(sub, "leaf.txt", @as([*c]const u8, null));
+        defer c.g_free(leaf);
+        defer {
+            removeFile(leaf);
+            _ = std.c.rmdir(sub);
+            _ = std.c.rmdir(dir);
+        }
+        if (!writeText(info, "tree.trashinfo", "[Trash Info]\nPath=/somewhere/tree\n")) return "could not write the info";
+        defer {
+            const ti = c.g_build_filename(info, "tree.trashinfo", @as([*c]const u8, null));
+            defer c.g_free(ti);
+            removeFile(ti);
+        }
+        if (countChildren("trash:///h-tree") != @as(?usize, 1)) return "a trashed folder does not list its contents";
+        if (countChildren("trash:///h-tree/sub") != @as(?usize, 1)) return "a folder inside a trashed folder does not list";
+        {
+            // A trailing slash is the same folder, and its children are usable.
+            const dirf = c.g_file_new_for_uri("trash:///h-tree/sub/");
+            defer c.g_object_unref(dirf);
+            const kid = c.g_file_get_child(dirf, "leaf.txt");
+            defer c.g_object_unref(kid);
+            const q = c.g_file_query_info(kid, "standard::size", c.G_FILE_QUERY_INFO_NONE, null, null);
+            if (q == null) return "a child under a trailing slash is not found";
+            c.g_object_unref(q);
+        }
+        const r = runGio(&.{ "cat", "trash:///h-tree/sub/leaf.txt" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok or !contains(r.out, "leaf payload")) return "gio cat inside a trashed folder failed";
+        const f = c.g_file_new_for_uri("trash:///h-tree/sub/leaf.txt");
+        defer c.g_object_unref(f);
+        const parent = c.g_file_get_parent(f);
+        defer c.g_object_unref(parent);
+        const up = c.g_file_get_uri(parent);
+        defer c.g_free(up);
+        if (!contains(up, "trash:///h-tree/sub")) return "the parent of an inner file is wrong";
+        var err: [*c]c.GError = null;
+        const gone = c.g_file_delete(f, null, &err);
+        if (err != null) c.g_error_free(err);
+        if (gone != 0) return "a file inside a trashed folder was deleted";
+        if (c.g_file_test(leaf, c.G_FILE_TEST_EXISTS) == 0) return "a refused delete still took the file";
+    }
+    {
+        // A read that never answers ends at its deadline, not with the caller stuck.
+        _ = c.g_setenv("GUNGNIR_TEST_READ_TIMEOUT_MS", "300", 1);
+        defer c.g_unsetenv("GUNGNIR_TEST_READ_TIMEOUT_MS");
+        const fifo = c.g_build_filename(files, "slow", @as([*c]const u8, null));
+        defer c.g_free(fifo);
+        if (mkfifo(fifo, 0o600) != 0) return "could not make the FIFO";
+        defer removeFile(fifo);
+        // A writer that stays silent: the open goes through, the read cannot.
+        const w = std.c.open(fifo, .{ .ACCMODE = .RDWR, .NONBLOCK = true });
+        if (w < 0) return "could not open the FIFO";
+        defer _ = std.c.close(w);
+        const f = c.g_file_new_for_uri("trash:///h-slow");
+        defer c.g_object_unref(f);
+        var err: [*c]c.GError = null;
+        const st = c.g_file_read(f, null, &err);
+        if (st == null) {
+            if (err != null) c.g_error_free(err);
+            return "could not open the silent FIFO";
+        }
+        defer c.g_object_unref(st);
+        if (c.g_seekable_can_seek(@ptrCast(@alignCast(st))) != 0) return "a FIFO claims to seek";
+        var buf: [16]u8 = undefined;
+        const t0 = c.g_get_monotonic_time();
+        const n = c.g_input_stream_read(@ptrCast(@alignCast(st)), &buf, buf.len, null, &err);
+        const took = c.g_get_monotonic_time() - t0;
+        const timed_out = n < 0 and c.g_error_matches(err, c.g_io_error_quark(), c.G_IO_ERROR_TIMED_OUT) != 0;
+        if (err != null) c.g_error_free(err);
+        if (!timed_out) return "a silent read did not time out";
+        if (took > 2 * std.time.us_per_s) return "a silent read outlived its deadline";
+    }
+    {
+        // A stream reads, seeks and tells like the file behind it.
+        if (!writeText(files, "seek.txt", "0123456789")) return "could not write the seek file";
+        const p = c.g_build_filename(files, "seek.txt", @as([*c]const u8, null));
+        defer c.g_free(p);
+        defer removeFile(p);
+        const f = c.g_file_new_for_uri("trash:///h-seek.txt");
+        defer c.g_object_unref(f);
+        const st = c.g_file_read(f, null, null);
+        if (st == null) return "could not open the seek file";
+        defer c.g_object_unref(st);
+        const sk: *c.GSeekable = @ptrCast(@alignCast(st));
+        if (c.g_seekable_seek(sk, 6, c.G_SEEK_SET, null, null) == 0) return "a seek failed";
+        var buf: [4]u8 = undefined;
+        if (c.g_input_stream_read(@ptrCast(@alignCast(st)), &buf, 4, null, null) != 4 or !std.mem.eql(u8, &buf, "6789"))
+            return "a read after a seek got the wrong bytes";
+        if (c.g_seekable_tell(sk) != 10) return "tell is wrong";
+        if (c.g_input_stream_close(@ptrCast(@alignCast(st)), null, null) == 0) return "close failed";
+        // Dropped unclosed: the worker tidies up, and the caller does not wait for it.
+        const dropped = c.g_file_read(f, null, null);
+        if (dropped == null) return "could not reopen the seek file";
+        const t0 = c.g_get_monotonic_time();
+        c.g_object_unref(dropped);
+        if (c.g_get_monotonic_time() - t0 > 100 * std.time.us_per_ms) return "dropping a stream waited";
+    }
+    {
+        // A monitor on the root sees files come and go, on this thread's main context.
+        const f = c.g_file_new_for_uri("trash:///");
+        defer c.g_object_unref(f);
+        const m = c.g_file_monitor_directory(f, c.G_FILE_MONITOR_NONE, null, null);
+        if (m == null) return "no monitor on trash:///";
+        defer c.g_object_unref(m);
+        var seen = Seen{};
+        _ = c.g_signal_connect_data(m, "changed", @ptrCast(&onChanged), &seen, null, 0);
+        c.g_usleep(500 * std.time.us_per_ms);
+        if (!writeText(files, "watched.txt", "w") or !writeText(info, "watched.txt.trashinfo", "[Trash Info]\nPath=/w\n"))
+            return "could not write the watched item";
+        if (!seen.wait(c.G_FILE_MONITOR_EVENT_CREATED)) return "the monitor missed a new item";
+        const a = c.g_build_filename(files, "watched.txt", @as([*c]const u8, null));
+        defer c.g_free(a);
+        const b = c.g_build_filename(info, "watched.txt.trashinfo", @as([*c]const u8, null));
+        defer c.g_free(b);
+        removeFile(a);
+        removeFile(b);
+        if (!seen.wait(c.G_FILE_MONITOR_EVENT_DELETED)) return "the monitor missed a removed item";
+        _ = c.g_file_monitor_cancel(m);
+    }
     {
         // The real commands, end to end: trash a file, restore it to where it was.
         const path = c.g_build_filename(data, "round.txt", @as([*c]const u8, null));

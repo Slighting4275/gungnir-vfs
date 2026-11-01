@@ -12,6 +12,10 @@
 //! - delete (41): `scheme u8 | name len16`.
 //! - restore (42): `name len16 | dest len16` (an empty dest: the original path).
 //! - empty (43): reply `deleted u32 | failed u32 | skipped len16`, whatever the status.
+//! - stat (45): `scheme u8 | name len16`; reply a list page of one. `<item>/<path>` names
+//!   an entry inside a trashed folder.
+//! - children (46): `cursor u32 | name len16`; reply a list page.
+//! - stamp (47): `scheme u8`; reply `stamp u64`.
 //!
 //! Statuses beyond the metadata ones: 15 OS error (body `errno i32`), 17 a mount inside
 //! the item, 18 items remain. Empty reports the first item error, else 18 if items
@@ -44,7 +48,7 @@ use crate::{
         Anchor, Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink,
     },
     recent,
-    trash::{self, Item, TrashDir},
+    trash::{self, Item, Pins, TrashDir},
 };
 
 pub const MSG_VFS_LIST: u32 = 40;
@@ -54,6 +58,12 @@ pub const MSG_TRASH_EMPTY: u32 = 43;
 /// Sent while an op is under way (same seq, no payload): the client's silence bound
 /// covers everything else, and an op may take as long as it makes progress.
 pub const MSG_VFS_BEAT: u32 = 44;
+/// One item by name, without listing the rest.
+pub const MSG_VFS_STAT: u32 = 45;
+/// What is in a trashed folder.
+pub const MSG_VFS_CHILDREN: u32 = 46;
+/// A number that changes when a scheme's list does.
+pub const MSG_VFS_STAMP: u32 = 47;
 
 pub const SCHEME_TRASH: u8 = 0;
 pub const SCHEME_RECENT: u8 = 1;
@@ -534,11 +544,9 @@ impl Svc {
         (items, partial)
     }
 
-    fn snapshot_recent(&self) -> Result<Vec<Item>, Failure> {
-        let path = self.xbel.as_ref().ok_or(Failure::st(ST_IO_ERROR))?;
-        let text = recent::load(path).map_err(|e| io_failure(&e))?;
-        let mut items = Vec::new();
-        for e in recent::parse(&text).into_iter().take(SNAPSHOT_MAX) {
+    /// One recent entry as an item.
+    fn recent_item(&self, e: recent::Entry) -> Item {
+        {
             let target = recent::file_path(&e.uri).unwrap_or_default();
             let (mut kind, mut size, mut mtime) = (trash::KIND_SPECIAL, 0, 0);
             let tp = Path::new(OsStr::from_bytes(&target));
@@ -556,7 +564,7 @@ impl Svc {
                 size = m.len();
                 mtime = m.mtime();
             }
-            items.push(Item {
+            Item {
                 name: hex(&e.uri).into_bytes(),
                 entry: Vec::new(),
                 orig: e.uri,
@@ -566,9 +574,92 @@ impl Svc {
                 mtime,
                 deleted: Vec::new(),
                 link: Vec::new(),
+            }
+        }
+    }
+
+    fn snapshot_recent(&self) -> Result<Vec<Item>, Failure> {
+        let path = self.xbel.as_ref().ok_or(Failure::st(ST_IO_ERROR))?;
+        let text = recent::load(path).map_err(|e| io_failure(&e))?;
+        Ok(recent::parse(&text)
+            .into_iter()
+            .take(SNAPSHOT_MAX)
+            .map(|e| self.recent_item(e))
+            .collect())
+    }
+
+    /// The trash directory, item and path inside it of a name, all pinned.
+    fn locate<'a>(&self, found: &'a Dirs, name: &'a [u8]) -> Result<Located<'a>, Failure> {
+        let (item, rel) = match name.iter().position(|&b| b == b'/') {
+            Some(at) => (&name[..at], &name[at + 1..]),
+            None => (name, &name[..0]),
+        };
+        // One spelling per path: an empty part or a `..` would get past the health check
+        // below, which sees the path as written, not as it is walked.
+        if !rel.is_empty() && !rel.split(|&b| b == b'/').all(trash::valid_entry) {
+            return Err(Failure::st(ST_NOT_FOUND));
+        }
+        let (d, entry) = trash::resolve(&found.dirs, item).ok_or_else(|| self.unresolved(item))?;
+        if !trash::sound(d, self.uid) {
+            return Err(Failure::os(libc::ENOTDIR));
+        }
+        // A mount can sit inside a trashed folder: known hung, it is not to be touched.
+        let inner = d.files().join(OsStr::from_bytes(&entry));
+        if self.blocked(&inner.join(OsStr::from_bytes(rel))) {
+            return Err(Failure::st(ST_SUSPECT_MOUNT));
+        }
+        let pins = d.pins().map_err(|e| missing_or(&e))?;
+        trash::stat_payload(&pins.files, &entry).map_err(|e| missing_or(&e))?;
+        Ok((d, entry, rel, pins))
+    }
+
+    /// One item by name: no scan, whatever the size of the trash.
+    fn stat(&self, scheme: u8, name: &[u8]) -> Result<Item, Failure> {
+        if scheme == SCHEME_RECENT {
+            let uri = unhex(name).ok_or(Failure::st(ST_NOT_FOUND))?;
+            let path = self.xbel.as_ref().ok_or(Failure::st(ST_IO_ERROR))?;
+            let text = recent::load(path).map_err(|e| io_failure(&e))?;
+            let e = recent::parse(&text)
+                .into_iter()
+                .find(|e| e.uri == uri)
+                .ok_or(Failure::st(ST_NOT_FOUND))?;
+            return Ok(self.recent_item(e));
+        }
+        let found = self.dirs();
+        let (d, entry, rel, pins) = self.locate(&found, name)?;
+        if rel.is_empty() {
+            return Ok(trash::item_in(d, &pins, &entry));
+        }
+        trash::child_item(d, &pins, &entry, rel, name).map_err(|e| missing_or(&e))
+    }
+
+    fn children(&self, name: &[u8]) -> Result<(Vec<Item>, bool), Failure> {
+        let found = self.dirs();
+        let (d, entry, rel, pins) = self.locate(&found, name)?;
+        let mut left = trash::SCAN_BYTES_MAX;
+        let skip = |t: &[u8]| self.blocked(Path::new(OsStr::from_bytes(t)));
+        let items = trash::children_of(d, &pins, &entry, rel, name, &mut left, &skip)
+            .map_err(|e| missing_or(&e))?;
+        let partial = left == 0;
+        Ok((items, partial))
+    }
+
+    /// A number that changes when the scheme's list may have.
+    fn stamp(&self, scheme: u8) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        if scheme == SCHEME_RECENT {
+            let m = self.xbel.as_ref().and_then(|p| fs::metadata(p).ok());
+            return m.map_or(0, |m| {
+                let h = trash::fnv(1, &m.mtime().to_le_bytes());
+                let h = trash::fnv(h, &m.mtime_nsec().to_le_bytes());
+                trash::fnv(h, &m.len().to_le_bytes())
             });
         }
-        Ok(items)
+        self.dirs()
+            .dirs
+            .iter()
+            .filter(|d| trash::sound(d, self.uid))
+            .fold(1, |h, d| trash::fnv(h, &trash::stamp(d).to_le_bytes()))
     }
 
     /// Run one op to its end, within the deadline, telling the client it is alive.
@@ -783,6 +874,18 @@ fn reply_status(st: u32, draining: bool) -> u32 {
     }
 }
 
+/// A name resolved: its trash, its entry, the path inside it, and the held directories.
+type Located<'a> = (&'a TrashDir, Vec<u8>, &'a [u8], Pins);
+
+/// "It is not there" as a not-found, not as an OS error.
+fn missing_or(e: &std::io::Error) -> Failure {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Failure::st(ST_NOT_FOUND)
+    } else {
+        io_failure(e)
+    }
+}
+
 /// `leaf` under the held-open `dir`.
 fn anchor(dir: OwnedFd, leaf: &[u8]) -> Result<Anchor, Failure> {
     Ok(Anchor {
@@ -886,6 +989,12 @@ impl Svc {
     fn unresolved(&self, name: &[u8]) -> Failure {
         match trash::volume_of(name) {
             Some(dir) if self.blocked(&dir) => Failure::st(ST_SUSPECT_MOUNT),
+            // The home trash left the list because its mount hung: that is no missing item.
+            None if name.starts_with(b"h-")
+                && self.home.as_ref().is_some_and(|h| self.blocked(&h.dir)) =>
+            {
+                Failure::st(ST_SUSPECT_MOUNT)
+            }
             _ => Failure::st(ST_NOT_FOUND),
         }
     }
@@ -1066,6 +1175,59 @@ impl Session for VfsSession {
                 });
             }
             MSG_TRASH_EMPTY => self.spawn(port, msg.seq, Svc::empty),
+            MSG_VFS_STAT => {
+                let mut p = msg.payload();
+                let Some((&scheme, rest)) = p.split_first() else {
+                    return bad();
+                };
+                p = rest;
+                let Some(name) = take16(&mut p).filter(|_| p.is_empty()).map(<[u8]>::to_vec) else {
+                    return bad();
+                };
+                if scheme > SCHEME_RECENT {
+                    return bad();
+                }
+                self.spawn(port, msg.seq, move |svc, _| match svc.stat(scheme, &name) {
+                    Ok(item) => (ST_OK, page(&[item], 0, false)),
+                    Err(f) => (f.status, f.body()),
+                });
+            }
+            MSG_VFS_CHILDREN => {
+                let mut p = msg.payload();
+                let Some((c, rest)) = p.split_first_chunk::<4>() else {
+                    return bad();
+                };
+                let cursor = u32::from_le_bytes(*c) as usize;
+                p = rest;
+                let Some(name) = take16(&mut p).filter(|_| p.is_empty()).map(<[u8]>::to_vec) else {
+                    return bad();
+                };
+                if cursor > 0 {
+                    let s = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+                    let body = page(&s.0, cursor, s.1);
+                    return port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_OK, &body));
+                }
+                let snap = Arc::clone(&self.snapshot);
+                self.spawn(port, msg.seq, move |svc, _| match svc.children(&name) {
+                    Ok((items, partial)) => {
+                        let body = page(&items, 0, partial);
+                        *snap.lock().unwrap_or_else(PoisonError::into_inner) = (items, partial);
+                        (ST_OK, body)
+                    }
+                    Err(f) => (f.status, f.body()),
+                });
+            }
+            MSG_VFS_STAMP => {
+                let [scheme] = *msg.payload() else {
+                    return bad();
+                };
+                if scheme > SCHEME_RECENT {
+                    return bad();
+                }
+                self.spawn(port, msg.seq, move |svc, _| {
+                    (ST_OK, svc.stamp(scheme).to_le_bytes().to_vec())
+                });
+            }
             _ => self.inner.request(port, msg),
         }
     }

@@ -457,6 +457,76 @@ fn a_mounted_snapshot_is_a_backup() -> R {
     Ok(())
 }
 
+/// One item without a list, the inside of a trashed folder, and a stamp that moves.
+#[test]
+fn stat_children_and_stamp_over_the_wire() -> R {
+    use gungnird::vfssvc::{MSG_VFS_CHILDREN, MSG_VFS_STAMP, MSG_VFS_STAT};
+    let d = Dir::new("stat")?;
+    let t = trash_dir(&d)?;
+    trashed(&t, "a", &d.join("a"))?;
+    fs::create_dir_all(t.join("files/dir/sub"))?;
+    fs::write(t.join("files/dir/sub/leaf"), b"hello")?;
+    fs::write(
+        t.join("info/dir.trashinfo"),
+        format!("[Trash Info]\nPath={}\n", d.join("dir").display()),
+    )?;
+    let mut dm = start(&d, false, &[])?;
+    let stat = |c: &mut Client, name: &[u8]| -> R<u32> {
+        let mut p = vec![SCHEME_TRASH];
+        p.extend(len16(name));
+        Ok(call(c, MSG_VFS_STAT, &p)?.0)
+    };
+    assert_eq!(stat(&mut dm.c, b"h-a")?, ST_OK);
+    assert_eq!(stat(&mut dm.c, b"h-dir/sub/leaf")?, ST_OK);
+    assert_eq!(stat(&mut dm.c, b"h-nope")?, ST_NOT_FOUND);
+    assert_eq!(stat(&mut dm.c, b"h-dir/nope")?, ST_NOT_FOUND);
+    assert_eq!(stat(&mut dm.c, b"h-dir/../a")?, ST_NOT_FOUND);
+    assert_eq!(stat(&mut dm.c, b"h-dir/sub/x/../../leaf")?, ST_NOT_FOUND);
+    assert_eq!(stat(&mut dm.c, b"h-dir//sub")?, ST_NOT_FOUND);
+    let mut p = 0u32.to_le_bytes().to_vec();
+    p.extend(len16(b"h-dir"));
+    let (st, body) = call(&mut dm.c, MSG_VFS_CHILDREN, &p)?;
+    assert_eq!(st, ST_OK);
+    assert_eq!(u16::from_le_bytes([body[4], body[5]]), 1);
+    let (st, one) = call(&mut dm.c, MSG_VFS_STAMP, &[SCHEME_TRASH])?;
+    assert_eq!((st, one.len()), (ST_OK, 8));
+    assert_eq!(call(&mut dm.c, MSG_VFS_STAMP, &[SCHEME_TRASH])?.1, one);
+    thread::sleep(Duration::from_millis(20));
+    trashed(&t, "b", &d.join("b"))?;
+    assert_ne!(call(&mut dm.c, MSG_VFS_STAMP, &[SCHEME_TRASH])?.1, one);
+    assert_eq!(call(&mut dm.c, MSG_VFS_STAMP, &[9])?.0, 6);
+    Ok(())
+}
+
+/// A hung mount inside a trashed folder is not touched by a look into it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_hung_mount_inside_a_trashed_folder_is_refused() -> R {
+    use gungnird::vfssvc::MSG_VFS_STAT;
+    let d = Dir::new("inner-hung")?;
+    let t = trash_dir(&d)?;
+    fs::create_dir_all(t.join("files/tree/m"))?;
+    fs::write(t.join("info/tree.trashinfo"), "[Trash Info]\nPath=/tree\n")?;
+    let hung = t.join("files/tree/m");
+    let mut dm = start(
+        &d,
+        false,
+        &[("GUNGNIR_TEST_FAKE_HUNG_MOUNT", hung.to_str().ok_or("path")?)],
+    )?;
+    let mut p = vec![SCHEME_TRASH];
+    p.extend(len16(b"h-tree/m/f"));
+    let t0 = Instant::now();
+    loop {
+        let st = call(&mut dm.c, MSG_VFS_STAT, &p)?.0;
+        if st == gungnird::md::ST_SUSPECT_MOUNT {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "never refused: {st}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 /// An empty stops with its client, between items as well as inside one.
 #[cfg(feature = "test-hooks")]
 #[test]
