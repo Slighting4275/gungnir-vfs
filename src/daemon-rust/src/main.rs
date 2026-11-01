@@ -272,12 +272,11 @@ fn serve_daemon(
     }
     eprintln!("gungnird: file ops engine: {engine:?} ({why})");
     // Temp files of copies and moves a previous run left unfinished (killed, or a stuck
-    // op abandoned at a drain): removed before any new op (BC-A2-F03b, BC-HC-F06).
+    // op abandoned at a drain): removed in the background, since they may sit on a mount
+    // that is still hung (BC-A2-F03b, BC-HC-F06).
     let ledger_path = db_path.with_file_name("ops-pending");
-    match ops::sweep_temp_ledger(&ledger_path) {
-        Ok(0) => {}
-        Ok(n) => eprintln!("gungnird: removed {n} temp file(s) left by unfinished file ops"),
-        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
+    if let Err(e) = ops::detach_temp_sweep(&ledger_path) {
+        eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display());
     }
     let ops = Arc::new(Ops::start(
         ops_cfg,
@@ -293,6 +292,16 @@ fn serve_daemon(
     {
         Ok(f) => ops.set_temp_ledger(f),
         Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
+    }
+    let kept_path = ledger_path.with_extension("kept");
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&kept_path)
+    {
+        Ok(f) => ops.set_kept_ledger(f),
+        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", kept_path.display()),
     }
     if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
         // Every first worker has its ring before the filter goes in; a worker on plain
@@ -410,16 +419,27 @@ struct FreshStore {
 impl FreshStore {
     /// What a start with the store at `db` would create: nothing if it exists.
     fn note(db: &std::path::Path) -> Self {
-        // The temp ledger next to the store (BC-A2-F03) is created by every start.
+        // The temp ledger next to the store (BC-A2-F03) and its kept file are created by
+        // every start.
         let ledger = db.with_file_name("ops-pending");
-        let new_ledger = std::fs::symlink_metadata(&ledger).is_err();
+        let kept = ledger.with_extension("kept");
         if std::fs::symlink_metadata(db).is_ok() {
+            let files = [ledger, kept]
+                .into_iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_err())
+                .collect();
             return Self {
-                files: if new_ledger { vec![ledger] } else { Vec::new() },
+                files,
                 dirs: Vec::new(),
             };
         }
-        let mut files = vec![db.to_path_buf(), ledger];
+        let mut files = vec![db.to_path_buf()];
+        // Only if new: left by an earlier run, they are records, not this start's litter.
+        files.extend(
+            [ledger, kept]
+                .into_iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_err()),
+        );
         for sfx in ["-wal", "-shm", "-journal"] {
             let mut p = db.as_os_str().to_os_string();
             p.push(sfx);
@@ -441,7 +461,10 @@ impl FreshStore {
     fn remove(&self) {
         let mut n = 0;
         for f in &self.files {
-            if std::fs::remove_file(f).is_ok() && !f.ends_with("ops-pending") {
+            if std::fs::remove_file(f).is_ok()
+                && !f.ends_with("ops-pending")
+                && !f.ends_with("ops-pending.kept")
+            {
                 n += 1;
             }
         }

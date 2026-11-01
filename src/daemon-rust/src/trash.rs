@@ -20,19 +20,32 @@
 //! path must stay inside that volume.
 
 use std::{
-    ffi::{CString, OsStr},
-    fs,
-    io::{self, Read},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt},
+    ffi::{CStr, CString, OsStr},
+    fs::{self, File},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
-    path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    path::{Component, Path, PathBuf},
+    sync::{Mutex, MutexGuard, TryLockError},
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Longest `.trashinfo` read; anything bigger is listed degraded.
 const INFO_MAX: u64 = 64 * 1024;
+/// Longest `Path=` taken: no real path is longer, and a volume could ship thousands of
+/// hard links to one huge info file.
+const PATH_LEN_MAX: usize = libc::PATH_MAX as usize;
+/// Longest `DeletionDate=` taken; a real one is 19 bytes.
+const DATE_LEN_MAX: usize = 64;
+/// Text one listing holds across every trash, on top of [`SCAN_MAX`]: subvolumes make
+/// trash directories cheap, so the bound cannot be per directory.
+pub const SCAN_BYTES_MAX: usize = 64 << 20;
+/// How old an info file with no payload must be to count as an orphan: `g_file_trash`
+/// writes the info first, and in between it is a file on its way in.
+const ORPHAN_AGE_SECS: i64 = 10;
 const HOME_VOLUME: &str = "h";
 /// Entries read from one trash directory: a volume is foreign media, and its list is not
 /// allowed to grow the daemon without bound.
@@ -41,6 +54,15 @@ pub const SCAN_MAX: usize = 1 << 17;
 const SIZES_MAX: u64 = 1 << 20;
 /// Request threads delete at the same time; each rewrite must see the last one's result.
 static SIZES: Mutex<()> = Mutex::new(());
+/// How long a delete waits for that turn. The cache may go stale, a request must not stick.
+const SIZES_WAIT: Duration = Duration::from_secs(1);
+
+/// The two directories of a trash, held open.
+#[derive(Debug)]
+pub struct Pins {
+    pub files: OwnedFd,
+    pub info: OwnedFd,
+}
 
 /// One trash directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +97,8 @@ pub struct Item {
     pub mtime: i64,
     /// `DeletionDate=` as written, empty if none.
     pub deleted: Vec<u8>,
+    /// A symlink payload's target.
+    pub link: Vec<u8>,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -109,10 +133,65 @@ impl TrashDir {
         self.dir.join("info")
     }
 
-    fn info_path(&self, entry: &[u8]) -> PathBuf {
-        let mut n = entry.to_vec();
-        n.extend_from_slice(b".trashinfo");
-        self.info().join(OsStr::from_bytes(&n))
+    /// Open a directory of this trash, walking down from `top` without following any
+    /// link. Everything done through the descriptor stays in the directory that was
+    /// checked: replacing a component with a symlink afterwards changes nothing.
+    fn pin(&self, sub: Option<&str>) -> io::Result<OwnedFd> {
+        let rel = self
+            .dir
+            .strip_prefix(&self.top)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let mut cur = open_at(
+            libc::AT_FDCWD,
+            &c_path(self.top.as_os_str().as_bytes())?,
+            DIR,
+        )?;
+        for part in rel.components() {
+            let Component::Normal(n) = part else {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            };
+            cur = open_at(
+                cur.as_raw_fd(),
+                &c_path(n.as_bytes())?,
+                DIR | libc::O_NOFOLLOW,
+            )?;
+        }
+        if let Some(n) = sub {
+            cur = open_at(
+                cur.as_raw_fd(),
+                &c_path(n.as_bytes())?,
+                DIR | libc::O_NOFOLLOW,
+            )?;
+        }
+        mine(&cur)?;
+        Ok(cur)
+    }
+
+    /// `files/` and `info/`, for one operation on one item: both are then the same trash
+    /// from its first check to its last step.
+    ///
+    /// # Errors
+    /// See [`Self::pin_files`].
+    pub fn pins(&self) -> io::Result<Pins> {
+        // Both from one held `dir`: two walks could land in two different trashes.
+        let base = self.pin(None)?;
+        let sub = |n: &CStr| {
+            let fd = open_at(base.as_raw_fd(), n, DIR | libc::O_NOFOLLOW)?;
+            mine(&fd)?;
+            Ok::<_, io::Error>(fd)
+        };
+        Ok(Pins {
+            files: sub(c"files")?,
+            info: sub(c"info")?,
+        })
+    }
+
+    /// `files/`, pinned for operations on the payloads.
+    ///
+    /// # Errors
+    /// A component is missing, a symlink, or someone else's.
+    pub fn pin_files(&self) -> io::Result<OwnedFd> {
+        self.pin(Some("files"))
     }
 
     fn payload(&self, entry: &[u8]) -> PathBuf {
@@ -141,6 +220,64 @@ pub fn volume_of(name: &[u8]) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(OsStr::from_bytes(&unhex(v)?)))
+}
+
+const DIR: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+
+/// A trash directory is the user's own, however it was reached.
+fn mine(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: plain getter.
+    if stat_at(fd.as_raw_fd(), c"")?.st_uid != unsafe { libc::geteuid() } {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
+}
+
+fn c_path(b: &[u8]) -> io::Result<CString> {
+    CString::new(b).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn open_at(dir: RawFd, name: &CStr, flags: i32) -> io::Result<OwnedFd> {
+    // SAFETY: valid NUL-terminated name; the result is checked before it is owned.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `lstat` relative to `dir`; an empty name is `dir` itself.
+fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    // SAFETY: an all-zero stat is valid, and the kernel only writes to it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+    // SAFETY: valid name and out pointer.
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &raw mut st, flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+fn unlink_at(dir: RawFd, name: &CStr, flags: i32) -> io::Result<()> {
+    // SAFETY: valid NUL-terminated name.
+    if unsafe { libc::unlinkat(dir, name.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The way to list a pinned directory: `std` can only open a directory by path.
+fn fd_path(fd: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+fn info_name(entry: &[u8]) -> io::Result<CString> {
+    c_path(&[entry, b".trashinfo"].concat())
+}
+
+fn is_dir(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
 /// The trash directory a URI name belongs to, among those known. A volume is matched
@@ -220,6 +357,97 @@ pub fn sound(d: &TrashDir, uid: u32) -> bool {
     own_dir(&d.dir, uid) && own_dir(&d.files(), uid) && own_dir(&d.info(), uid)
 }
 
+/// Whether `d` is a trash that exists but cannot be used. Absent directories are simply
+/// nothing to list; anything else that is not [`sound`] may hide items, so it can never
+/// count as empty.
+#[must_use]
+pub fn unusable(d: &TrashDir, uid: u32) -> bool {
+    // Only "no such file" is absence: a stat that fails any other way cannot say so.
+    let absent =
+        |p: &Path| matches!(fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    !absent(&d.dir) && (!absent(&d.files()) || !own_dir(&d.dir, uid)) && !sound(d, uid)
+}
+
+/// A restore to `dest` stays where `d` allows it: on a volume, the directory it lands in
+/// must really be on that volume, or foreign media could steer a file into, say, the
+/// user's autostart directory. (The home trash is the user's own and needs no such check.)
+/// The path is walked one component at a time from a held top, reading each link instead
+/// of following it: a link that stays on the volume works, even an absolute one, and one
+/// that leaves it is refused without ever touching what it points at (that may be a hung
+/// mount). A link planted mid-walk fails `O_NOFOLLOW`. The result goes on meaning that
+/// directory whatever happens to the path.
+#[must_use]
+pub fn restore_parent(d: &TrashDir, dest: &[u8]) -> Option<OwnedFd> {
+    const LINKS_MAX: usize = 40; // the kernel's own limit
+    let parent = Path::new(OsStr::from_bytes(dest)).parent()?;
+    let mut left: Vec<Vec<u8>> = parts(parent.strip_prefix(&d.top).ok()?);
+    left.reverse();
+    let top = c_path(d.top.as_os_str().as_bytes()).ok()?;
+    let top = open_at(libc::AT_FDCWD, &top, DIR).ok()?;
+    // One descriptor and the way there: `..` walks down again from the top, so depth costs
+    // no descriptors and `..` can never rise past where the walk came from.
+    let mut cur: Option<OwnedFd> = None;
+    let mut at: Vec<Vec<u8>> = Vec::new();
+    let mut links = 0;
+    while let Some(part) = left.pop() {
+        if part == b".." {
+            at.pop()?;
+            cur = None;
+            for name in &at {
+                let from = cur.as_ref().unwrap_or(&top).as_raw_fd();
+                let name = c_path(name).ok()?;
+                cur = Some(open_at(from, &name, DIR | libc::O_NOFOLLOW).ok()?);
+            }
+            continue;
+        }
+        let from = cur.as_ref().unwrap_or(&top).as_raw_fd();
+        let name = c_path(&part).ok()?;
+        if stat_at(from, &name).ok()?.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            cur = Some(open_at(from, &name, DIR | libc::O_NOFOLLOW).ok()?);
+            at.push(part);
+            continue;
+        }
+        links += 1;
+        if links > LINKS_MAX {
+            return None;
+        }
+        let to = read_link_at(from, &name).ok()?;
+        let to = Path::new(OsStr::from_bytes(&to));
+        let mut more = if to.is_absolute() {
+            cur = None;
+            at.clear();
+            parts(to.strip_prefix(&d.top).ok()?)
+        } else {
+            parts(to)
+        };
+        more.reverse();
+        left.append(&mut more);
+    }
+    Some(cur.unwrap_or(top))
+}
+
+/// A relative path's components; `.` means nothing here.
+fn parts(p: &Path) -> Vec<Vec<u8>> {
+    p.components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.as_bytes().to_vec()),
+            Component::ParentDir => Some(b"..".to_vec()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn read_link_at(dir: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: writes at most buf.len() bytes into `buf`.
+    let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
+}
+
 /// The parsed content of a `.trashinfo`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Info {
@@ -261,21 +489,24 @@ pub fn parse_info(text: &[u8]) -> Option<Info> {
             }
         }
     }
-    (!info.path.is_empty()).then_some(info)
+    if info.deleted.len() > DATE_LEN_MAX {
+        info.deleted.clear();
+    }
+    (!info.path.is_empty() && info.path.len() <= PATH_LEN_MAX).then_some(info)
 }
 
-/// Read a `.trashinfo` without following a link, blocking on a FIFO or taking a terminal.
-fn read_capped(p: &Path) -> io::Result<Vec<u8>> {
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-        .open(p)?;
+/// Read a small regular file without following a link, blocking on a FIFO, taking a
+/// terminal or reading more than `max` bytes, whatever its metadata claims.
+fn read_capped(dir: RawFd, name: &CStr, max: u64) -> io::Result<Vec<u8>> {
+    let flags =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let f = File::from(open_at(dir, name, flags)?);
     if !f.metadata()?.is_file() {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
     let mut out = Vec::new();
-    f.take(INFO_MAX + 1).read_to_end(&mut out)?;
-    if out.len() as u64 > INFO_MAX {
+    f.take(max + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > max {
         return Err(io::Error::from_raw_os_error(libc::EFBIG));
     }
     Ok(out)
@@ -285,7 +516,13 @@ fn read_capped(p: &Path) -> io::Result<Vec<u8>> {
 /// Outside the home trash an absolute path must lie on the volume itself.
 #[must_use]
 pub fn original_path(d: &TrashDir, path: &[u8]) -> Option<Vec<u8>> {
-    if path.split(|&b| b == b'/').any(|c| c == b"." || c == b"..") {
+    // One spelling for a path: what clients send back has been through GFile, and every
+    // comparison with it has to mean the same place.
+    let body = path.strip_prefix(b"/").unwrap_or(path);
+    if body
+        .split(|&b| b == b'/')
+        .any(|c| c.is_empty() || c == b"." || c == b"..")
+    {
         return None;
     }
     let top = d.top.as_os_str().as_bytes();
@@ -304,30 +541,43 @@ pub fn original_path(d: &TrashDir, path: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn kind_of(m: &fs::Metadata) -> u8 {
-    let t = m.file_type();
-    if t.is_symlink() {
-        KIND_SYMLINK
-    } else if t.is_dir() {
-        KIND_DIR
-    } else if t.is_file() {
-        KIND_FILE
-    } else {
-        KIND_SPECIAL
+fn kind_of(st: &libc::stat) -> u8 {
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => KIND_SYMLINK,
+        libc::S_IFDIR => KIND_DIR,
+        libc::S_IFREG => KIND_FILE,
+        _ => KIND_SPECIAL,
     }
 }
 
 /// One item from its entry name.
 #[must_use]
 pub fn read_item(d: &TrashDir, entry: &[u8]) -> Item {
+    let (files, info) = (d.pin_files().ok(), d.pin(Some("info")).ok());
+    item_at(d, files.as_ref(), info.as_ref(), entry)
+}
+
+/// One item through a held pair.
+#[must_use]
+pub fn item_in(d: &TrashDir, pins: &Pins, entry: &[u8]) -> Item {
+    item_at(d, Some(&pins.files), Some(&pins.info), entry)
+}
+
+/// One item through its pinned directories; one that could not be pinned degrades it.
+fn item_at(d: &TrashDir, files: Option<&OwnedFd>, info: Option<&OwnedFd>, entry: &[u8]) -> Item {
     let payload = d.payload(entry);
     // A payload that cannot be examined is still an item (A-T005-1).
-    let (kind, size, mtime) = match fs::symlink_metadata(&payload) {
-        Ok(m) => (kind_of(&m), m.len(), m.mtime()),
-        Err(_) => (KIND_SPECIAL, 0, 0),
+    let st = files.and_then(|f| stat_at(f.as_raw_fd(), &c_path(entry).ok()?).ok());
+    let (kind, size, mtime) = match st {
+        Some(s) => (kind_of(&s), s.st_size as u64, s.st_mtime),
+        None => (KIND_SPECIAL, 0, 0),
     };
-    let info = read_capped(&d.info_path(entry))
-        .ok()
+    let link = (kind == KIND_SYMLINK)
+        .then(|| read_link_at(files?.as_raw_fd(), &c_path(entry).ok()?).ok())
+        .flatten()
+        .unwrap_or_default();
+    let info = info
+        .and_then(|f| read_capped(f.as_raw_fd(), &info_name(entry).ok()?, INFO_MAX).ok())
         .and_then(|t| parse_info(&t));
     let (orig, deleted) = match info {
         Some(i) => (
@@ -348,6 +598,7 @@ pub fn read_item(d: &TrashDir, entry: &[u8]) -> Item {
         size,
         mtime,
         deleted,
+        link,
     }
 }
 
@@ -357,12 +608,158 @@ pub fn read_item(d: &TrashDir, entry: &[u8]) -> Item {
 /// # Errors
 /// `files/` cannot be read.
 pub fn scan(d: &TrashDir) -> io::Result<Vec<Item>> {
+    scan_capped(d, &mut SCAN_BYTES_MAX.clone())
+}
+
+/// [`scan`] out of a budget of text shared with other directories; it runs out to 0.
+///
+/// # Errors
+/// `files/` cannot be read.
+pub fn scan_capped(d: &TrashDir, left: &mut usize) -> io::Result<Vec<Item>> {
+    let files = d.pin_files()?;
+    let info = d.pin(Some("info")).ok();
     let mut items = Vec::new();
-    for e in fs::read_dir(d.files())?.take(SCAN_MAX) {
+    for e in fs::read_dir(fd_path(&files))?.take(SCAN_MAX) {
+        if *left == 0 {
+            break;
+        }
         let name = e?.file_name();
-        items.push(read_item(d, name.as_bytes()));
+        let it = item_at(d, Some(&files), info.as_ref(), name.as_bytes());
+        let bytes =
+            it.name.len() + it.orig.len() + it.target.len() + it.deleted.len() + it.link.len();
+        *left = left.saturating_sub(bytes);
+        items.push(it);
     }
     Ok(items)
+}
+
+/// Directories right below `root` on another device with no mount needed: subvolumes.
+/// `skip` says which must not be looked at (a mount point known hung). Mount points turn
+/// up here too; they are volumes as well, and the caller drops duplicates.
+#[must_use]
+pub fn subvolume_tops(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    const ENTRIES_MAX: usize = 4096;
+    let Ok(dev) = fs::symlink_metadata(root).map(|m| m.dev()) else {
+        return Vec::new();
+    };
+    let Ok(it) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    it.take(ENTRIES_MAX)
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        // Btrfs answers for itself, snapshots told apart (`btrfs.rs`).
+        .filter(|p| {
+            !skip(p)
+                && fs::symlink_metadata(p).is_ok_and(|m| m.dev() != dev)
+                && !crate::btrfs::is_btrfs(p)
+        })
+        .collect()
+}
+
+/// Clear the orphans of a trash whose `files/` is empty: what `gio trash --empty` and file
+/// managers leave, as they delete item by item and never send the daemon's empty.
+///
+/// Returns whether an orphan that should have gone is still there: nothing lists one, so
+/// this is the only way a client can hear of it.
+pub fn sweep_if_empty(d: &TrashDir) -> bool {
+    let Ok(Pins { files, info }) = d.pins() else {
+        return false;
+    };
+    if !fs::read_dir(fd_path(&files)).is_ok_and(|mut it| it.next().is_none()) {
+        return false;
+    }
+    let _ = remove_orphans(d);
+    // Unreadable: nothing says it is clean.
+    let Ok(it) = fs::read_dir(fd_path(&info)) else {
+        return true;
+    };
+    it.flatten().any(|e| {
+        let name = e.file_name();
+        name.as_bytes()
+            .strip_suffix(b".trashinfo")
+            .is_some_and(|n| valid_entry(n) && settled(&info, n))
+    })
+}
+
+/// Whether `d` holds an orphan that should have gone, with `items` its listing. An orphan
+/// is on no list, so this is the only way a client can hear of one. Clears what it can.
+#[must_use]
+pub fn stuck_orphans(d: &TrashDir, items: &[Item]) -> bool {
+    let Ok(pins) = d.pins() else {
+        return false;
+    };
+    let listed: std::collections::HashSet<&[u8]> =
+        items.iter().map(|i| i.entry.as_slice()).collect();
+    let orphan = || -> io::Result<bool> {
+        let mut seen = 0;
+        for e in fs::read_dir(fd_path(&pins.info))? {
+            // No end of it in sight: nothing says the rest is clean.
+            seen += 1;
+            if seen > SCAN_MAX {
+                return Ok(true);
+            }
+            let name = e?.file_name();
+            let Some(entry) = name.as_bytes().strip_suffix(b".trashinfo") else {
+                continue;
+            };
+            if valid_entry(entry)
+                && !listed.contains(entry)
+                && settled(&pins.info, entry)
+                && matches!(stat_payload(&pins.files, entry), Err(e) if e.kind() == io::ErrorKind::NotFound)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    match orphan() {
+        Ok(false) => false,
+        Ok(true) => {
+            let _ = remove_orphans(d);
+            orphan().unwrap_or(true)
+        }
+        // Unreadable: nothing says it is clean.
+        Err(_) => true,
+    }
+}
+
+/// Whether anything is left now: what an empty asks once it has finished. A payload, or
+/// an info entry that could not be removed.
+///
+/// # Errors
+/// `files/` or `info/` cannot be read.
+pub fn has_items(d: &TrashDir) -> io::Result<bool> {
+    let pins = d.pins()?;
+    if fs::read_dir(fd_path(&pins.files))?.next().is_some() {
+        return Ok(true);
+    }
+    for e in fs::read_dir(fd_path(&pins.info))? {
+        let name = e?.file_name();
+        // Only the info of a possible item: `.trashinfo` alone names none.
+        if name
+            .as_bytes()
+            .strip_suffix(b".trashinfo")
+            .is_some_and(valid_entry)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `entry`'s payload in a pinned `files/`, for its existence and nothing else.
+///
+/// # Errors
+/// It is absent, or cannot be examined.
+pub fn stat_payload(files: &OwnedFd, entry: &[u8]) -> io::Result<()> {
+    stat_at(files.as_raw_fd(), &c_path(entry)?).map(|_| ())
+}
+
+/// No info entry: absent, or a payload name with no room for the `.trashinfo` suffix.
+fn no_such_info(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENAMETOOLONG)
 }
 
 /// Check that the info entry of `entry` can be removed, before the payload is touched
@@ -372,24 +769,33 @@ pub fn scan(d: &TrashDir) -> io::Result<Vec<Item>> {
 /// # Errors
 /// The errno that would stop the removal.
 pub fn check_info_removable(d: &TrashDir, entry: &[u8]) -> Result<(), i32> {
-    let dir = CString::new(d.info().as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-    // SAFETY: valid NUL-terminated path.
-    if unsafe { libc::access(dir.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO));
+    let dir = d
+        .pin(Some("info"))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    check_info_removable_at(&dir, entry)
+}
+
+/// [`check_info_removable`] in a held `info/`.
+///
+/// # Errors
+/// The errno that would stop the removal.
+pub fn check_info_removable_at(dir: &OwnedFd, entry: &[u8]) -> Result<(), i32> {
+    let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    // SAFETY: valid NUL-terminated path, and "." is the pinned directory itself.
+    if unsafe { libc::faccessat(dir.as_raw_fd(), c".".as_ptr(), libc::W_OK | libc::X_OK, 0) } != 0 {
+        return Err(errno(io::Error::last_os_error()));
     }
-    let p = d.info_path(entry);
-    match fs::symlink_metadata(&p) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-        Ok(m) if m.is_dir() => match fs::read_dir(&p) {
-            Ok(mut it) => match it.next() {
+    let name = info_name(entry).map_err(errno)?;
+    match stat_at(dir.as_raw_fd(), &name) {
+        Err(e) if no_such_info(&e) => Ok(()),
+        Err(e) => Err(errno(e)),
+        Ok(st) if is_dir(&st) => {
+            let sub = open_at(dir.as_raw_fd(), &name, DIR | libc::O_NOFOLLOW).map_err(errno)?;
+            match fs::read_dir(fd_path(&sub)).map_err(errno)?.next() {
                 None => Ok(()),
                 Some(_) => Err(libc::ENOTEMPTY),
-            },
-            Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-        },
+            }
+        }
         Ok(_) => Ok(()),
     }
 }
@@ -399,29 +805,60 @@ pub fn check_info_removable(d: &TrashDir, entry: &[u8]) -> Result<(), i32> {
 /// # Errors
 /// The removal failed; the payload is gone by then, and the error says so to the caller.
 pub fn remove_info(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
-    let p = d.info_path(entry);
-    let r = match fs::symlink_metadata(&p) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-        Ok(m) if m.is_dir() => fs::remove_dir(&p),
-        Ok(_) => fs::remove_file(&p),
-    };
+    let dir = d.pin(Some("info"));
+    match dir {
+        Ok(dir) => remove_info_at(d, &dir, entry),
+        Err(e) => {
+            let _ = drop_size_line(d, entry);
+            Err(e)
+        }
+    }
+}
+
+/// [`remove_info`] in a held `info/`: the entry checked is the entry removed.
+///
+/// # Errors
+/// See [`remove_info`].
+pub fn remove_info_at(d: &TrashDir, dir: &OwnedFd, entry: &[u8]) -> io::Result<()> {
+    let r = (|| {
+        let name = info_name(entry)?;
+        match stat_at(dir.as_raw_fd(), &name) {
+            Err(e) if no_such_info(&e) => Ok(()),
+            Err(e) => Err(e),
+            Ok(st) if is_dir(&st) => unlink_at(dir.as_raw_fd(), &name, libc::AT_REMOVEDIR),
+            Ok(_) => unlink_at(dir.as_raw_fd(), &name, 0),
+        }
+    })();
     // The cache is only a cache: a stale line makes readers rescan, so failing to drop
     // it is not worth reporting.
     let _ = drop_size_line(d, entry);
     r
 }
 
+/// `m`, within `wait`.
+fn turn(m: &Mutex<()>, wait: Duration) -> Option<MutexGuard<'_, ()>> {
+    let t0 = Instant::now();
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if t0.elapsed() >= wait => return None,
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 /// Remove `entry`'s line from `directorysizes`, atomically (`<size> <mtime> <encoded>`).
 fn drop_size_line(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
-    let _serial = SIZES.lock().unwrap_or_else(PoisonError::into_inner);
-    let path = d.dir.join("directorysizes");
-    if fs::symlink_metadata(&path).is_ok_and(|m| m.len() > SIZES_MAX) {
+    let Some(_serial) = turn(&SIZES, SIZES_WAIT) else {
         return Ok(());
-    }
-    let text = match fs::read(&path) {
+    };
+    let dir = d.pin(None)?;
+    let dirfd = dir.as_raw_fd();
+    let text = match read_capped(dirfd, c"directorysizes", SIZES_MAX) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EFBIG) => return Ok(()),
         Err(e) => return Err(e),
     };
     let mut out = Vec::with_capacity(text.len());
@@ -438,27 +875,65 @@ fn drop_size_line(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
     if !changed {
         return Ok(());
     }
-    let tmp = d
-        .dir
-        .join(format!(".directorysizes-{}", std::process::id()));
-    fs::write(&tmp, &out)?;
-    fs::rename(&tmp, &path)
+    let tmp = c_path(format!(".directorysizes-{}", std::process::id()).as_bytes())?;
+    // The name may already be planted: drop it, then create exclusively (no link is followed).
+    match unlink_at(dirfd, &tmp, 0) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    let mut f = File::from(open_at(dirfd, &tmp, flags)?);
+    let written = f.write_all(&out);
+    drop(f);
+    // SAFETY: valid NUL-terminated names.
+    let r = written.and_then(|()| {
+        if unsafe { libc::renameat(dirfd, tmp.as_ptr(), dirfd, c"directorysizes".as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    });
+    if r.is_err() {
+        let _ = unlink_at(dirfd, &tmp, 0);
+    }
+    r
+}
+
+/// Whether an info file has been there long enough not to be a trash in progress.
+fn settled(info: &OwnedFd, entry: &[u8]) -> bool {
+    // SAFETY: time(NULL) only returns the clock.
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    match info_name(entry).and_then(|n| stat_at(info.as_raw_fd(), &n)) {
+        // From the future (clock skew, a FAT volume): no age can be told, so none is waited.
+        Ok(st) => !(0..ORPHAN_AGE_SECS).contains(&now.saturating_sub(st.st_mtime)),
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 /// Info files whose payload is gone: what a crash between the two removals leaves.
 /// Removes them; returns how many went.
 #[must_use]
 pub fn remove_orphans(d: &TrashDir) -> usize {
-    let Ok(it) = fs::read_dir(d.info()) else {
+    let Ok(Pins { files, info }) = d.pins() else {
+        return 0;
+    };
+    let Ok(it) = fs::read_dir(fd_path(&info)) else {
         return 0;
     };
     let mut n = 0;
     for e in it.flatten() {
         let name = e.file_name();
-        let Some(entry) = name.as_bytes().strip_suffix(b".trashinfo") else {
+        let Some(entry) = name
+            .as_bytes()
+            .strip_suffix(b".trashinfo")
+            .filter(|e| valid_entry(e))
+        else {
             continue;
         };
-        if fs::symlink_metadata(d.payload(entry)).is_err() && remove_info(d, entry).is_ok() {
+        // Only a payload known to be gone makes an orphan: any other failure may be
+        // hiding a file whose info is all that says where it belongs.
+        let gone =
+            matches!(stat_payload(&files, entry), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if gone && settled(&info, entry) && remove_info_at(d, &info, entry).is_ok() {
             n += 1;
         }
     }
@@ -565,10 +1040,50 @@ mod tests {
         let t = T::new("orphan");
         let d = t.trash();
         item(&d, "kept", "/k");
-        fs::write(d.info().join("gone.trashinfo"), b"[Trash Info]\nPath=/g\n").unwrap();
+        let gone = d.info().join("gone.trashinfo");
+        fs::write(&gone, b"[Trash Info]\nPath=/g\n").unwrap();
         assert_eq!(scan(&d).unwrap().len(), 1);
+        // Just written: g_file_trash may be about to rename its payload in.
+        assert_eq!(remove_orphans(&d), 0);
+        let then = std::time::SystemTime::now() - Duration::from_secs(60);
+        File::options()
+            .write(true)
+            .open(&gone)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        // A future date tells nothing, and must not keep it for ever.
+        let later = std::time::SystemTime::now() + Duration::from_secs(1 << 20);
+        File::options()
+            .write(true)
+            .open(&gone)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
         assert_eq!(remove_orphans(&d), 1);
         assert!(!d.info().join("gone.trashinfo").exists());
+        fs::write(&gone, b"x").unwrap();
+        File::options()
+            .write(true)
+            .open(&gone)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        fs::remove_file(d.files().join("kept")).unwrap();
+        fs::remove_file(d.info().join("kept.trashinfo")).unwrap();
+        assert!(!sweep_if_empty(&d));
+        assert!(!gone.exists(), "the last delete takes the orphans along");
+        let stuck = d.info().join("stuck.trashinfo");
+        fs::create_dir_all(stuck.join("x")).unwrap();
+        File::open(&stuck).unwrap().set_modified(then).unwrap();
+        assert!(sweep_if_empty(&d), "one that would not go is reported");
+        fs::remove_dir_all(&stuck).unwrap();
+        fs::set_permissions(d.info(), fs::Permissions::from_mode(0o300)).unwrap();
+        let unreadable = sweep_if_empty(&d);
+        fs::set_permissions(d.info(), fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: plain getter.
+        assert!(unreadable || unsafe { libc::geteuid() } == 0);
+        item(&d, "kept", "/k");
         assert!(d.info().join("kept.trashinfo").exists());
     }
 
@@ -682,6 +1197,314 @@ mod tests {
             });
             assert_eq!(fs::read(d.dir.join("directorysizes")).unwrap(), b"");
         }
+    }
+
+    /// A swap after the check must not redirect anything: info and listing stay put.
+    #[test]
+    fn a_swapped_info_directory_is_refused() {
+        let t = T::new("swap-info");
+        let d = t.trash();
+        let other = t.0.join("other");
+        fs::create_dir(&other).unwrap();
+        let bait = other.join("x.trashinfo");
+        fs::write(&bait, b"precious").unwrap();
+        fs::rename(d.info(), t.0.join("old")).unwrap();
+        symlink(&other, d.info()).unwrap();
+        assert!(remove_info(&d, b"x").is_err());
+        assert_eq!(check_info_removable(&d, b"x"), Err(libc::ENOTDIR));
+        assert_eq!(remove_orphans(&d), 0);
+        assert!(bait.exists());
+    }
+
+    /// The restore parent is resolved beneath the top, atomically.
+    #[test]
+    fn a_restore_parent_cannot_leave_the_volume() {
+        let t = T::new("beneath");
+        let mut d = t.trash();
+        d.home = false;
+        fs::create_dir(t.0.join("in")).unwrap();
+        symlink("in", t.0.join("inner")).unwrap();
+        symlink("/tmp", t.0.join("abs")).unwrap();
+        symlink("../..", t.0.join("up")).unwrap();
+        let at = |n: &str| t.0.join(n).join("f").as_os_str().as_bytes().to_vec();
+        assert!(restore_parent(&d, &at("in")).is_some());
+        assert!(restore_parent(&d, &at("inner")).is_some());
+        assert!(restore_parent(&d, &at("abs")).is_none());
+        assert!(restore_parent(&d, &at("up")).is_none());
+        // An absolute link that stays on the volume is an ordinary layout.
+        symlink(t.0.join("in"), t.0.join("alias")).unwrap();
+        assert!(restore_parent(&d, &at("alias")).is_some());
+        assert!(restore_parent(&d, b"/etc/f").is_none());
+        assert!(restore_parent(&d, t.0.join("f").as_os_str().as_bytes()).is_some());
+    }
+
+    /// A hostile info file costs no more than a path's worth of memory.
+    #[test]
+    fn oversized_info_fields_are_dropped() {
+        let long = "x".repeat(PATH_LEN_MAX + 1);
+        assert!(parse_info(format!("[Trash Info]\nPath=/{long}\n").as_bytes()).is_none());
+        let i = parse_info(format!("[Trash Info]\nPath=/a\nDeletionDate={long}\n").as_bytes());
+        assert!(i.unwrap().deleted.is_empty());
+    }
+
+    /// A scan stops at its budget; what it left is seen by the empty's final look.
+    #[test]
+    fn a_scan_keeps_to_its_byte_budget() {
+        let t = T::new("budget");
+        let d = t.trash();
+        for n in 0..5 {
+            fs::write(d.files().join(format!("f{n}")), b"x").unwrap();
+        }
+        assert_eq!(scan_capped(&d, &mut 1).unwrap().len(), 1);
+        assert_eq!(scan_capped(&d, &mut (1 << 20)).unwrap().len(), 5);
+        assert!(scan_capped(&d, &mut 0).unwrap().is_empty());
+    }
+
+    /// An orphan stuck beside live items still reaches the client; a live item is none.
+    #[test]
+    fn stuck_orphans_show_beside_items() {
+        let t = T::new("stuck-beside");
+        let d = t.trash();
+        item(&d, "kept", "/k");
+        let items = scan(&d).unwrap();
+        assert!(!stuck_orphans(&d, &items));
+        let stuck = d.info().join("stuck.trashinfo");
+        fs::create_dir_all(stuck.join("x")).unwrap();
+        // Too new to tell from a file on its way in.
+        assert!(!stuck_orphans(&d, &items));
+        let then = std::time::SystemTime::now() - Duration::from_secs(60);
+        File::open(&stuck).unwrap().set_modified(then).unwrap();
+        assert!(stuck_orphans(&d, &items));
+        fs::remove_dir_all(&stuck).unwrap();
+        // One that cannot even be looked at is not a clean bill of health.
+        fs::create_dir_all(stuck.join("x")).unwrap();
+        fs::set_permissions(d.info(), fs::Permissions::from_mode(0o400)).unwrap();
+        let hidden = stuck_orphans(&d, &[]);
+        fs::set_permissions(d.info(), fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: plain getter.
+        assert!(hidden || unsafe { libc::geteuid() } == 0);
+        fs::remove_dir_all(&stuck).unwrap();
+        // A plain one is simply cleared.
+        let gone = d.info().join("gone.trashinfo");
+        fs::write(&gone, b"x").unwrap();
+        File::options()
+            .write(true)
+            .open(&gone)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        assert!(!stuck_orphans(&d, &items));
+        assert!(!gone.exists());
+    }
+
+    /// Depth costs no descriptors, and `..` cannot leave the top.
+    #[test]
+    fn a_deep_restore_parent_holds_one_descriptor() {
+        let t = T::new("deep");
+        let mut d = t.trash();
+        d.home = false;
+        let mut p = t.0.clone();
+        for _ in 0..1100 {
+            p.push("d");
+        }
+        fs::create_dir_all(&p).unwrap();
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid out pointer.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rl) },
+            0
+        );
+        if rl.rlim_cur > 1024 {
+            // Cover the case the old walk failed: fewer descriptors than the path is deep.
+            let low = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: rl.rlim_max,
+            };
+            // SAFETY: a valid limit.
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const low) },
+                0
+            );
+        }
+        let dest = p.join("f");
+        let got = restore_parent(&d, dest.as_os_str().as_bytes());
+        // SAFETY: a valid limit.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rl) };
+        assert!(got.is_some());
+        symlink("../../..", t.0.join("up3")).unwrap();
+        let esc = t.0.join("up3/f");
+        assert!(restore_parent(&d, esc.as_os_str().as_bytes()).is_none());
+        fs::create_dir_all(t.0.join("a/b")).unwrap();
+        symlink("../b", t.0.join("a/b/side")).unwrap();
+        assert!(restore_parent(&d, t.0.join("a/b/side/f").as_os_str().as_bytes()).is_some());
+    }
+
+    /// Odd spellings have no meaning: they would not compare equal to what GFile sends.
+    #[test]
+    fn a_path_has_one_spelling() {
+        let t = T::new("spell");
+        let d = t.trash();
+        for odd in [&b"a//b"[..], b"a/b/", b"/a//b", b"/a/b/"] {
+            assert_eq!(original_path(&d, odd), None, "{odd:?}");
+        }
+        assert!(original_path(&d, b"a/b").is_some());
+        assert!(original_path(&d, b"/a/b").is_some());
+    }
+
+    /// A symlink payload reports its target.
+    #[test]
+    fn a_symlink_item_carries_its_target() {
+        let t = T::new("link-item");
+        let d = t.trash();
+        symlink("/some/where", d.files().join("l")).unwrap();
+        assert_eq!(read_item(&d, b"l").link, b"/some/where");
+    }
+
+    /// Another device right below a root is found; the same device and skips are not.
+    #[test]
+    fn subvolumes_are_found_one_level_down() {
+        let shm = Path::new("/dev/shm");
+        let differs = |a: &Path, b: &Path| {
+            let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
+            dev(a) != dev(b)
+        };
+        if differs(Path::new("/dev"), shm) {
+            assert!(
+                subvolume_tops(Path::new("/dev"), &|_| false)
+                    .iter()
+                    .any(|p| p == shm)
+            );
+            assert!(
+                !subvolume_tops(Path::new("/dev"), &|p| p == shm)
+                    .iter()
+                    .any(|p| p == shm)
+            );
+        }
+    }
+
+    /// What an empty's final look depends on.
+    #[test]
+    fn has_items_sees_a_late_arrival() {
+        let t = T::new("late");
+        let d = t.trash();
+        assert!(!has_items(&d).unwrap());
+        fs::write(d.files().join("b"), b"x").unwrap();
+        assert!(has_items(&d).unwrap());
+    }
+
+    /// An orphan that cannot be removed is still something an empty left.
+    #[test]
+    fn has_items_sees_a_stuck_orphan() {
+        let t = T::new("stuck-orphan");
+        let d = t.trash();
+        fs::write(d.info().join("o.trashinfo"), b"x").unwrap();
+        fs::write(d.info().join("unrelated"), b"x").unwrap();
+        assert!(has_items(&d).unwrap());
+        fs::remove_file(d.info().join("o.trashinfo")).unwrap();
+        assert!(!has_items(&d).unwrap());
+        for odd in [".trashinfo", "..trashinfo", "...trashinfo"] {
+            fs::write(d.info().join(odd), b"x").unwrap();
+        }
+        assert_eq!(remove_orphans(&d), 0);
+        assert!(!has_items(&d).unwrap());
+    }
+
+    /// REV2-4: a trash swapped under an orphan sweep keeps the new tree's records.
+    #[test]
+    fn a_held_info_directory_outlives_a_swap() {
+        let t = T::new("swap-orphan");
+        let d = t.trash();
+        fs::write(d.info().join("e.trashinfo"), b"old").unwrap();
+        let held = d.pins().unwrap();
+        fs::rename(&d.dir, t.0.join("gone")).unwrap();
+        let live = t.trash();
+        fs::write(live.info().join("e.trashinfo"), b"live").unwrap();
+        remove_info_at(&d, &held.info, b"e").unwrap();
+        assert_eq!(fs::read(live.info().join("e.trashinfo")).unwrap(), b"live");
+        assert!(!t.0.join("gone/info/e.trashinfo").exists());
+    }
+
+    /// A delete that cannot get its turn gives up on the cache, it does not wait.
+    #[test]
+    fn a_held_cache_lock_cannot_hold_a_delete() {
+        let m = Mutex::new(());
+        let wait = Duration::from_millis(50);
+        let g = m.lock().unwrap();
+        let t0 = Instant::now();
+        assert!(turn(&m, wait).is_none());
+        assert!(t0.elapsed() < wait * 20);
+        drop(g);
+        assert!(turn(&m, wait).is_some());
+    }
+
+    /// A hostile volume's temp name must not aim the cache rewrite at another file.
+    #[test]
+    fn the_size_cache_rewrite_never_follows_a_planted_link() {
+        let t = T::new("sizes-link");
+        let d = t.trash();
+        let victim = t.0.join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        fs::write(d.dir.join("directorysizes"), b"1 2 e\n").unwrap();
+        let tmp = d
+            .dir
+            .join(format!(".directorysizes-{}", std::process::id()));
+        symlink(&victim, &tmp).unwrap();
+        drop_size_line(&d, b"e").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(fs::read(d.dir.join("directorysizes")).unwrap(), b"");
+    }
+
+    /// A FIFO or an endless device at the cache must neither hang nor fill memory.
+    #[test]
+    fn the_size_cache_is_only_read_when_it_is_a_small_regular_file() {
+        let t = T::new("sizes-odd");
+        let d = t.trash();
+        let p = d.dir.join("directorysizes");
+        let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let t0 = std::time::Instant::now();
+        let _ = drop_size_line(&d, b"e");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        fs::remove_file(&p).unwrap();
+        symlink("/dev/zero", &p).unwrap();
+        let _ = drop_size_line(&d, b"e");
+    }
+
+    /// Only a payload known to be gone makes an orphan (EACCES is not ENOENT).
+    #[test]
+    fn an_unexaminable_payload_keeps_its_info() {
+        // SAFETY: plain getter.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = T::new("orphan-eacces");
+        let d = t.trash();
+        item(&d, "kept", "/k");
+        fs::set_permissions(d.files(), fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(remove_orphans(&d), 0);
+        fs::set_permissions(d.files(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(d.info().join("kept.trashinfo").exists());
+    }
+
+    /// An owned trash that cannot be entered may hide items.
+    #[test]
+    fn an_inaccessible_trash_is_unusable() {
+        // SAFETY: plain getter.
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            return;
+        }
+        let t = T::new("mode0");
+        let d = t.trash();
+        assert!(!unusable(&d, uid));
+        fs::set_permissions(&d.dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let bad = unusable(&d, uid);
+        fs::set_permissions(&d.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(bad);
     }
 
     #[test]

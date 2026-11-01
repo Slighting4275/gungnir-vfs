@@ -130,12 +130,13 @@ fn list(c: &mut Client, scheme: u8) -> R<Vec<Row>> {
         assert_eq!(st, ST_OK, "list");
         let next = u32::from_le_bytes(body[..4].try_into()?);
         let n = u16::from_le_bytes(body[4..6].try_into()?);
-        let mut b = &body[6..];
+        let mut b = &body[7..];
         for _ in 0..n {
             let name = str16(&mut b);
             let orig = str16(&mut b);
             let _target = str16(&mut b);
             let _deleted = str16(&mut b);
+            let _link = str16(&mut b);
             let kind = b[0];
             b = &b[17..];
             out.push(Row { name, orig, kind });
@@ -276,8 +277,249 @@ fn a_symlinked_files_directory_is_never_followed() -> R {
     assert!(list(&mut dm.c, SCHEME_TRASH)?.is_empty());
     assert_ne!(delete(&mut dm.c, SCHEME_TRASH, b"h-precious")?, ST_OK);
     let (st, _) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
-    assert_eq!(st, ST_OK);
+    assert_ne!(st, ST_OK);
     assert!(elsewhere.join("precious").exists());
+    Ok(())
+}
+
+/// REV-1: a trash that cannot be used is not an empty trash.
+#[test]
+fn empty_does_not_report_success_past_an_unusable_trash() -> R {
+    let d = Dir::new("rev1")?;
+    let t = d.join("data/Trash");
+    fs::create_dir_all(t.join("info"))?;
+    let elsewhere = d.join("elsewhere");
+    fs::create_dir(&elsewhere)?;
+    fs::write(elsewhere.join("kept"), b"p")?;
+    std::os::unix::fs::symlink(&elsewhere, t.join("files"))?;
+    let mut dm = start(&d, false, &[])?;
+    let (st, _) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
+    assert_ne!(st, ST_OK, "items remain behind a trash that was skipped");
+    assert!(elsewhere.join("kept").exists());
+    Ok(())
+}
+
+/// REV-2: a payload whose name leaves no room for ".trashinfo" can still be deleted.
+#[test]
+fn a_payload_with_a_maximum_length_name_can_be_deleted() -> R {
+    let d = Dir::new("rev2")?;
+    let t = trash_dir(&d)?;
+    let e = "n".repeat(250);
+    fs::write(t.join("files").join(&e), b"x")?;
+    let mut dm = start(&d, false, &[])?;
+    assert_eq!(list(&mut dm.c, SCHEME_TRASH)?.len(), 1);
+    let name = format!("h-{e}");
+    assert_eq!(delete(&mut dm.c, SCHEME_TRASH, name.as_bytes())?, ST_OK);
+    assert!(list(&mut dm.c, SCHEME_TRASH)?.is_empty());
+    Ok(())
+}
+
+/// REV-3: a hostile volume's symlink cannot steer a restore off the volume.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_restore_cannot_follow_a_volume_symlink_off_the_volume() -> R {
+    let d = Dir::new("rev3")?;
+    trash_dir(&d)?;
+    let vol = d.join("vol");
+    // SAFETY: plain getter.
+    let vt = vol.join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+    fs::create_dir_all(vt.join("files"))?;
+    fs::create_dir_all(vt.join("info"))?;
+    let victim = d.join("autostart");
+    fs::create_dir(&victim)?;
+    std::os::unix::fs::symlink(&victim, vol.join("link"))?;
+    fs::write(vt.join("files/evil"), b"payload")?;
+    fs::write(
+        vt.join("info/evil.trashinfo"),
+        "[Trash Info]\nPath=link/evil\n",
+    )?;
+    let mut dm = start(
+        &d,
+        false,
+        &[(gungnird::vfssvc::TEST_TOP_ENV, vol.to_str().ok_or("path")?)],
+    )?;
+    let rows = list(&mut dm.c, SCHEME_TRASH)?;
+    assert_ne!(restore(&mut dm.c, &rows[0].name, b"")?, ST_OK);
+    assert!(!victim.join("evil").exists(), "escaped the volume");
+    // What every real client sends: g_file_move names the item's own orig-path.
+    assert_ne!(restore(&mut dm.c, &rows[0].name, &rows[0].orig)?, ST_OK);
+    assert!(
+        !victim.join("evil").exists(),
+        "escaped the volume by its own path"
+    );
+    // A path through the volume is checked however it came to be spelled.
+    fs::write(
+        vt.join("info/evil.trashinfo"),
+        "[Trash Info]\nPath=link//evil\n",
+    )?;
+    let rows = list(&mut dm.c, SCHEME_TRASH)?;
+    let there = vol.join("link/evil");
+    let spelled = there.to_str().ok_or("path")?.as_bytes();
+    assert_ne!(restore(&mut dm.c, &rows[0].name, spelled)?, ST_OK);
+    assert!(!victim.join("evil").exists(), "escaped by respelling");
+    assert!(vt.join("files/evil").exists(), "the item stays");
+    Ok(())
+}
+
+/// REV-12: a delete with a scheme that does not exist deletes nothing.
+#[test]
+fn an_unknown_scheme_deletes_nothing() -> R {
+    let d = Dir::new("rev12")?;
+    let t = trash_dir(&d)?;
+    trashed(&t, "e", &d.join("e"))?;
+    let mut dm = start(&d, false, &[])?;
+    assert_eq!(delete(&mut dm.c, 2, b"h-e")?, 6);
+    assert!(t.join("files/e").exists());
+    Ok(())
+}
+
+/// A trash on a subvolume with no mount, however deep, is listed and emptied.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_deep_subvolume_trash_is_listed_and_emptied() -> R {
+    use gungnird::btrfs::create_subvolume;
+    let d = Dir::new("subvol")?;
+    trash_dir(&d)?;
+    let vol = d.join("vol");
+    if create_subvolume(&vol).is_err() {
+        eprintln!("skipped: no btrfs here");
+        return Ok(());
+    }
+    fs::create_dir_all(vol.join("a/b/c"))?;
+    let deep = vol.join("a/b/c/deep");
+    create_subvolume(&deep)?;
+    // SAFETY: plain getter.
+    let vt = deep.join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+    fs::create_dir_all(vt.join("files"))?;
+    fs::create_dir_all(vt.join("info"))?;
+    fs::write(vt.join("files/e"), b"x")?;
+    fs::write(vt.join("info/e.trashinfo"), "[Trash Info]\nPath=e\n")?;
+    let mut dm = start(
+        &d,
+        false,
+        &[(gungnird::vfssvc::TEST_TOP_ENV, vol.to_str().ok_or("path")?)],
+    )?;
+    assert_eq!(list(&mut dm.c, SCHEME_TRASH)?.len(), 1, "not found");
+    let (st, body) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
+    assert_eq!(st, ST_OK, "{body:?}");
+    assert!(!vt.join("files/e").exists(), "not emptied");
+    drop(dm);
+    let _ = fs::remove_dir_all(&deep);
+    let _ = fs::remove_dir_all(&vol);
+    Ok(())
+}
+
+/// A mounted snapshot nobody lives on is a backup: not listed, not emptied.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_mounted_snapshot_is_a_backup() -> R {
+    use gungnird::btrfs::{create_snapshot, create_subvolume};
+    let d = Dir::new("snap-top")?;
+    trash_dir(&d)?;
+    let live = d.join("live");
+    if create_subvolume(&live).is_err() {
+        eprintln!("skipped: no btrfs here");
+        return Ok(());
+    }
+    // SAFETY: plain getter.
+    let name = format!(".Trash-{}", unsafe { libc::geteuid() });
+    fs::create_dir_all(live.join(&name).join("files"))?;
+    fs::create_dir_all(live.join(&name).join("info"))?;
+    fs::write(live.join(&name).join("files/e"), b"x")?;
+    fs::write(
+        live.join(&name).join("info/e.trashinfo"),
+        "[Trash Info]\nPath=e\n",
+    )?;
+    let snap = d.join("snap");
+    if create_snapshot(&live, &snap).is_err() {
+        eprintln!("skipped: no snapshot allowed here");
+        return Ok(());
+    }
+    let mut dm = start(
+        &d,
+        false,
+        &[(gungnird::vfssvc::TEST_TOP_ENV, snap.to_str().ok_or("path")?)],
+    )?;
+    assert_eq!(
+        list(&mut dm.c, SCHEME_TRASH)?.len(),
+        0,
+        "a backup was listed"
+    );
+    let (st, _) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
+    assert_eq!(st, ST_OK);
+    assert!(
+        snap.join(&name).join("files/e").exists(),
+        "a backup was emptied"
+    );
+    drop(dm);
+    let _ = fs::remove_dir_all(&snap);
+    let _ = fs::remove_dir_all(&live);
+    Ok(())
+}
+
+/// An empty stops with its client, between items as well as inside one.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_lost_client_stops_an_empty() -> R {
+    let d = Dir::new("empty-gone")?;
+    let t = trash_dir(&d)?;
+    for n in 0..40 {
+        fs::create_dir(t.join(format!("files/d{n}")))?;
+        fs::write(
+            t.join(format!("info/d{n}.trashinfo")),
+            "[Trash Info]\nPath=/d\n",
+        )?;
+    }
+    let mut dm = start(&d, false, &[(ops::SLOW_OPS_ENV, "100")])?;
+    dm.c.send(MSG_TRASH_EMPTY, &[])?;
+    thread::sleep(Duration::from_millis(500));
+    dm.c = Client::connect(&d.join("s.sock"), Duration::from_secs(5))?;
+    thread::sleep(Duration::from_millis(400));
+    let left = fs::read_dir(t.join("files"))?.count();
+    assert!(left > 0, "the empty ran to its end");
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(fs::read_dir(t.join("files"))?.count(), left, "it went on");
+    Ok(())
+}
+
+/// A long op says it is alive, and a client that goes away stops it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_long_delete_beats_and_a_lost_client_cancels_it() -> R {
+    let d = Dir::new("beat")?;
+    let t = trash_dir(&d)?;
+    fs::create_dir(t.join("files/big"))?;
+    for n in 0..4 {
+        fs::write(t.join(format!("files/big/f{n}")), b"x")?;
+    }
+    fs::write(t.join("info/big.trashinfo"), "[Trash Info]\nPath=/big\n")?;
+    let mut dm = start(&d, false, &[(ops::SLOW_OPS_ENV, "8000")])?;
+    let mut req = vec![SCHEME_TRASH];
+    req.extend(len16(b"h-big"));
+    let seq = dm.c.send(gungnird::vfssvc::MSG_VFS_DELETE, &req)?;
+    let t0 = Instant::now();
+    loop {
+        let left = Duration::from_secs(7)
+            .checked_sub(t0.elapsed())
+            .ok_or("no beat in time")?;
+        let m = dm.c.recv(left)?;
+        if m.seq == seq {
+            assert_eq!(m.kind, gungnird::vfssvc::MSG_VFS_BEAT, "answered early");
+            break;
+        }
+    }
+    let sock = d.join("s.sock");
+    dm.c = Client::connect(&sock, Duration::from_secs(5))?;
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(list(&mut dm.c, SCHEME_TRASH)?.len(), 1, "still listed");
+    let names = fs::read_dir(t.join("files/big"))?.count();
+    thread::sleep(Duration::from_secs(9));
+    assert_eq!(
+        fs::read_dir(t.join("files/big"))?.count(),
+        names,
+        "the op went on with nobody listening"
+    );
+    assert!(t.join("info/big.trashinfo").exists());
     Ok(())
 }
 
@@ -290,6 +532,11 @@ fn empty_never_reports_success_with_items_left() -> R {
     fs::write(t.join("files/stuck"), b"x")?;
     fs::create_dir_all(t.join("info/stuck.trashinfo/x"))?;
     fs::write(t.join("info/orphan.trashinfo"), "[Trash Info]\nPath=/o\n")?;
+    let then = std::time::SystemTime::now() - Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(t.join("info/orphan.trashinfo"))?
+        .set_modified(then)?;
     let mut dm = start(&d, false, &[])?;
     let (st, body) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
     assert_ne!(st, ST_OK, "{body:?}");

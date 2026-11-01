@@ -51,6 +51,7 @@ const value_stringv: u8 = 2;
 pub const Error = ipc.Error || Allocator.Error || error{
     NotFound,
     Busy,
+    Cancelled,
     SuspectMount,
     NoSuchFile,
     BadRequest,
@@ -264,6 +265,11 @@ pub const Client = struct {
     seq: u64 = 1 << 32, // clear of the handshake ping's seq
     /// Upper bound for one request's round trip.
     timeout_ms: u32 = 1000,
+    /// A message kind that only says the daemon is alive and working: 0 for none.
+    beat_kind: u32 = 0,
+    /// Polled while waiting: true gives up with `error.Cancelled`.
+    stop: ?*const fn (?*anyopaque) bool = null,
+    stop_ctx: ?*anyopaque = null,
     /// Absolute CLOCK_MONOTONIC deadline (ns) shared by a series of requests, e.g. all the
     /// round trips of one GIO call; 0 for none. The earlier of this and `timeout_ms` wins.
     deadline_ns: u64 = 0,
@@ -278,7 +284,7 @@ pub const Client = struct {
     /// are skipped. error.DaemonAbsent: the daemon closed the connection.
     fn call(c: *Client, kind: u32, payload: []const u8, reply: *ipc.Msg) Error![]const u8 {
         const own = nowNs() + @as(u64, c.timeout_ms) * std.time.ns_per_ms;
-        const deadline = if (c.deadline_ns != 0) @min(own, c.deadline_ns) else own;
+        var deadline = if (c.deadline_ns != 0) @min(own, c.deadline_ns) else own;
         if (nowNs() >= deadline) return error.Timeout;
         if (!c.conn.alive()) return error.DaemonAbsent;
         c.seq +%= 1;
@@ -290,6 +296,7 @@ pub const Client = struct {
                 error.Timeout => {
                     if (nowNs() >= deadline) return error.Timeout;
                     if (!c.conn.alive()) return error.DaemonAbsent;
+                    if (c.stop) |f| if (f(c.stop_ctx)) return error.Cancelled;
                     continue;
                 },
                 else => return err,
@@ -300,6 +307,11 @@ pub const Client = struct {
                     continue;
                 }
                 if (m.seq != seq) continue;
+                // Alive and working: the silence bound starts again.
+                if (c.beat_kind != 0 and m.kind == c.beat_kind) {
+                    deadline = nowNs() + @as(u64, c.timeout_ms) * std.time.ns_per_ms;
+                    continue;
+                }
                 if (m.kind != msg_reply) return error.Protocol;
                 reply.* = m;
                 var r: Reader = .{ .rest = reply.payload() };

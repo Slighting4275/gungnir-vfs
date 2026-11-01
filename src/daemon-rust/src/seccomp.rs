@@ -92,13 +92,17 @@ enum Rule {
 /// The ioctl requests the daemon makes, from strace of its test suites (HANDOFF-A2,
 /// evidence a2-6-ioctl-trace.txt) and the source: FIONBIO (std's set_nonblocking),
 /// FICLONE (reflink copy), FS_IOC_GETVERSION (inode generation), FS_IOC_GETFSUUID and
-/// BTRFS_IOC_INO_LOOKUP (filesystem identity). The kernel reads the request as 32 bits.
+/// BTRFS_IOC_INO_LOOKUP (filesystem identity), and the three that list btrfs subvolumes
+/// (`btrfs.rs`). The kernel reads the request as 32 bits.
 const IOCTLS: &[u32] = &[
     libc::FIONBIO as u32,
     libc::FICLONE as u32,
     libc::FS_IOC_GETVERSION as u32,
     crate::fsid::FS_IOC_GETFSUUID,
     crate::fsid::BTRFS_IOC_INO_LOOKUP,
+    crate::btrfs::BTRFS_IOC_GET_SUBVOL_INFO,
+    crate::btrfs::BTRFS_IOC_GET_SUBVOL_ROOTREF,
+    crate::btrfs::BTRFS_IOC_INO_LOOKUP_USER,
 ];
 
 /// Sandboxing mode for `gungnird`.
@@ -255,6 +259,7 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_unlinkat as u32,
         // Copying a symlink recreates it (ops io::symlink); AUD-02.
         libc::SYS_symlinkat as u32,
+        libc::SYS_linkat as u32,
         // std::fs::rename, for the atomic rewrites of recently-used.xbel and directorysizes.
         libc::SYS_rename as u32,
         libc::SYS_renameat as u32,
@@ -1007,7 +1012,7 @@ mod tests {
                 errno: libc::ENOTTY
             })
         );
-        assert_eq!(IOCTLS.len(), 5);
+        assert_eq!(IOCTLS.len(), 8);
         // Decoded from the strace run (evidence a2-6-ioctl-trace.txt).
         for v in [0x5421, 0x4004_9409, 0x8008_7601, 0x8011_1500, 0xd000_9412] {
             assert!(IOCTLS.contains(&v), "{v:#x}");

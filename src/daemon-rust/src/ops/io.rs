@@ -404,9 +404,55 @@ pub const GRAVEYARD_MAX: usize = 16;
 /// Free every abandoned ring whose request has completed: the kernel no longer
 /// references its buffers. Returns how many are still waiting.
 pub fn reap() -> usize {
-    let mut g = GRAVEYARD.lock().unwrap_or_else(PoisonError::into_inner);
-    g.retain_mut(|(ring, _)| !ring.completion().any(|c| c.user_data() == USER_OP));
-    g.len()
+    let mut late = Vec::new();
+    let left = {
+        let mut g = GRAVEYARD.lock().unwrap_or_else(PoisonError::into_inner);
+        g.retain_mut(|(ring, owned)| {
+            let Some(c) = ring.completion().find(|c| c.user_data() == USER_OP) else {
+                return true;
+            };
+            // An open that finished after all: nobody is left to own its descriptor.
+            if owned.opening && c.result() >= 0 {
+                late.push(c.result());
+            }
+            false
+        });
+        g.len()
+    };
+    close_late(late);
+    left
+}
+
+/// Descriptors waiting for the one closing thread, and whether it is running.
+static LATE: Mutex<(Vec<RawFd>, bool)> = Mutex::new((Vec::new(), false));
+
+/// A close can block for as long as the mount does (FUSE flushes on close): never on the
+/// caller, who may hold the scheduler. One thread does them all, so a mount that hangs
+/// every close costs that one thread and a list of numbers, not a thread each. With no
+/// thread to be had they wait for the next call.
+fn close_late(fds: Vec<RawFd>) {
+    let mut g = LATE.lock().unwrap_or_else(PoisonError::into_inner);
+    g.0.extend(fds);
+    if g.1 || g.0.is_empty() {
+        return;
+    }
+    let started = std::thread::Builder::new()
+        .name("gungnir-close".into())
+        .spawn(|| {
+            loop {
+                let fd = {
+                    let mut g = LATE.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Some(fd) = g.0.pop() else {
+                        g.1 = false;
+                        return;
+                    };
+                    fd
+                };
+                // SAFETY: a fresh descriptor nothing else has seen.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        });
+    g.1 = started.is_ok();
 }
 
 /// Memory a request may reference until the kernel completes it.
@@ -415,6 +461,8 @@ struct Owned {
     st: libc::statx,
     path_a: CString,
     path_b: CString,
+    /// The request in flight returns a descriptor.
+    opening: bool,
 }
 
 pub struct UringIo {
@@ -513,6 +561,7 @@ impl UringIo {
                 st: zero_statx(),
                 path_a: CString::default(),
                 path_b: CString::default(),
+                opening: false,
             })),
             buf_size: buf_size.max(4096),
         })
@@ -633,7 +682,12 @@ impl Io for UringIo {
             .mode(mode)
             .build()
             .user_data(USER_OP);
-        let fd = self.run(w, &e)?;
+        o.opening = true;
+        let r = self.run(w, &e);
+        if let Ok((_, o)) = self.parts() {
+            o.opening = false;
+        }
+        let fd = r?;
         // SAFETY: a fresh fd from the kernel, owned by nobody else.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }

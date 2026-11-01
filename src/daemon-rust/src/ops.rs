@@ -245,6 +245,32 @@ impl std::error::Error for OpError {}
 
 pub type OpResult = std::result::Result<(), OpError>;
 
+/// A path's parent held open: the op works relative to it, so the directory that was
+/// checked is the one used even if the path is re-aimed afterwards. Set only by the
+/// daemon itself, never from the wire.
+#[derive(Debug, Clone)]
+pub struct Anchor {
+    pub dir: Arc<OwnedFd>,
+    pub leaf: CString,
+}
+
+impl PartialEq for Anchor {
+    fn eq(&self, o: &Self) -> bool {
+        self.dir.as_raw_fd() == o.dir.as_raw_fd() && self.leaf == o.leaf
+    }
+}
+
+impl Eq for Anchor {}
+
+impl Anchor {
+    /// The same file as a path, for the steps that work by path.
+    fn path(&self) -> Vec<u8> {
+        let mut p = format!("/proc/self/fd/{}/", self.dir.as_raw_fd()).into_bytes();
+        p.extend_from_slice(self.leaf.to_bytes());
+        p
+    }
+}
+
 /// A validated start request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpRequest {
@@ -255,6 +281,10 @@ pub struct OpRequest {
     pub src: Vec<u8>,
     /// Empty unless the op has a destination.
     pub dest: Vec<u8>,
+    /// `src` and `dest` stay the names (for metadata and reports); when set, these are
+    /// what is actually operated on.
+    pub src_at: Option<Anchor>,
+    pub dest_at: Option<Anchor>,
 }
 
 /// An absolute, lexically canonical path: no NUL, no empty, `.` or `..` component, no
@@ -332,6 +362,8 @@ impl OpRequest {
             timeout_ms,
             src: src.to_vec(),
             dest: dest.to_vec(),
+            src_at: None,
+            dest_at: None,
         })
     }
 
@@ -513,6 +545,8 @@ pub struct OpCtl {
     pub req: OpRequest,
     sink: Arc<dyn Sink>,
     deadline: Instant,
+    /// In an fsync: see [`FSYNC_STALL_FACTOR`].
+    flushing: AtomicBool,
     stop: AtomicU8,
     stop_at: Mutex<Option<Instant>>,
     finished: AtomicBool,
@@ -644,6 +678,10 @@ pub struct OpsConfig {
     pub pause_at: Option<PausePoint>,
     /// Tests: behave as if every rename and copy_file_range crossed filesystems.
     pub force_exdev: bool,
+    /// Behave as on a filesystem without `RENAME_NOREPLACE`.
+    pub force_no_noreplace: bool,
+    /// Test hook: every fsync takes at least this long.
+    pub fsync_delay: Duration,
     /// Tests: skip FICLONE / copy_file_range, to exercise the read/write path.
     pub no_clone: bool,
     pub no_cfr: bool,
@@ -667,6 +705,8 @@ impl Default for OpsConfig {
             slow: Duration::ZERO,
             pause_at: None,
             force_exdev: false,
+            force_no_noreplace: false,
+            fsync_delay: Duration::ZERO,
             no_clone: false,
             no_cfr: false,
         }
@@ -761,6 +801,10 @@ struct Shared {
     /// The file, and how many recorded ops have not ended: at 0 it is emptied, so it
     /// stays small in a long-running daemon.
     ledger: Mutex<Option<(std::fs::File, usize)>>,
+    /// Entries of ops whose engine was poisoned: a late create can still leave their temp
+    /// file. Their own append-only file, never truncated while running, for the next
+    /// start's sweep: such ops are rare, and compacting the ledger cannot touch these.
+    kept: Mutex<Option<std::fs::File>>,
 }
 
 /// The file-operation service: queue, workers and watchdog.
@@ -795,12 +839,13 @@ impl Ops {
             }),
             work: Condvar::new(),
             watch: Condvar::new(),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(first_op_id()),
             suspects: Mutex::new(Vec::new()),
             uring_failed: AtomicBool::new(false),
             io_made: AtomicUsize::new(0),
             io_uring: AtomicUsize::new(0),
             ledger: Mutex::new(None),
+            kept: Mutex::new(None),
         });
         for _ in 0..workers {
             spawn_worker(&sh)?;
@@ -882,6 +927,7 @@ impl Ops {
             req,
             sink,
             deadline: now + timeout,
+            flushing: AtomicBool::new(false),
             stop: AtomicU8::new(STOP_NONE),
             stop_at: Mutex::new(None),
             finished: AtomicBool::new(false),
@@ -940,6 +986,11 @@ impl Ops {
     /// worker abandoned at a drain) has its temp files removed by the next start.
     pub fn set_temp_ledger(&self, file: std::fs::File) {
         *lock(&self.sh.ledger) = Some((file, 0));
+    }
+
+    /// Record the ops that ended with a request abandoned in `file` (see [`Shared::kept`]).
+    pub fn set_kept_ledger(&self, file: std::fs::File) {
+        *lock(&self.sh.kept) = Some(file);
     }
 }
 
@@ -1011,6 +1062,23 @@ impl Shared {
         }
     }
 
+    /// Op `id` ended with a request abandoned: its entry goes to the kept file first, and
+    /// only then does it leave the ledger; if it cannot, it stays there. Past the size
+    /// bound it is dropped: all that is at stake is a stray temp file, never the user's.
+    fn ledger_keep(&self, id: u64, dest: &[u8]) {
+        use std::io::Write;
+        let saved = lock(&self.kept).as_mut().is_some_and(|f| {
+            if f.metadata().is_ok_and(|m| m.len() >= KEPT_MAX) {
+                eprintln!("gungnird: temp ledger: kept file full, op {id:016x} not recorded");
+                return true;
+            }
+            f.write_all(&ledger_start(id, dest)).is_ok() && f.sync_data().is_ok()
+        });
+        if saved {
+            self.ledger_end(id);
+        }
+    }
+
     fn make_io(&self) -> Box<dyn Io> {
         let io = self.make_io_inner();
         self.io_made.fetch_add(1, Ordering::SeqCst);
@@ -1075,6 +1143,9 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 fn ledger_start(id: u64, dest: &[u8]) -> Vec<u8> {
     format!("S {id:016x} {}\n", hex(dest)).into_bytes()
 }
+
+/// Largest kept file: abandoned ops are rare, and each start reads it whole.
+const KEPT_MAX: u64 = 1 << 20;
 
 fn ledger_end(id: u64) -> Vec<u8> {
     format!("E {id:016x}\n").into_bytes()
@@ -1177,6 +1248,66 @@ pub fn sweep_temp_ledger(ledger: &std::path::Path) -> std::io::Result<usize> {
     Ok(removed)
 }
 
+/// Ids unique across runs: temp names carry them, and a sweep of the previous run's may
+/// still be going while this run's ops start. Random, so neither a quick restart nor a
+/// clock set back can repeat them; the top bits stay clear for the counter.
+fn first_op_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    (std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+        >> 2)
+        .max(1)
+}
+
+/// Run the sweep of [`sweep_temp_ledger`] without making startup wait for it: a temp file
+/// can be on a mount that stayed hung, and a daemon that never starts helps nobody. The
+/// ledger moves aside at once, so new ops start a fresh one; what a crashed sweep left
+/// aside is swept again next time. Returns once the thread is off.
+///
+/// # Errors
+/// The ledger cannot be moved aside, or no thread can be started.
+pub fn detach_temp_sweep(ledger: &std::path::Path) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let aside = ledger.with_extension("sweep");
+    for from in [ledger.to_path_buf(), ledger.with_extension("kept")] {
+        match std::fs::read(&from) {
+            Ok(text) => {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .mode(0o600)
+                    .open(&aside)?;
+                // On a line of its own: what is already there may end in a torn write.
+                f.write_all(b"\n")?;
+                f.write_all(&text)?;
+                f.sync_all()?;
+                std::fs::remove_file(&from)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if !aside.exists() {
+        return Ok(());
+    }
+    thread::Builder::new()
+        .name("gungnir-sweep".into())
+        .spawn(move || {
+            match sweep_temp_ledger(&aside) {
+                Ok(n) => {
+                    if n > 0 {
+                        eprintln!("gungnird: removed {n} temp file(s) left by unfinished file ops");
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                // Kept: it is the only record of those temp files, for the next start.
+                Err(e) => eprintln!("gungnird: temp ledger {}: {e}", aside.display()),
+            }
+        })
+        .map(drop)
+}
+
 fn spawn_worker(sh: &Arc<Shared>) -> std::io::Result<()> {
     lock(&sh.state).threads += 1;
     let w = Arc::clone(sh);
@@ -1216,8 +1347,14 @@ fn worker(sh: &Arc<Shared>) {
             let r = run_op(sh, &mut *io, &op);
             // Its temp files are gone (renamed or removed) by the time run_op returns:
             // recorded before the client hears the op is done.
+            // Not after an abandoned request, though: a late create can still leave a temp
+            // file, and the open entry is what makes the next start sweep it.
             if ledgered {
-                sh.ledger_end(op.id);
+                if io.healthy() {
+                    sh.ledger_end(op.id);
+                } else {
+                    sh.ledger_keep(op.id, &op.req.dest);
+                }
             }
             if r.is_ok() {
                 op.maybe_emit(true);
@@ -1245,6 +1382,9 @@ fn watchdog(sh: &Arc<Shared>) {
         }
         let now = Instant::now();
         let mut finish: Vec<(Arc<OpCtl>, OpError)> = Vec::new();
+        // Late completions of abandoned requests are collected here, not only when an
+        // engine happens to be made.
+        io::reap();
         // Queued ops: cancelled or out of time before a worker got to them.
         s.queue.retain(|op| {
             let why = match op.stopped() {
@@ -1268,7 +1408,12 @@ fn watchdog(sh: &Arc<Shared>) {
                 continue;
             }
             let idle = now.duration_since(*lock(&op.last_progress));
-            if op.stopped().is_none() && (now >= op.deadline || idle >= sh.cfg.stall) {
+            let limit = if op.flushing.load(Ordering::Acquire) {
+                sh.cfg.stall.saturating_mul(FSYNC_STALL_FACTOR)
+            } else {
+                sh.cfg.stall
+            };
+            if op.stopped().is_none() && (now >= op.deadline || idle >= limit) {
                 op.request_stop(STOP_TIMEOUT);
             }
             let since = *lock(&op.stop_at);
@@ -1384,6 +1529,9 @@ fn other_mount(a: &libc::statx, b: &libc::statx) -> bool {
     }
     (a.stx_dev_major, a.stx_dev_minor) != (b.stx_dev_major, b.stx_dev_minor)
 }
+
+/// An fsync may sit this many stall limits (ten minutes by default) without progress.
+const FSYNC_STALL_FACTOR: u32 = 20;
 
 /// Entries a failed recursive delete remembers (to report exactly what it deleted);
 /// beyond, deleted files are not reported and keep their (orphaned, harmless) metadata.
@@ -1522,7 +1670,7 @@ impl Exec<'_> {
         } else {
             None
         };
-        self.copy_file(&src, &dest, self.op.req.flags, false)?;
+        self.copy_file(&src, &dest, self.op.req.flags, false, None)?;
         self.op.add_file();
         if let Some(id) = from {
             self.meta.copied(&id, &dest, false);
@@ -1533,15 +1681,25 @@ impl Exec<'_> {
     fn mv(&mut self) -> OpResult {
         let src = self.op.req.src.clone();
         let dest = self.op.req.dest.clone();
-        let (cs, cd) = (cstr(&src)?, cstr(&dest)?);
+        let (src_at, dest_at) = (self.op.req.src_at.clone(), self.op.req.dest_at.clone());
+        let (sfd, cs) = match &src_at {
+            Some(a) => (a.dir.as_raw_fd(), a.leaf.clone()),
+            None => (libc::AT_FDCWD, cstr(&src)?),
+        };
+        let (dfd, cd) = match &dest_at {
+            Some(a) => (a.dir.as_raw_fd(), a.leaf.clone()),
+            None => (libc::AT_FDCWD, cstr(&dest)?),
+        };
         let st = self
             .io
-            .statx(self.op, libc::AT_FDCWD, &cs, libc::AT_SYMLINK_NOFOLLOW)?;
+            .statx(self.op, sfd, &cs, libc::AT_SYMLINK_NOFOLLOW)?;
         let overwrite = self.flag(FLAG_OVERWRITE);
         let r = if self.cfg.force_exdev {
             Err(StepError::Os(libc::EXDEV))
+        } else if self.cfg.force_no_noreplace && !overwrite {
+            self.rename_reserved(sfd, &cs, dfd, &cd)
         } else {
-            self.rename(libc::AT_FDCWD, &cs, libc::AT_FDCWD, &cd, overwrite)
+            self.rename(sfd, &cs, dfd, &cd, overwrite)
         };
         match r {
             Ok(()) => {
@@ -1556,28 +1714,25 @@ impl Exec<'_> {
                 if is_type(&st, libc::S_IFDIR) {
                     return Err(OpError::WouldRecurse);
                 }
-                let from = self.meta.identify(&src);
+                // The ledger names temp files by `dest`, which an anchored destination has
+                // stopped trusting: such a move is a rename or nothing, and the file stays.
+                if dest_at.is_some() {
+                    return Err(OpError::Os(libc::EXDEV));
+                }
+                // By path from here on, through the anchor if there is one.
+                let copy_src = src_at.as_ref().map_or_else(|| src.clone(), Anchor::path);
+                let from = self.meta.identify(&copy_src);
                 let flags = self.op.req.flags | FLAG_NOFOLLOW_SYMLINKS | FLAG_ALL_METADATA;
-                self.copy_file(&src, &dest, flags, true)?;
-                // The source goes only once the copy is durable: its data was fsynced
-                // before the rename, and the rename itself is made durable here (fsync
-                // of the destination directory); otherwise a crash could keep the
-                // source's unlink and lose the copy's directory entry.
-                let (parent, _) = split(&dest)?;
-                let dir = self.io.open(
-                    self.op,
-                    libc::AT_FDCWD,
-                    &parent,
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    0,
-                )?;
-                self.io.fsync(self.op, dir.as_raw_fd())?;
+                self.copy_file(&copy_src, &dest, flags, true, Some(&st))?;
+                // The source goes only once the copy is durable: `copy_file` fsynced the data
+                // before the rename and the destination directory after it; otherwise a
+                // crash could keep the source's unlink and lose the copy's directory entry.
                 // And only if it is still the file that was copied, unchanged: a file
                 // renamed onto `src` or written to during the copy is kept (EBUSY; the
                 // copy stays at `dest`).
                 let now = self
                     .io
-                    .statx(self.op, libc::AT_FDCWD, &cs, libc::AT_SYMLINK_NOFOLLOW)?;
+                    .statx(self.op, sfd, &cs, libc::AT_SYMLINK_NOFOLLOW)?;
                 if !same_file(&now, &st)
                     || now.stx_size != st.stx_size
                     || (now.stx_mtime.tv_sec, now.stx_mtime.tv_nsec)
@@ -1585,7 +1740,7 @@ impl Exec<'_> {
                 {
                     return Err(OpError::Os(libc::EBUSY));
                 }
-                self.io.unlink(self.op, libc::AT_FDCWD, &cs, 0)?;
+                self.io.unlink(self.op, sfd, &cs, 0)?;
                 self.op.add_file();
                 match from {
                     Some(id) => self.meta.copied(&id, &dest, true),
@@ -1614,23 +1769,56 @@ impl Exec<'_> {
             .io
             .rename(self.op, od, old, nd, new, libc::RENAME_NOREPLACE)
         {
-            Err(StepError::Os(libc::EINVAL)) => {
-                match self.io.statx(self.op, nd, new, libc::AT_SYMLINK_NOFOLLOW) {
-                    Ok(_) => Err(StepError::Os(libc::EEXIST)),
-                    Err(StepError::Os(libc::ENOENT)) => {
-                        self.io.rename(self.op, od, old, nd, new, 0)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            Err(StepError::Os(libc::EINVAL)) => self.rename_reserved(od, old, nd, new),
             r => r,
         }
+    }
+
+    /// No-replace on a filesystem without `RENAME_NOREPLACE`. `linkat` is atomic about the
+    /// name, so nothing can be overwritten and a crash leaves two names of one file at
+    /// worst, never a lost one: the destination is never rolled back, because an unlink
+    /// that failed or was abandoned may yet remove the source. A filesystem with neither
+    /// gets a refusal: the source stays where it is.
+    /// A directory cannot be linked, and a rename of one can only ever replace an empty
+    /// directory, so a plain check loses nothing.
+    fn rename_reserved(&mut self, od: RawFd, old: &CStr, nd: RawFd, new: &CStr) -> Step<()> {
+        let st = self.io.statx(self.op, od, old, libc::AT_SYMLINK_NOFOLLOW)?;
+        if is_type(&st, libc::S_IFDIR) {
+            return match self.io.statx(self.op, nd, new, libc::AT_SYMLINK_NOFOLLOW) {
+                Ok(_) => Err(StepError::Os(libc::EEXIST)),
+                Err(StepError::Os(libc::ENOENT)) => self.io.rename(self.op, od, old, nd, new, 0),
+                Err(e) => Err(e),
+            };
+        }
+        // SAFETY: valid dir fds and NUL-terminated names; no flag follows a link.
+        if unsafe { libc::linkat(od, old.as_ptr(), nd, new.as_ptr(), 0) } != 0 {
+            return Err(StepError::Os(match last_errno() {
+                libc::EPERM | libc::ENOTSUP | libc::ENOSYS => libc::EOPNOTSUPP,
+                e => e,
+            }));
+        }
+        // Only the file that was examined, and only if that is what the link made: a file
+        // swapped in around the `linkat` means the source may be the last name of another.
+        let linked = self.io.statx(self.op, nd, new, libc::AT_SYMLINK_NOFOLLOW)?;
+        let now = self.io.statx(self.op, od, old, libc::AT_SYMLINK_NOFOLLOW)?;
+        if !same_file(&linked, &st) || !same_file(&now, &st) {
+            return Err(StepError::Os(libc::EBUSY));
+        }
+        self.io.unlink(self.op, od, old, 0)
     }
 
     /// Copy one non-directory `src` to `dest` through a temporary file in `dest`'s
     /// directory. `durable`: fsync before the rename (a move's copy; always done when
     /// an existing file is replaced).
-    fn copy_file(&mut self, src: &[u8], dest: &[u8], flags: u32, durable: bool) -> OpResult {
+    /// `expect`: the file a move examined; anything else at `src` is not what it may unlink.
+    fn copy_file(
+        &mut self,
+        src: &[u8],
+        dest: &[u8],
+        flags: u32,
+        durable: bool,
+        expect: Option<&libc::statx>,
+    ) -> OpResult {
         let nofollow = flags & FLAG_NOFOLLOW_SYMLINKS != 0;
         let overwrite = flags & FLAG_OVERWRITE != 0;
         let cs = cstr(src)?;
@@ -1644,6 +1832,9 @@ impl Exec<'_> {
                 0
             },
         )?;
+        if expect.is_some_and(|e| !same_file(e, &st)) {
+            return Err(OpError::Os(libc::EBUSY));
+        }
         if is_type(&st, libc::S_IFDIR) {
             return Err(OpError::WouldRecurse);
         }
@@ -1680,7 +1871,12 @@ impl Exec<'_> {
             }
         }
         if symlink {
-            return self.copy_symlink(&cs, &st, pdir.as_raw_fd(), &leaf, overwrite);
+            self.copy_symlink(&cs, &st, pdir.as_raw_fd(), &leaf, overwrite)?;
+            return if durable {
+                self.sync_dir(pdir.as_raw_fd())
+            } else {
+                Ok(())
+            };
         }
         let in_fd = self.io.open(
             self.op,
@@ -1699,6 +1895,11 @@ impl Exec<'_> {
         if !is_type(&fst, libc::S_IFREG) {
             return Err(OpError::Os(libc::EOPNOTSUPP));
         }
+        // Another file opened than the one examined: a move would copy this one, then
+        // unlink that one if it came back.
+        if !same_file(&fst, &st) {
+            return Err(OpError::Os(libc::EBUSY));
+        }
         let mode = if flags & FLAG_TARGET_DEFAULT_PERMS != 0 {
             0o666
         } else {
@@ -1709,7 +1910,7 @@ impl Exec<'_> {
             self.copy_data(in_fd.as_raw_fd(), out.as_raw_fd(), fst.stx_size)?;
             self.finish_attrs(in_fd.as_raw_fd(), out.as_raw_fd(), &fst, flags);
             if durable || existing.is_some() {
-                self.io.fsync(self.op, out.as_raw_fd())?;
+                self.fsync_long(out.as_raw_fd())?;
             }
             self.check()?;
             self.pause(PausePoint::BeforePublish)?;
@@ -1721,7 +1922,34 @@ impl Exec<'_> {
             // Plain syscall: the engine may be stopped or poisoned by now.
             // SAFETY: valid dir fd and NUL-terminated name.
             unsafe { libc::unlinkat(pdir.as_raw_fd(), tmp.as_ptr(), 0) };
+            return r;
         }
+        if durable {
+            self.sync_dir(pdir.as_raw_fd())?;
+        }
+        Ok(())
+    }
+
+    /// Make a rename inside `dir` durable. Through the descriptor the file was published
+    /// in: the path may mean another directory by now.
+    fn sync_dir(&mut self, dir: RawFd) -> OpResult {
+        let d = self
+            .io
+            .open(self.op, dir, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        self.fsync_long(d.as_raw_fd())?;
+        Ok(())
+    }
+
+    /// An fsync makes no progress anyone can see, and flushing a big copy to a slow disk
+    /// legitimately takes minutes: it gets its own stall limit.
+    fn fsync_long(&mut self, fd: RawFd) -> Step<()> {
+        self.op.flushing.store(true, Ordering::Release);
+        if !self.cfg.fsync_delay.is_zero() {
+            thread::sleep(self.cfg.fsync_delay);
+        }
+        let r = self.io.fsync(self.op, fd);
+        self.op.flushing.store(false, Ordering::Release);
+        self.op.touch();
         r
     }
 
@@ -1756,12 +1984,26 @@ impl Exec<'_> {
         leaf: &CStr,
         overwrite: bool,
     ) -> OpResult {
+        // Through a descriptor on the link itself: what is read is what was examined.
+        let link = self.io.open(
+            self.op,
+            libc::AT_FDCWD,
+            src,
+            libc::O_PATH | libc::O_NOFOLLOW,
+            0,
+        )?;
+        let now = self
+            .io
+            .statx(self.op, link.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+        if !same_file(&now, st) {
+            return Err(OpError::Os(libc::EBUSY));
+        }
         let mut buf = vec![0u8; 4096];
-        // SAFETY: writes at most buf.len() bytes into `buf`.
+        // SAFETY: writes at most buf.len() bytes into `buf`; the empty name is the link.
         let n = unsafe {
             libc::readlinkat(
-                libc::AT_FDCWD,
-                src.as_ptr(),
+                link.as_raw_fd(),
+                c"".as_ptr(),
                 buf.as_mut_ptr().cast(),
                 buf.len(),
             )
@@ -1970,29 +2212,36 @@ impl Exec<'_> {
     /// into another mount (`EXDEV`).
     fn delete_tree(&mut self) -> OpResult {
         let p = self.op.req.src.clone();
-        let c = cstr(&p)?;
-        let st = self
-            .io
-            .statx(self.op, libc::AT_FDCWD, &c, libc::AT_SYMLINK_NOFOLLOW)?;
+        let anchor = self.op.req.src_at.clone();
+        let (at, c) = match &anchor {
+            Some(a) => (a.dir.as_raw_fd(), a.leaf.clone()),
+            None => (libc::AT_FDCWD, cstr(&p)?),
+        };
+        let st = self.io.statx(self.op, at, &c, libc::AT_SYMLINK_NOFOLLOW)?;
         if !is_type(&st, libc::S_IFDIR) {
-            self.io.unlink(self.op, libc::AT_FDCWD, &c, 0)?;
+            self.io.unlink(self.op, at, &c, 0)?;
             self.op.add_file();
             self.meta.removed(&p, false);
             return Ok(());
         }
         // A mount point as the root is a crossing too: emptying it would delete files on
         // the other filesystem, then fail with EBUSY on the root itself (DIB-F001).
-        if let Some(at) = p.iter().rposition(|&b| b == b'/') {
-            let parent = cstr(if at == 0 { b"/" } else { &p[..at] })?;
+        if anchor.is_some() {
+            let up = self.io.statx(self.op, at, c"", libc::AT_EMPTY_PATH)?;
+            if other_mount(&up, &st) {
+                return Err(OpError::Os(libc::EXDEV));
+            }
+        } else if let Some(i) = p.iter().rposition(|&b| b == b'/') {
+            let parent = cstr(if i == 0 { b"/" } else { &p[..i] })?;
             let up = self.io.statx(self.op, libc::AT_FDCWD, &parent, 0)?; // the directory, through any link
             if other_mount(&up, &st) {
                 return Err(OpError::Os(libc::EXDEV));
             }
         }
         let mut log = Vec::new();
-        let r = self.empty_tree(&c, &st, &mut log).and_then(|()| {
+        let r = self.empty_tree(at, &c, &p, &st, &mut log).and_then(|()| {
             self.io
-                .unlink(self.op, libc::AT_FDCWD, &c, libc::AT_REMOVEDIR)
+                .unlink(self.op, at, &c, libc::AT_REMOVEDIR)
                 .map_err(Into::into)
         });
         if r.is_ok() {
@@ -2010,13 +2259,15 @@ impl Exec<'_> {
     /// directory, with its subtree) so a failure can report exactly what went.
     fn empty_tree(
         &mut self,
+        at: RawFd,
         root: &CStr,
+        path: &[u8],
         root_st: &libc::statx,
         log: &mut Vec<(Vec<u8>, bool)>,
     ) -> OpResult {
         let fd = self.io.open(
             self.op,
-            libc::AT_FDCWD,
+            at,
             root,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             0,
@@ -2029,7 +2280,12 @@ impl Exec<'_> {
         if !same_file(&base, root_st) {
             return Err(OpError::Os(libc::EBUSY)); // replaced since the statx
         }
-        let mut cur: Vec<u8> = root.to_bytes().to_vec();
+        // Bound over itself since the statx: same inode, another mount. Past this open
+        // the descriptor stays on the mount it was opened on.
+        if other_mount(root_st, &base) {
+            return Err(OpError::Os(libc::EXDEV));
+        }
+        let mut cur: Vec<u8> = path.to_vec();
         // (stream, its name in the parent, log length when it was entered)
         let mut stack: Vec<(DirStream, CString, usize)> =
             vec![(DirStream::open(fd)?, CString::default(), 0)];
@@ -2111,7 +2367,7 @@ impl Exec<'_> {
             libc::O_RDONLY | libc::O_NOCTTY,
             0,
         )?;
-        self.io.fsync(self.op, fd.as_raw_fd())?;
+        self.fsync_long(fd.as_raw_fd())?;
         self.op.add_file();
         Ok(())
     }

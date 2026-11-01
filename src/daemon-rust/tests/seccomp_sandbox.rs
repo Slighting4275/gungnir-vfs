@@ -979,6 +979,8 @@ mod daemon {
             timeout_ms: 0,
             src: b(src),
             dest: dest.map(b).unwrap_or_default(),
+            src_at: None,
+            dest_at: None,
         };
         let seq = c.send(MSG_OP_START, &r.encode())?;
         let t0 = Instant::now();

@@ -153,6 +153,8 @@ fn start_copy(c: &mut Client, src: &Path, dst: &Path) -> R<u32> {
         timeout_ms: 0,
         src: src.as_os_str().as_bytes().to_vec(),
         dest: dst.as_os_str().as_bytes().to_vec(),
+        src_at: None,
+        dest_at: None,
     };
     let seq = c.send(MSG_OP_START, &r.encode())?;
     loop {

@@ -29,6 +29,7 @@
 //! system or user gvfs modules load. Sockets and databases go in a fresh private (0700)
 //! directory per run, created under <tmp-dir> (.build/tmp).
 const std = @import("std");
+extern "c" fn mkfifo(path: [*c]const u8, mode: c_uint) c_int;
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
@@ -811,6 +812,7 @@ fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
         const r = runGio(&.{ "list", "trash:///" }) orelse return "could not run gio";
         defer freeCli(r);
         if (!r.ok or !contains(r.out, "h-a.txt") or !contains(r.out, "h-b.txt")) return "gio list trash:/// failed";
+        if (contains(r.err, "CRITICAL")) return "gio list trash:/// logs a critical";
     }
     {
         const r = runGio(&.{ "info", "-a", "standard::display-name,trash::orig-path", "trash:///h-a.txt" }) orelse return "could not run gio";
@@ -832,6 +834,67 @@ fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
         const r = runGio(&.{ "remove", "trash:///h-nothing" }) orelse return "could not run gio";
         defer freeCli(r);
         if (r.ok) return "gio remove on a missing item succeeded";
+    }
+    {
+        // A child of an item is not the item: deleting it must not delete the item.
+        const parent = c.g_file_new_for_uri("trash:///h-a.txt");
+        defer c.g_object_unref(parent);
+        const child = c.g_file_get_child(parent, "inner");
+        defer c.g_object_unref(child);
+        if (c.g_file_equal(parent, child) != 0) return "a child aliases its trash item";
+        if (c.g_file_delete(child, null, null) != 0) return "deleting a child of an item succeeded";
+        if (countChildren("trash:///") != @as(?usize, 1)) return "deleting a child removed the item";
+    }
+    {
+        // A FIFO cannot hold the caller: the open has a deadline, and the thread it left
+        // behind ends as soon as the kernel lets it go.
+        const fifo = c.g_build_filename(files, "pipe", @as([*c]const u8, null));
+        defer c.g_free(fifo);
+        if (mkfifo(fifo, 0o600) != 0) return "could not make the FIFO";
+        const f = c.g_file_new_for_uri("trash:///h-pipe");
+        defer c.g_object_unref(f);
+        var err: [*c]c.GError = null;
+        const t0 = c.g_get_monotonic_time();
+        const s = c.g_file_read(f, null, &err);
+        const took = c.g_get_monotonic_time() - t0;
+        const timed_out = s == null and c.g_error_matches(err, c.g_io_error_quark(), c.G_IO_ERROR_TIMED_OUT) != 0;
+        if (err != null) c.g_error_free(err);
+        if (s != null) c.g_object_unref(s);
+        const w = std.c.open(fifo, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+        if (w >= 0) _ = std.c.close(w);
+        removeFile(fifo);
+        if (!timed_out) return "reading a FIFO in the trash did not time out";
+        if (took > 8 * std.time.us_per_s) return "reading a FIFO in the trash outlived its deadline";
+    }
+    {
+        // A trashed symlink says where it points, so a NOFOLLOW copy can recreate it.
+        const l = c.g_build_filename(files, "lnk", @as([*c]const u8, null));
+        defer c.g_free(l);
+        const lf = c.g_file_new_for_path(l);
+        defer c.g_object_unref(lf);
+        if (c.g_file_make_symbolic_link(lf, "/some/where", null, null) == 0) return "could not make the symlink";
+        defer removeFile(l);
+        const f = c.g_file_new_for_uri("trash:///h-lnk");
+        defer c.g_object_unref(f);
+        const li = c.g_file_query_info(f, "standard::*", c.G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, null, null);
+        if (li == null) return "could not query a trashed symlink";
+        defer c.g_object_unref(li);
+        if (c.g_strcmp0(c.g_file_info_get_symlink_target(li), "/some/where") != 0) return "a trashed symlink lost its target";
+    }
+    {
+        // A name that fails unescaping is the raw text with a slash, which no item has:
+        // trash:///h-a%00 must not select an item literally called a%00.
+        const f = c.g_file_new_for_uri("trash:///h-a%00");
+        defer c.g_object_unref(f);
+        const u = c.g_file_get_uri(f);
+        defer c.g_free(u);
+        if (!contains(u, "%2Fh-a")) return "a malformed URI could name a real item";
+    }
+    {
+        // A malformed URI is no item; it must never mean the root.
+        const r = runGio(&.{ "remove", "trash:///h-a.txt%00" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (r.ok or !contains(r.err, "no such item")) return "a malformed trash URI was not refused as missing";
     }
     {
         const src = c.g_file_new_for_uri("trash:///h-a.txt");
@@ -863,6 +926,47 @@ fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
         const r = runGio(&.{ "list", "recent:///" }) orelse return "could not run gio";
         defer freeCli(r);
         if (!r.ok) return "gio list recent:/// failed";
+    }
+
+    {
+        // The real commands, end to end: trash a file, restore it to where it was.
+        const path = c.g_build_filename(data, "round.txt", @as([*c]const u8, null));
+        defer c.g_free(path);
+        if (!writeText(data, "round.txt", "round")) return "could not write the round-trip file";
+        // g_file_trash picks the home trash by comparing devices with $HOME, which in a
+        // container lies on another filesystem than the test's data directory.
+        const home = c.g_strdup(c.g_getenv("HOME"));
+        defer c.g_free(home);
+        _ = c.g_setenv("HOME", data, 1);
+        defer _ = c.g_setenv("HOME", home, 1);
+        defer removeFile(path);
+        const t = runGio(&.{ "trash", std.mem.span(path) }) orelse return "could not run gio";
+        defer freeCli(t);
+        if (!t.ok) return "gio trash failed";
+        if (c.g_file_test(path, c.G_FILE_TEST_EXISTS) != 0) return "gio trash left the file";
+        const u = runGio(&.{ "trash", "--restore", "trash:///h-round.txt" }) orelse return "could not run gio";
+        defer freeCli(u);
+        if (!u.ok) return "gio trash --restore failed";
+        if (c.g_file_test(path, c.G_FILE_TEST_EXISTS) == 0) return "gio trash --restore did not bring it back";
+        if (countChildren("trash:///") != @as(?usize, 0)) return "the restored file is still in the trash";
+    }
+    {
+        // What a real client does: GIO has no empty, so `gio trash --empty` enumerates
+        // and deletes. An old orphan goes with the last item.
+        if (!writeText(files, "z.txt", "z") or !writeText(info, "z.txt.trashinfo", "[Trash Info]\nPath=/z\n") or
+            !writeText(info, "old.trashinfo", "[Trash Info]\nPath=/o\n"))
+            return "could not write the last items";
+        const oldp = c.g_build_filename(info, "old.trashinfo", @as([*c]const u8, null));
+        defer c.g_free(oldp);
+        const oldf = c.g_file_new_for_path(oldp);
+        defer c.g_object_unref(oldf);
+        if (c.g_file_set_attribute_uint64(oldf, "time::modified", 1_000_000_000, c.G_FILE_QUERY_INFO_NONE, null, null) == 0)
+            return "could not age the orphan";
+        const r = runGio(&.{ "trash", "--empty" }) orelse return "could not run gio";
+        defer freeCli(r);
+        if (!r.ok) return "gio trash --empty failed";
+        if (countChildren("trash:///") != @as(?usize, 0)) return "gio trash --empty left items";
+        if (c.g_file_test(oldp, c.G_FILE_TEST_EXISTS) != 0) return "gio trash --empty left an orphan";
     }
 
     ctx.stopDaemon();

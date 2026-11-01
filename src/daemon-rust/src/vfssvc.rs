@@ -18,9 +18,12 @@
 //! remain, else 4 (suspect mount) naming the skipped volumes.
 
 use std::{
-    ffi::OsStr,
+    ffi::{CString, OsStr},
     fs,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::{
+        fd::OwnedFd,
+        unix::ffi::{OsStrExt, OsStringExt},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, PoisonError,
@@ -31,12 +34,15 @@ use std::{
 };
 
 use crate::{
+    btrfs,
     ipc::{Handler, Msg, PAYLOAD_MAX, Port, Session},
     md::{
         MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT,
         ST_TIMEOUT, reply_payload,
     },
-    ops::{Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink},
+    ops::{
+        Anchor, Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink,
+    },
     recent,
     trash::{self, Item, TrashDir},
 };
@@ -45,6 +51,9 @@ pub const MSG_VFS_LIST: u32 = 40;
 pub const MSG_VFS_DELETE: u32 = 41;
 pub const MSG_VFS_RESTORE: u32 = 42;
 pub const MSG_TRASH_EMPTY: u32 = 43;
+/// Sent while an op is under way (same seq, no payload): the client's silence bound
+/// covers everything else, and an op may take as long as it makes progress.
+pub const MSG_VFS_BEAT: u32 = 44;
 
 pub const SCHEME_TRASH: u8 = 0;
 pub const SCHEME_RECENT: u8 = 1;
@@ -54,9 +63,19 @@ pub const ST_NOT_EMPTY: u32 = 18;
 
 /// Request threads that may exist at once; the next request gets `busy`.
 pub const MAX_WAITERS: usize = 4;
-/// Longest one item's op is waited for; then it is cancelled and answered `timeout`.
-const OP_DEADLINE: Duration = Duration::from_secs(60);
+/// Longest one item's op is waited for. Past the engine's own limits, which end it first:
+/// no progress for 30 s, or an hour in all. A big restore across devices needs that hour.
+const OP_DEADLINE: Duration = Duration::from_secs(3610);
 const CANCEL_WAIT: Duration = Duration::from_secs(2);
+/// A job this old is stuck, or a very long op that can spare its place in the queue.
+const SLOT_LEASE: Duration = Duration::from_secs(63);
+/// Threads the service will leave blocked before it refuses everything.
+const STUCK_MAX: usize = 32;
+const SUBVOLS_TTL: Duration = Duration::from_secs(5);
+/// How long a request waits for a subvolume search before answering without it.
+const SUBVOLS_WAIT: Duration = Duration::from_secs(2);
+const BEAT: Duration = Duration::from_secs(5);
+const GONE_CHECK: Duration = Duration::from_millis(250);
 /// Items one snapshot keeps; a bigger list is cut, never an unbounded allocation.
 const SNAPSHOT_MAX: usize = 1 << 17;
 /// Test hook (`test-hooks` builds only): this directory is one more volume.
@@ -126,6 +145,46 @@ impl Sink for Wait {
     }
 }
 
+/// The request a job runs for.
+pub struct Ctx {
+    port: Arc<Port>,
+    seq: u64,
+    last_beat: Mutex<Instant>,
+    /// The connection went: nobody wants the answer, so an op in progress stops.
+    gone: Arc<AtomicBool>,
+}
+
+impl Ctx {
+    fn last_beat_due(&self) -> bool {
+        let mut t = self
+            .last_beat
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let due = t.elapsed() >= BEAT;
+        if due {
+            *t = Instant::now();
+        }
+        due
+    }
+}
+
+/// What the trash directories are right now.
+struct Dirs {
+    dirs: Vec<TrashDir>,
+    skipped: Vec<PathBuf>,
+    /// Every subvolume was seen.
+    complete: bool,
+}
+
+/// The subvolume search, shared with its thread: the lock is never held across it.
+#[derive(Default)]
+struct Subvols {
+    /// The last search: when it ended, what it found, whether that was everything.
+    done: Option<(Instant, Vec<PathBuf>, bool)>,
+    /// When the search under way began.
+    started: Option<Instant>,
+}
+
 impl Wait {
     fn until(&self, end: Instant) -> Option<Result<(), OpError>> {
         let mut g = self.done.lock().unwrap_or_else(PoisonError::into_inner);
@@ -149,9 +208,16 @@ pub struct Svc {
     home: Option<TrashDir>,
     xbel: Option<PathBuf>,
     uid: u32,
+    /// `$HOME`, whose subvolumes hold trash as well.
+    home_root: Option<PathBuf>,
+    subvols: Arc<(Mutex<Subvols>, Condvar)>,
+    /// Search the host's btrfs mounts; test daemons keep to their own volume.
+    host_subvols: bool,
     /// Volumes beyond the mount table (the test hook).
     extra_tops: Vec<PathBuf>,
     in_flight: AtomicUsize,
+    /// Every running job: when it started, and whether it has ended.
+    jobs: Mutex<Vec<(Instant, Arc<AtomicBool>)>>,
     draining: AtomicBool,
 }
 
@@ -194,6 +260,35 @@ fn mount_points(text: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The mount `path` is on: the longest of `tops` above it, so a mount below another one
+/// counts as itself.
+fn mount_of<'a>(tops: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    tops.iter()
+        .filter(|t| path.starts_with(t))
+        .max_by_key(|t| t.components().count())
+}
+
+/// The mount points of a `/proc/self/mountinfo` text that are btrfs: opening anything
+/// else to find out would touch mounts that may hang.
+fn btrfs_mounts(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        if right.split(' ').next() != Some("btrfs") {
+            continue;
+        }
+        if let Some(raw) = left.split(' ').nth(4) {
+            let p = PathBuf::from(std::ffi::OsString::from_vec(unescape(raw.as_bytes())));
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// mountinfo's octal escapes.
 fn unescape(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
@@ -213,7 +308,32 @@ fn unescape(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Admission over `jobs`: at most [`MAX_WAITERS`] jobs younger than the lease, and
+/// [`STUCK_MAX`] in all. A job past its lease stops counting against the first bound
+/// (it keeps running and still answers): a thread blocked for good in a filesystem call
+/// on a mount that hung after its check costs one thread, not the whole service.
+fn admit(jobs: &mut Vec<(Instant, Arc<AtomicBool>)>, now: Instant) -> Option<Arc<AtomicBool>> {
+    jobs.retain(|(_, done)| !done.load(Ordering::SeqCst));
+    let young = jobs
+        .iter()
+        .filter(|(t, _)| now.duration_since(*t) < SLOT_LEASE)
+        .count();
+    if young >= MAX_WAITERS || jobs.len() >= STUCK_MAX {
+        return None;
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    jobs.push((now, Arc::clone(&done)));
+    Some(done)
+}
+
 impl Svc {
+    fn admit(&self, now: Instant) -> Option<Arc<AtomicBool>> {
+        admit(
+            &mut self.jobs.lock().unwrap_or_else(PoisonError::into_inner),
+            now,
+        )
+    }
+
     /// A service with paths from the environment's values.
     #[must_use]
     pub fn new(ops: Arc<Ops>, xdg_data: Option<&OsStr>, home: Option<&OsStr>) -> Arc<Self> {
@@ -231,11 +351,15 @@ impl Svc {
         Arc::new(Self {
             ops,
             home: trash_home,
+            home_root: home.map(PathBuf::from),
+            subvols: Arc::default(),
+            host_subvols: cfg!(not(feature = "test-hooks")),
             xbel,
             // SAFETY: plain getter.
             uid: unsafe { libc::geteuid() },
             extra_tops,
             in_flight: AtomicUsize::new(0),
+            jobs: Mutex::new(Vec::new()),
             draining: AtomicBool::new(false),
         })
     }
@@ -245,7 +369,73 @@ impl Svc {
     }
 
     /// Every trash directory reachable now, and the volumes skipped as hung or gone.
-    fn dirs(&self) -> (Vec<TrashDir>, Vec<PathBuf>) {
+    fn dirs(&self) -> Dirs {
+        self.dirs_as_of(false)
+    }
+
+    /// The subvolumes below `roots`, and whether that is all of them. Every item query
+    /// lists, and a machine can have hundreds: remembered briefly, except for an empty,
+    /// which has to answer for what is there now. The search runs on its own thread, one
+    /// at a time, with no lock held: a mount that hangs under it costs that thread, and
+    /// everyone else answers without it, saying the answer is not complete.
+    fn subvolumes(&self, roots: Vec<PathBuf>, fresh: bool) -> (Vec<PathBuf>, bool) {
+        let (lock, cv) = &*self.subvols;
+        let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if !fresh
+            && let Some((at, found, complete)) = &g.done
+            && at.elapsed() < SUBVOLS_TTL
+        {
+            return (found.clone(), *complete);
+        }
+        if g.started.is_none() {
+            let shared = Arc::clone(&self.subvols);
+            let ops = Arc::clone(&self.ops);
+            let spawned = thread::Builder::new()
+                .name("gungnir-subvols".into())
+                .spawn(move || {
+                    let skip = |p: &Path| ops.blocked(p.as_os_str().as_bytes()).is_some();
+                    let (mut found, mut complete) = (Vec::new(), true);
+                    for root in roots {
+                        // A hung root is named as skipped: that says more than "incomplete".
+                        if skip(&root) {
+                            continue;
+                        }
+                        let (more, whole) = btrfs::subvolumes(&root, btrfs::SUBVOLS_MAX, &skip);
+                        complete &= whole;
+                        found.extend(
+                            more.into_iter()
+                                .filter(|p| !found.contains(p))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    let (lock, cv) = &*shared;
+                    let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    g.done = Some((Instant::now(), found, complete));
+                    g.started = None;
+                    cv.notify_all();
+                });
+            if spawned.is_err() {
+                let found = g.done.as_ref().map_or_else(Vec::new, |d| d.1.clone());
+                return (found, false);
+            }
+            g.started = Some(Instant::now());
+        }
+        while let Some(t) = g.started {
+            let Some(left) = SUBVOLS_WAIT.checked_sub(t.elapsed()) else {
+                let found = g.done.as_ref().map_or_else(Vec::new, |d| d.1.clone());
+                return (found, false);
+            };
+            g = cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        g.done
+            .as_ref()
+            .map_or((Vec::new(), false), |d| (d.1.clone(), d.2))
+    }
+
+    fn dirs_as_of(&self, fresh: bool) -> Dirs {
         let mut dirs: Vec<TrashDir> = Vec::new();
         let mut skipped = Vec::new();
         if let Some(h) = &self.home {
@@ -255,10 +445,43 @@ impl Svc {
                 dirs.push(h.clone());
             }
         }
-        let mut tops = fs::read_to_string("/proc/self/mountinfo")
-            .map(|t| mount_points(&t))
-            .unwrap_or_default();
+        let table = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mut tops = mount_points(&table);
         tops.extend(self.extra_tops.iter().cloned());
+        let mut roots = if self.host_subvols {
+            btrfs_mounts(&table)
+        } else {
+            Vec::new()
+        };
+        roots.extend(self.extra_tops.iter().cloned());
+        // A mounted snapshot is a backup, unless the system or the user lives on it (a
+        // rollback runs from one, even with /home mounted apart): only then is its trash
+        // a real one.
+        let lived_on: Vec<PathBuf> = [
+            Some(Path::new("/")),
+            self.home_root.as_deref(),
+            self.home.as_ref().map(|h| h.dir.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| mount_of(&tops, p).cloned())
+        .collect();
+        tops.retain(|t| {
+            !roots.contains(t) || self.blocked(t) || lived_on.contains(t) || !btrfs::is_snapshot(t)
+        });
+        roots.retain(|t| tops.contains(t));
+        // A subvolume needs no mount of its own, and g_file_trash treats it as a volume.
+        // Btrfs lists its own, at any depth. Other filesystems: what shows as another
+        // device right below a root, which needs no walking of the disk.
+        let (subvols, complete) = self.subvolumes(roots, fresh);
+        let mut below = Vec::new();
+        for root in tops.iter().chain(&self.home_root) {
+            if !self.blocked(root) {
+                below.extend(trash::subvolume_tops(root, &|p| self.blocked(p)));
+            }
+        }
+        tops.extend(below);
+        tops.extend(subvols);
         for top in tops {
             if self.blocked(&top) {
                 // Only a volume with a trash matters, and asking would touch it: a hung
@@ -272,25 +495,43 @@ impl Svc {
                 }
             }
         }
-        (dirs, skipped)
+        Dirs {
+            dirs,
+            skipped,
+            complete,
+        }
     }
 
-    fn snapshot_trash(&self) -> Vec<Item> {
-        let (dirs, _) = self.dirs();
+    /// Everything in every trash, and whether that may not be all of it.
+    fn snapshot_trash(&self) -> (Vec<Item>, bool) {
+        let found = self.dirs();
+        let mut partial = !found.complete || !found.skipped.is_empty();
         let mut items = Vec::new();
-        for d in dirs.iter().filter(|d| trash::sound(d, self.uid)) {
-            match trash::scan(d) {
-                Ok(i) => items.extend(i),
+        let mut left = trash::SCAN_BYTES_MAX;
+        for d in found.dirs.iter() {
+            if !trash::sound(d, self.uid) {
+                partial |= trash::unusable(d, self.uid);
+                continue;
+            }
+            match trash::scan_capped(d, &mut left) {
+                Ok(i) => {
+                    partial |= left == 0 || trash::stuck_orphans(d, &i);
+                    items.extend(i);
+                }
                 // The home trash not existing yet is the normal case.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => eprintln!("gungnird: trash {}: {e}", d.dir.display()),
+                Err(e) => {
+                    partial = true;
+                    eprintln!("gungnird: trash {}: {e}", d.dir.display());
+                }
             }
             if items.len() >= SNAPSHOT_MAX {
                 items.truncate(SNAPSHOT_MAX);
+                partial = true;
                 break;
             }
         }
-        items
+        (items, partial)
     }
 
     fn snapshot_recent(&self) -> Result<Vec<Item>, Failure> {
@@ -324,17 +565,29 @@ impl Svc {
                 size,
                 mtime,
                 deleted: Vec::new(),
+                link: Vec::new(),
             });
         }
         Ok(items)
     }
 
-    /// Run one op to its end, within the deadline.
-    fn run(&self, req: OpRequest) -> Result<(), Failure> {
+    /// Run one op to its end, within the deadline, telling the client it is alive.
+    fn run(&self, req: OpRequest, ctx: &Ctx) -> Result<(), Failure> {
         let w = Arc::new(Wait::default());
         let ctl = self.ops.submit(req, w.clone())?;
-        if let Some(r) = w.until(Instant::now() + OP_DEADLINE) {
-            return r.map_err(Failure::from);
+        let end = Instant::now() + OP_DEADLINE;
+        loop {
+            let now = Instant::now();
+            // Short enough for a disconnect to stop the op promptly.
+            if let Some(r) = w.until(end.min(now + GONE_CHECK)) {
+                return r.map_err(Failure::from);
+            }
+            if ctx.gone.load(Ordering::SeqCst) || Instant::now() >= end {
+                break;
+            }
+            if ctx.last_beat_due() {
+                ctx.port.reply(MSG_VFS_BEAT, ctx.seq, &[]);
+            }
         }
         self.ops.cancel(&ctl);
         match w.until(Instant::now() + CANCEL_WAIT) {
@@ -345,29 +598,39 @@ impl Svc {
 
     /// Delete one item: the info entry is checked first and removed last, so a failure
     /// leaves it listed and retryable.
-    fn delete_item(&self, d: &TrashDir, entry: &[u8]) -> Result<(), Failure> {
+    fn delete_item(&self, d: &TrashDir, entry: &[u8], ctx: &Ctx) -> Result<(), Failure> {
         if !trash::sound(d, self.uid) {
             return Err(Failure::os(libc::ENOTDIR));
         }
-        trash::check_info_removable(d, entry).map_err(Failure::os)?;
+        let pins = d.pins().map_err(|e| io_failure(&e))?;
+        trash::check_info_removable_at(&pins.info, entry).map_err(Failure::os)?;
         let payload = d.files().join(OsStr::from_bytes(entry));
-        match fs::symlink_metadata(&payload) {
-            Ok(_) => self.run(OpRequest {
-                kind: OpKind::DeleteTree,
-                flags: 0,
-                timeout_ms: 0,
-                src: payload.as_os_str().as_bytes().to_vec(),
-                dest: Vec::new(),
-            })?,
+        match trash::stat_payload(&pins.files, entry) {
+            Ok(()) => self.run(
+                OpRequest {
+                    kind: OpKind::DeleteTree,
+                    flags: 0,
+                    timeout_ms: 0,
+                    src: payload.as_os_str().as_bytes().to_vec(),
+                    dest: Vec::new(),
+                    src_at: Some(anchor(pins.files, entry)?),
+                    dest_at: None,
+                },
+                ctx,
+            )?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Failure::st(ST_NOT_FOUND));
             }
             Err(e) => return Err(io_failure(&e)),
         }
-        trash::remove_info(d, entry).map_err(|e| io_failure(&e))
+        let r = trash::remove_info_at(d, &pins.info, entry).map_err(|e| io_failure(&e));
+        // Real clients empty a trash by deleting its items one by one. An orphan that would
+        // not go is no failure of this delete: the next listing says so.
+        let _ = trash::sweep_if_empty(d);
+        r
     }
 
-    fn delete(&self, scheme: u8, name: &[u8]) -> Result<(), Failure> {
+    fn delete(&self, scheme: u8, name: &[u8], ctx: &Ctx) -> Result<(), Failure> {
         if scheme == SCHEME_RECENT {
             let uri = unhex(name).ok_or(Failure::st(ST_BAD_REQUEST))?;
             let path = self.xbel.as_ref().ok_or(Failure::st(ST_IO_ERROR))?;
@@ -377,18 +640,24 @@ impl Svc {
                 recent::ForgetError::Io(e) => io_failure(&e),
             });
         }
-        let (dirs, _) = self.dirs();
-        let (d, entry) = trash::resolve(&dirs, name).ok_or_else(|| self.unresolved(name))?;
-        self.delete_item(d, &entry)
+        let found = self.dirs();
+        let (d, entry) = trash::resolve(&found.dirs, name).ok_or_else(|| self.unresolved(name))?;
+        self.delete_item(d, &entry, ctx)
     }
 
-    fn restore(&self, name: &[u8], dest: &[u8]) -> Result<(), Failure> {
-        let (dirs, _) = self.dirs();
-        let (d, entry) = trash::resolve(&dirs, name).ok_or_else(|| self.unresolved(name))?;
+    fn restore(&self, name: &[u8], dest: &[u8], ctx: &Ctx) -> Result<(), Failure> {
+        let found = self.dirs();
+        let (d, entry) = trash::resolve(&found.dirs, name).ok_or_else(|| self.unresolved(name))?;
         if !trash::sound(d, self.uid) {
             return Err(Failure::os(libc::ENOTDIR));
         }
-        let item = trash::read_item(d, &entry);
+        let pins = d.pins().map_err(|e| io_failure(&e))?;
+        let item = trash::item_in(d, &pins, &entry);
+        // The item's own path is foreign data even when a client sends it back, and
+        // g_file_move always does, respelled. Anything landing on the volume goes through
+        // the volume's own checks; only a destination elsewhere is the user's own choice.
+        let inside = Path::new(OsStr::from_bytes(dest)).starts_with(&d.top);
+        let foreign = !d.home && (dest.is_empty() || inside);
         let to = if dest.is_empty() {
             item.orig
         } else {
@@ -397,23 +666,51 @@ impl Svc {
         if to.first() != Some(&b'/') {
             return Err(Failure::st(ST_BAD_REQUEST));
         }
-        trash::check_info_removable(d, &entry).map_err(Failure::os)?;
-        self.run(OpRequest {
-            kind: OpKind::Move,
-            flags: 0,
-            timeout_ms: 0,
-            src: item.target,
-            dest: to,
-        })?;
-        trash::remove_info(d, &entry).map_err(|e| io_failure(&e))
+        // The check is the descriptor: what was checked is where the file lands.
+        let dest_at = if foreign {
+            let parent = trash::restore_parent(d, &to).ok_or(Failure::os(libc::EACCES))?;
+            let leaf = to.rsplit(|&b| b == b'/').next().unwrap_or_default();
+            Some(anchor(parent, leaf)?)
+        } else {
+            None
+        };
+        trash::check_info_removable_at(&pins.info, &entry).map_err(Failure::os)?;
+        self.run(
+            OpRequest {
+                kind: OpKind::Move,
+                flags: 0,
+                timeout_ms: 0,
+                src: item.target,
+                dest: to,
+                src_at: Some(anchor(pins.files, &entry)?),
+                dest_at,
+            },
+            ctx,
+        )
+        .map_err(restore_failure)?;
+        trash::remove_info_at(d, &pins.info, &entry).map_err(|e| io_failure(&e))
     }
 
     /// Empty what can be reached. Returns the reply status and body.
-    fn empty(&self) -> (u32, Vec<u8>) {
-        let (dirs, skipped) = self.dirs();
+    fn empty(&self, ctx: &Ctx) -> (u32, Vec<u8>) {
+        let Dirs {
+            dirs,
+            skipped,
+            complete,
+        } = self.dirs_as_of(true);
         let (mut deleted, mut failed) = (0u32, 0u32);
         let mut first: Option<Failure> = None;
-        for d in dirs.iter().filter(|d| trash::sound(d, self.uid)) {
+        // More subvolumes than were looked at: one of them may hold a trash.
+        let mut truncated = !complete;
+        'dirs: for d in &dirs {
+            if trash::unusable(d, self.uid) {
+                failed += 1;
+                first.get_or_insert(Failure::os(libc::ENOTDIR));
+                continue;
+            }
+            if !trash::sound(d, self.uid) {
+                continue; // nothing there yet
+            }
             let items = match trash::scan(d) {
                 Ok(i) => i,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -423,7 +720,12 @@ impl Svc {
                 }
             };
             for item in items {
-                match self.delete_item(d, &item.entry) {
+                // Nobody is there any more: the op in flight stopped, and so does this.
+                if ctx.gone.load(Ordering::SeqCst) {
+                    first = Some(Failure::st(ST_CANCELLED));
+                    break 'dirs;
+                }
+                match self.delete_item(d, &item.entry, ctx) {
                     Ok(()) => deleted += 1,
                     Err(f) => {
                         failed += 1;
@@ -432,6 +734,15 @@ impl Svc {
                 }
             }
             let _ = trash::remove_orphans(d);
+            // Past the scan's cap, trashed while this ran, or an info that would not go: it
+            // stays (the user chose to empty what was there), but "emptied" would be a lie.
+            match trash::has_items(d) {
+                Ok(left) => truncated |= left,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    first.get_or_insert(io_failure(&e));
+                }
+            }
         }
         let mut names = Vec::new();
         for p in &skipped {
@@ -446,13 +757,47 @@ impl Svc {
         body.extend_from_slice(&failed.to_le_bytes());
         body.extend_from_slice(&(names.len() as u16).to_le_bytes());
         body.extend_from_slice(&names);
-        let status = match first {
-            Some(f) => f.status,
-            None if failed > 0 => ST_NOT_EMPTY,
-            None if !skipped.is_empty() => ST_SUSPECT_MOUNT,
-            None => ST_OK,
-        };
-        (status, body)
+        (empty_status(first, truncated, !skipped.is_empty()), body)
+    }
+}
+
+/// Nothing in a restore is a mount in an item to unmount: say what it is.
+fn restore_failure(f: Failure) -> Failure {
+    if f.status == ST_MOUNT_INSIDE {
+        Failure {
+            status: ST_OS_ERROR,
+            errno: libc::EXDEV,
+        }
+    } else {
+        f
+    }
+}
+
+/// Stopped by a drain, not by anyone who asked: for the client that is "try again", never
+/// the silent cancel a file manager would not report.
+fn reply_status(st: u32, draining: bool) -> u32 {
+    if st == ST_CANCELLED && draining {
+        ST_BUSY
+    } else {
+        st
+    }
+}
+
+/// `leaf` under the held-open `dir`.
+fn anchor(dir: OwnedFd, leaf: &[u8]) -> Result<Anchor, Failure> {
+    Ok(Anchor {
+        dir: Arc::new(dir),
+        leaf: CString::new(leaf).map_err(|_| Failure::st(ST_BAD_REQUEST))?,
+    })
+}
+
+/// What an empty reports: never success while anything may remain.
+fn empty_status(first: Option<Failure>, truncated: bool, skipped: bool) -> u32 {
+    match first {
+        Some(f) => f.status,
+        None if truncated => ST_NOT_EMPTY,
+        None if skipped => ST_SUSPECT_MOUNT,
+        None => ST_OK,
     }
 }
 
@@ -476,32 +821,35 @@ fn put16(out: &mut Vec<u8>, s: &[u8]) {
 
 /// Encoded size of an item, if it can ever fit one reply.
 fn encoded(i: &Item) -> usize {
-    8 + i.name.len() + i.orig.len() + i.target.len() + i.deleted.len() + 17
+    10 + i.name.len() + i.orig.len() + i.target.len() + i.deleted.len() + i.link.len() + 17
 }
 
 /// One page of `items` from `cursor`: the reply body. An item too big for a reply is
 /// listed with its long strings dropped, never skipped: it can still be deleted by name.
 #[must_use]
-pub fn page(items: &[Item], cursor: usize) -> Vec<u8> {
+pub fn page(items: &[Item], cursor: usize, partial: bool) -> Vec<u8> {
     let max = PAYLOAD_MAX - 4;
-    let mut body = vec![0u8; 6];
+    let mut body = vec![0u8; 7];
+    body[6] = u8::from(partial);
     let (mut at, mut count) = (cursor, 0u16);
     while let Some(i) = items.get(at) {
         let degraded;
-        let it = if encoded(i) > max - 6 {
+        let it = if encoded(i) > max - 7 {
             degraded = Item {
                 orig: Vec::new(),
                 target: Vec::new(),
                 deleted: Vec::new(),
+                link: Vec::new(),
                 ..i.clone()
             };
             &degraded
         } else {
             i
         };
-        if encoded(it) > max - 6 {
+        if encoded(it) > max - 7 {
             // Not even its name fits: nothing could address it. Say so, and move on.
             eprintln!("gungnird: a trash item's name is too long to list");
+            body[6] = 1; // it exists, and no client will ever see it
             at += 1;
             continue;
         }
@@ -512,6 +860,7 @@ pub fn page(items: &[Item], cursor: usize) -> Vec<u8> {
         put16(&mut body, &it.orig);
         put16(&mut body, &it.target);
         put16(&mut body, &it.deleted);
+        put16(&mut body, &it.link);
         body.push(it.kind);
         body.extend_from_slice(&it.size.to_le_bytes());
         body.extend_from_slice(&it.mtime.to_le_bytes());
@@ -559,7 +908,8 @@ impl Handler for VfsHandler {
         Box::new(VfsSession {
             inner: self.inner.session(),
             svc: Arc::clone(&self.svc),
-            snapshot: Arc::new(Mutex::new(Vec::new())),
+            snapshot: Arc::new(Mutex::new((Vec::new(), false))),
+            gone: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -580,7 +930,14 @@ impl Handler for VfsHandler {
 struct VfsSession {
     inner: Box<dyn Session>,
     svc: Arc<Svc>,
-    snapshot: Arc<Mutex<Vec<Item>>>,
+    snapshot: Arc<Mutex<(Vec<Item>, bool)>>,
+    gone: Arc<AtomicBool>,
+}
+
+impl Drop for VfsSession {
+    fn drop(&mut self) {
+        self.gone.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Gives a request-thread slot back, whatever the thread does.
@@ -598,27 +955,36 @@ impl VfsSession {
         &self,
         port: &Arc<Port>,
         seq: u64,
-        job: impl FnOnce(&Svc) -> (u32, Vec<u8>) + Send + 'static,
+        job: impl FnOnce(&Svc, &Ctx) -> (u32, Vec<u8>) + Send + 'static,
     ) {
         let busy = || port.reply(MSG_MD_REPLY, seq, &reply_payload(ST_BUSY, &[]));
         if self.svc.draining.load(Ordering::SeqCst) {
             return busy();
         }
-        let n = self.svc.in_flight.fetch_add(1, Ordering::SeqCst);
-        let slot = Slot(Arc::clone(&self.svc));
-        if n >= MAX_WAITERS {
-            drop(slot);
+        let Some(done) = self.svc.admit(Instant::now()) else {
             return busy();
-        }
+        };
+        self.svc.in_flight.fetch_add(1, Ordering::SeqCst);
+        let slot = Slot(Arc::clone(&self.svc));
+        let ended = Arc::clone(&done);
         let p = Arc::clone(port);
+        let ctx = Ctx {
+            port: Arc::clone(port),
+            seq,
+            last_beat: Mutex::new(Instant::now()),
+            gone: Arc::clone(&self.gone),
+        };
         let spawned = thread::Builder::new()
             .name("gungnir-vfs".into())
             .spawn(move || {
-                let (st, body) = job(&slot.0);
+                let (st, body) = job(&slot.0, &ctx);
+                let st = reply_status(st, slot.0.draining.load(Ordering::SeqCst));
                 p.reply(MSG_MD_REPLY, seq, &reply_payload(st, &body));
                 drop(slot);
+                ended.store(true, Ordering::SeqCst);
             });
         if spawned.is_err() {
+            done.store(true, Ordering::SeqCst);
             busy();
         }
     }
@@ -635,20 +1001,20 @@ impl VfsSession {
         let cursor = u32::from_le_bytes([a, b, c, d]) as usize;
         if cursor > 0 {
             let s = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
-            let body = page(&s, cursor);
+            let body = page(&s.0, cursor, s.1);
             return port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_OK, &body));
         }
         let snap = Arc::clone(&self.snapshot);
-        self.spawn(port, msg.seq, move |svc| {
+        self.spawn(port, msg.seq, move |svc, _| {
             let items = if scheme == SCHEME_TRASH {
                 Ok(svc.snapshot_trash())
             } else {
-                svc.snapshot_recent()
+                svc.snapshot_recent().map(|i| (i, false))
             };
             match items {
-                Ok(items) => {
-                    let body = page(&items, 0);
-                    *snap.lock().unwrap_or_else(PoisonError::into_inner) = items;
+                Ok((items, partial)) => {
+                    let body = page(&items, 0, partial);
+                    *snap.lock().unwrap_or_else(PoisonError::into_inner) = (items, partial);
                     (ST_OK, body)
                 }
                 Err(f) => (f.status, f.body()),
@@ -679,7 +1045,12 @@ impl Session for VfsSession {
                 let Some(name) = take16(&mut p).filter(|_| p.is_empty()).map(<[u8]>::to_vec) else {
                     return bad();
                 };
-                self.spawn(port, msg.seq, move |svc| outcome(svc.delete(scheme, &name)));
+                if scheme > SCHEME_RECENT {
+                    return bad();
+                }
+                self.spawn(port, msg.seq, move |svc, ctx| {
+                    outcome(svc.delete(scheme, &name, ctx))
+                });
             }
             MSG_VFS_RESTORE => {
                 let mut p = msg.payload();
@@ -690,7 +1061,9 @@ impl Session for VfsSession {
                     return bad();
                 }
                 let (name, dest) = (name.to_vec(), dest.to_vec());
-                self.spawn(port, msg.seq, move |svc| outcome(svc.restore(&name, &dest)));
+                self.spawn(port, msg.seq, move |svc, ctx| {
+                    outcome(svc.restore(&name, &dest, ctx))
+                });
             }
             MSG_TRASH_EMPTY => self.spawn(port, msg.seq, Svc::empty),
             _ => self.inner.request(port, msg),
@@ -702,6 +1075,112 @@ impl Session for VfsSession {
 mod tests {
     use super::*;
 
+    /// A mount nested in a snapshot is not the snapshot: home on it says nothing of that.
+    #[test]
+    fn home_belongs_to_the_nearest_mount() {
+        let tops: Vec<PathBuf> = ["/", "/mnt/snap", "/mnt/snap/home"]
+            .map(PathBuf::from)
+            .into();
+        let on = |p: &str| mount_of(&tops, Path::new(p)).map(|t| t.to_str().unwrap_or(""));
+        assert_eq!(on("/mnt/snap/home/u"), Some("/mnt/snap/home"));
+        assert_eq!(on("/mnt/snap/x"), Some("/mnt/snap"));
+        assert_eq!(on("/home/u"), Some("/"));
+    }
+
+    #[test]
+    fn only_btrfs_mounts_are_searched() {
+        let table = "36 1 0:32 / / rw - btrfs /dev/a rw\n\
+                     37 1 0:33 / /mnt/my\\040disk rw shared:1 - btrfs /dev/b rw\n\
+                     38 1 0:34 / /mnt/nfs rw - nfs4 s:/x rw\n";
+        assert_eq!(
+            btrfs_mounts(table),
+            vec![PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_says_what_failed() {
+        assert_eq!(
+            restore_failure(Failure::st(ST_MOUNT_INSIDE)).errno,
+            libc::EXDEV
+        );
+        assert_eq!(restore_failure(Failure::st(ST_TIMEOUT)).status, ST_TIMEOUT);
+        assert_eq!(reply_status(ST_CANCELLED, true), ST_BUSY);
+        assert_eq!(reply_status(ST_CANCELLED, false), ST_CANCELLED);
+        assert_eq!(reply_status(ST_OK, true), ST_OK);
+    }
+
+    /// A search stuck under a hung mount holds nobody up, and says it is not complete.
+    #[test]
+    fn a_stuck_subvolume_search_costs_only_itself() {
+        use crate::ops::{NoGate, NoMeta, OpsConfig, io::EngineKind};
+        let ops = Arc::new(
+            Ops::start(
+                OpsConfig::default(),
+                EngineKind::Threads,
+                Arc::new(NoGate),
+                Arc::new(NoMeta),
+            )
+            .unwrap(),
+        );
+        let svc = Svc::new(ops, None, None);
+        {
+            let mut g = svc.subvols.0.lock().unwrap();
+            g.done = Some((
+                Instant::now() - SUBVOLS_TTL,
+                vec![PathBuf::from("/old")],
+                true,
+            ));
+            g.started = Some(Instant::now());
+        }
+        let t0 = Instant::now();
+        let (found, complete) = svc.subvolumes(Vec::new(), false);
+        assert!(t0.elapsed() < SUBVOLS_WAIT * 2);
+        assert_eq!(found, vec![PathBuf::from("/old")]);
+        assert!(!complete);
+        // The lock was free all along, and an old search is not waited for at all.
+        svc.subvols.0.lock().unwrap().started = Some(Instant::now() - SUBVOLS_WAIT);
+        let t0 = Instant::now();
+        assert!(!svc.subvolumes(Vec::new(), true).1);
+        assert!(t0.elapsed() < Duration::from_millis(500));
+    }
+
+    /// How an enumeration learns it was not told everything.
+    #[test]
+    fn a_page_says_when_the_listing_is_partial() {
+        let items = vec![item(0, 4)];
+        assert_eq!(page(&items, 0, false)[6], 0);
+        assert_eq!(page(&items, 0, true)[6], 1);
+        // An item too long to name is one no client can see.
+        let mut long = item(1, 4);
+        long.name = vec![b'n'; PAYLOAD_MAX];
+        assert_eq!(page(&[long], 0, false)[6], 1);
+    }
+
+    /// Stuck jobs hand their slot back after the lease, and the total stays bounded.
+    #[test]
+    fn a_stuck_job_gives_its_slot_back() {
+        let mut jobs = Vec::new();
+        let t0 = Instant::now();
+        for _ in 0..MAX_WAITERS {
+            assert!(admit(&mut jobs, t0).is_some());
+        }
+        assert!(admit(&mut jobs, t0).is_none());
+        let mut now = t0 + SLOT_LEASE;
+        let mut taken = MAX_WAITERS;
+        while taken < STUCK_MAX {
+            for _ in 0..MAX_WAITERS {
+                if admit(&mut jobs, now).is_some() {
+                    taken += 1;
+                }
+            }
+            now += SLOT_LEASE;
+        }
+        assert!(admit(&mut jobs, now).is_none());
+        jobs[0].1.store(true, Ordering::SeqCst);
+        assert!(admit(&mut jobs, now).is_some());
+    }
+
     fn item(n: usize, text: usize) -> Item {
         Item {
             name: format!("h-{n}").into_bytes(),
@@ -712,6 +1191,7 @@ mod tests {
             size: 1,
             mtime: 2,
             deleted: Vec::new(),
+            link: Vec::new(),
         }
     }
 
@@ -727,7 +1207,7 @@ mod tests {
         let items: Vec<_> = (0..500).map(|n| item(n, 40)).collect();
         let (mut cursor, mut seen) = (0, 0usize);
         loop {
-            let b = page(&items, cursor);
+            let b = page(&items, cursor, false);
             assert!(b.len() + 4 <= PAYLOAD_MAX);
             let (next, n) = count(&b);
             seen += usize::from(n);
@@ -743,7 +1223,7 @@ mod tests {
     #[test]
     fn an_oversized_item_is_listed_without_its_long_strings() {
         let items = vec![item(0, 60_000), item(1, 10)];
-        let b = page(&items, 0);
+        let b = page(&items, 0, false);
         assert!(b.len() + 4 <= PAYLOAD_MAX);
         assert_eq!(count(&b), (0, 2));
     }
@@ -757,7 +1237,7 @@ mod tests {
         let items = vec![item(1, 1), huge, item(2, 1), item(3, 1)];
         let (mut cursor, mut seen) = (0, 0usize);
         for _ in 0..8 {
-            let b = page(&items, cursor);
+            let b = page(&items, cursor, false);
             let (next, n) = count(&b);
             seen += usize::from(n);
             if next == 0 {
@@ -767,6 +1247,15 @@ mod tests {
             cursor = next as usize;
         }
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn empty_reports_success_only_when_nothing_can_remain() {
+        let f = Failure::os(libc::EACCES);
+        assert_eq!(empty_status(Some(f), true, true), ST_OS_ERROR);
+        assert_eq!(empty_status(None, true, true), ST_NOT_EMPTY);
+        assert_eq!(empty_status(None, false, true), ST_SUSPECT_MOUNT);
+        assert_eq!(empty_status(None, false, false), ST_OK);
     }
 
     #[test]

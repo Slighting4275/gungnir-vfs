@@ -11,6 +11,7 @@
 //! and the folders inside a trashed folder are not browsable through `trash:///`.
 
 const std = @import("std");
+const health = @import("health.zig");
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
@@ -34,8 +35,13 @@ const kind_symlink: u8 = 3;
 
 const connect_timeout_ms = 500;
 const list_timeout_ms = 5_000;
-/// Longer than the daemon's own bound on one item, so its answer is what the caller sees.
+/// Longest silence from the daemon. An op under way sends a beat every 5 s, so a big
+/// restore takes what it takes, and only a daemon stuck outside its engine runs this out.
 const op_timeout_ms = 65_000;
+const msg_beat: u32 = 44;
+/// A list refused because every request slot is taken is tried again this often.
+const busy_retries = 100;
+const busy_wait_us = 20_000;
 
 pub const GungnirFile = extern struct {
     parent: c.GObject,
@@ -52,6 +58,7 @@ const GungnirEnum = extern struct {
     parent: c.GFileEnumerator,
     infos: ?*c.GPtrArray,
     at: c.guint,
+    partial: c_int,
 };
 
 const GungnirEnumClass = extern struct {
@@ -94,7 +101,16 @@ pub fn forUri(uri: [*c]const u8) ?*c.GFile {
     const trimmed = std.mem.trimStart(u8, rest, "/");
     if (trimmed.len == 0) return newFile(scheme, null);
     const z = c.g_uri_unescape_string(trimmed.ptr, null);
-    if (z == null) return newFile(scheme, null);
+    if (z == null) {
+        // Not valid escaping (%00, a stray %): no item has that name, and above all it
+        // must not silently mean the root.
+        // The raw text could be a real item's name, so it gets a slash, which none has.
+        const raw = dupz(trimmed);
+        defer c.g_free(raw);
+        const none = c.g_strconcat("/", raw, @as([*c]const u8, null));
+        defer c.g_free(none);
+        return newFile(scheme, none);
+    }
     defer c.g_free(z);
     return newFile(scheme, z);
 }
@@ -134,8 +150,50 @@ const Link = struct {
 };
 
 /// Turn a failed request into a GError.
+fn cancelled(ctx: ?*anyopaque) bool {
+    const k: [*c]c.GCancellable = @ptrCast(@alignCast(ctx));
+    return c.g_cancellable_is_cancelled(k) != 0;
+}
+
+/// Have `link` honour `k`: closing the connection is what stops the daemon's op.
+fn watch(link: *Link, k: [*c]c.GCancellable) void {
+    link.client.beat_kind = msg_beat;
+    if (k != null) {
+        link.client.stop = &cancelled;
+        link.client.stop_ctx = @ptrCast(k);
+    }
+}
+
+/// A request, tried again while every request slot is taken: each query of one item is a
+/// list, so a folder view's worth of them at once is normal, and `busy` means a moment.
+fn requestRetry(link: *Link, kind: u32, payload: []const u8, reply: *ipc.Msg) md.Error![]const u8 {
+    const Call = struct {
+        link: *Link,
+        kind: u32,
+        payload: []const u8,
+        reply: *ipc.Msg,
+        fn run(a: @This()) md.Error![]const u8 {
+            return a.link.client.request(a.kind, a.payload, a.reply);
+        }
+    };
+    return whileBusy(Call{ .link = link, .kind = kind, .payload = payload, .reply = reply }, busy_retries, busy_wait_us);
+}
+
+fn whileBusy(call: anytype, retries: u32, wait_us: c.gulong) md.Error![]const u8 {
+    var tries: u32 = 0;
+    while (true) {
+        return call.run() catch |e| {
+            if (e != error.Busy or tries >= retries) return e;
+            tries += 1;
+            c.g_usleep(wait_us);
+            continue;
+        };
+    }
+}
+
 fn failure(cl: *const md.Client, reply: *ipc.Msg, e: md.Error, err: [*c][*c]c.GError) void {
     switch (e) {
+        error.Cancelled => setError(err, c.G_IO_ERROR_CANCELLED, "cancelled"),
         error.Busy => setError(err, c.G_IO_ERROR_BUSY, "gungnird is busy; try again"),
         error.Timeout => setError(err, c.G_IO_ERROR_TIMED_OUT, "gungnird did not answer in time"),
         error.SuspectMount => setError(err, c.G_IO_ERROR_TIMED_OUT, "a volume is hung or gone (reported by the gungnird mount health monitor)"),
@@ -164,6 +222,7 @@ const Row = struct {
     orig: []const u8,
     target: []const u8,
     deleted: []const u8,
+    link: []const u8,
     kind: u8,
     size: u64,
     mtime: i64,
@@ -186,12 +245,14 @@ const Parser = struct {
         const orig = p.str() orelse return null;
         const target = p.str() orelse return null;
         const deleted = p.str() orelse return null;
+        const link = p.str() orelse return null;
         if (p.rest.len < 17) return null;
         const r: Row = .{
             .name = name,
             .orig = orig,
             .target = target,
             .deleted = deleted,
+            .link = link,
             .kind = p.rest[0],
             .size = std.mem.readInt(u64, p.rest[1..9], .little),
             .mtime = std.mem.readInt(i64, p.rest[9..17], .little),
@@ -247,10 +308,19 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
     };
     c.g_file_info_set_file_type(info, file_kind);
     c.g_file_info_set_size(info, @intCast(@min(r.size, std.math.maxInt(i64))));
+    c.g_file_info_set_is_hidden(info, 0);
+    c.g_file_info_set_attribute_boolean(info, "standard::is-backup", 0);
+    c.g_file_info_set_is_symlink(info, 0);
     c.g_file_info_set_attribute_uint64(info, "time::modified", @intCast(@max(r.mtime, 0)));
     c.g_file_info_set_attribute_boolean(info, "access::can-delete", 1);
     setCommon(info);
-    if (r.kind == kind_symlink) c.g_file_info_set_is_symlink(info, 1);
+    if (r.kind == kind_symlink) {
+        c.g_file_info_set_is_symlink(info, 1);
+        // g_file_copy with NOFOLLOW recreates the link from this, instead of reading it.
+        const l = dupz(r.link);
+        defer c.g_free(l);
+        if (r.link.len != 0) c.g_file_info_set_symlink_target(info, l);
+    }
 
     if (r.kind == kind_dir) {
         c.g_file_info_set_content_type(info, "inode/directory");
@@ -282,7 +352,8 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
 }
 
 /// Every item of `scheme` as GFileInfos, in a new array owning them.
-fn fetch(scheme: u8, err: [*c][*c]c.GError) ?*c.GPtrArray {
+/// Everything listed; `partial` says it may not be everything there is.
+fn fetch(scheme: u8, partial: ?*bool, err: [*c][*c]c.GError) ?*c.GPtrArray {
     var link: Link = undefined;
     if (!link.open(list_timeout_ms, err)) return null;
     defer link.close();
@@ -293,19 +364,20 @@ fn fetch(scheme: u8, err: [*c][*c]c.GError) ?*c.GPtrArray {
         req[0] = scheme;
         std.mem.writeInt(u32, req[1..5], cursor, .little);
         var reply: ipc.Msg = undefined;
-        const body = link.client.request(msg_list, &req, &reply) catch |e| {
+        const body = requestRetry(&link, msg_list, &req, &reply) catch |e| {
             failure(&link.client, &reply, e, err);
             _ = c.g_ptr_array_free(out, 1);
             return null;
         };
-        if (body.len < 6) {
+        if (body.len < 7) {
             setError(err, c.G_IO_ERROR_FAILED, "bad reply from gungnird");
             _ = c.g_ptr_array_free(out, 1);
             return null;
         }
         const next = std.mem.readInt(u32, body[0..4], .little);
         const count = std.mem.readInt(u16, body[4..6], .little);
-        var p: Parser = .{ .rest = body[6..] };
+        if (partial) |o| o.* = o.* or body[6] != 0;
+        var p: Parser = .{ .rest = body[7..] };
         var i: u16 = 0;
         while (i < count) : (i += 1) {
             const r = p.row() orelse {
@@ -333,6 +405,9 @@ fn rootInfo(scheme: u8, count: c.guint) ?*c.GFileInfo {
     c.g_file_info_set_file_type(info, c.G_FILE_TYPE_DIRECTORY);
     c.g_file_info_set_content_type(info, "inode/directory");
     c.g_file_info_set_size(info, 0);
+    c.g_file_info_set_is_hidden(info, 0);
+    c.g_file_info_set_attribute_boolean(info, "standard::is-backup", 0);
+    c.g_file_info_set_is_symlink(info, 0);
     setCommon(info);
     c.g_file_info_set_attribute_boolean(info, "access::can-delete", 0);
     if (scheme == scheme_trash) c.g_file_info_set_attribute_uint32(info, "trash::item-count", count);
@@ -341,7 +416,7 @@ fn rootInfo(scheme: u8, count: c.guint) ?*c.GFileInfo {
 
 /// One item's info, as a new reference.
 fn findInfo(self: *GungnirFile, err: [*c][*c]c.GError) ?*c.GFileInfo {
-    const all = fetch(self.scheme, err) orelse return null;
+    const all = fetch(self.scheme, null, err) orelse return null;
     defer _ = c.g_ptr_array_free(all, 1);
     var i: c.guint = 0;
     while (i < all.*.len) : (i += 1) {
@@ -389,7 +464,9 @@ fn fileGetScheme(f: ?*c.GFile) callconv(.c) [*c]u8 {
 
 fn fileBasename(f: ?*c.GFile) callconv(.c) [*c]u8 {
     const s = asSelf(f);
-    return c.g_strdup(if (s.name != null) s.name else "/");
+    if (s.name == null) return c.g_strdup("/");
+    const n = std.mem.span(s.name);
+    return c.g_strdup(n[if (std.mem.lastIndexOfScalar(u8, n, '/')) |i| i + 1 else 0..].ptr);
 }
 
 fn fileGetPath(f: ?*c.GFile) callconv(.c) [*c]u8 {
@@ -426,7 +503,15 @@ fn fileResolve(f: ?*c.GFile, rel: [*c]const u8) callconv(.c) ?*c.GFile {
     const s = asSelf(f);
     const r = std.mem.trim(u8, std.mem.span(rel), "/");
     if (r.len == 0 or std.mem.eql(u8, r, ".")) return newFile(s.scheme, s.name);
-    if (s.name != null) return newFile(s.scheme, s.name); // no browsing inside an item
+    if (s.name != null) {
+        // No browsing inside an item, but a child must never alias it: a name with a
+        // slash is no item, so every use of this file answers not-found.
+        const rz = dupz(r);
+        defer c.g_free(rz);
+        const child = c.g_strconcat(s.name, "/", rz, @as([*c]const u8, null));
+        defer c.g_free(child);
+        return newFile(s.scheme, child);
+    }
     const z = dupz(r);
     defer c.g_free(z);
     return newFile(s.scheme, z);
@@ -454,7 +539,8 @@ fn fileEnumerate(
         setError(err, c.G_IO_ERROR_NOT_DIRECTORY, "folders inside the trash cannot be browsed");
         return null;
     }
-    const infos = fetch(s.scheme, err) orelse return null;
+    var partial = false;
+    const infos = fetch(s.scheme, &partial, err) orelse return null;
     const raw = c.g_object_new(enum_type, "container", f, @as([*c]const u8, null));
     if (raw == null) {
         _ = c.g_ptr_array_free(infos, 1);
@@ -464,6 +550,7 @@ fn fileEnumerate(
     const e: *GungnirEnum = @ptrCast(@alignCast(raw));
     e.infos = infos;
     e.at = 0;
+    e.partial = @intFromBool(partial);
     return @ptrCast(@alignCast(raw));
 }
 
@@ -479,7 +566,7 @@ fn fileQueryInfo(
     _ = cancellable;
     const s = asSelf(f);
     if (s.name != null) return findInfo(s, err);
-    const all = fetch(s.scheme, err) orelse return null;
+    const all = fetch(s.scheme, null, err) orelse return null;
     defer _ = c.g_ptr_array_free(all, 1);
     return rootInfo(s.scheme, all.*.len);
 }
@@ -493,17 +580,125 @@ fn targetFile(self: *GungnirFile, err: [*c][*c]c.GError) ?*c.GFile {
         setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "this item has no file behind it");
         return null;
     }
-    return c.g_vfs_get_file_for_uri(c.g_vfs_get_local(), uri);
+    const t = c.g_vfs_get_file_for_uri(c.g_vfs_get_local(), uri) orelse return null;
+    if (targetBlocked(t, err)) {
+        c.g_object_unref(t);
+        return null;
+    }
+    return t;
+}
+
+/// One open of a target on its own thread. Two owners, the caller and the thread; once
+/// the caller stops waiting, the thread cleans up whenever the kernel lets it go.
+const OpenJob = struct {
+    refs: std.atomic.Value(u32) = .init(2),
+    file: *c.GFile,
+    cancellable: [*c]c.GCancellable,
+    lock: c.GMutex = undefined,
+    cond: c.GCond = undefined,
+    done: bool = false,
+    abandoned: bool = false,
+    stream: [*c]c.GFileInputStream = null,
+    err: [*c]c.GError = null,
+
+    fn unref(j: *OpenJob) void {
+        if (j.refs.fetchSub(1, .acq_rel) != 1) return;
+        c.g_object_unref(j.file);
+        if (j.cancellable != null) c.g_object_unref(j.cancellable);
+        c.g_mutex_clear(&j.lock);
+        c.g_cond_clear(&j.cond);
+        c.g_free(j);
+    }
+};
+
+/// Open threads alive, stuck or not; past the bound, nothing more is tried. Counted before
+/// the thread starts, so callers arriving together cannot all get past it.
+var opens_running: std.atomic.Value(u32) = .init(0);
+const opens_running_max = 32;
+const open_timeout_us = 5 * std.time.us_per_s;
+
+fn openThread(data: c.gpointer) callconv(.c) c.gpointer {
+    const j: *OpenJob = @ptrCast(@alignCast(data));
+    var e: [*c]c.GError = null;
+    const s = c.g_file_read(j.file, j.cancellable, &e);
+    c.g_mutex_lock(&j.lock);
+    const abandoned = j.abandoned;
+    j.done = true;
+    if (!abandoned) {
+        j.stream = s;
+        j.err = e;
+        c.g_cond_signal(&j.cond);
+    }
+    c.g_mutex_unlock(&j.lock);
+    if (abandoned) {
+        if (s != null) c.g_object_unref(s);
+        if (e != null) c.g_error_free(e);
+    }
+    j.unref();
+    _ = opens_running.fetchSub(1, .acq_rel);
+    return null;
+}
+
+/// `g_file_read` with a deadline. It follows links, and any part of the way may be a
+/// hung mount the health table cannot see from the path; a FIFO blocks too.
+fn readBounded(t: *c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) [*c]c.GFileInputStream {
+    if (opens_running.fetchAdd(1, .acq_rel) >= opens_running_max) {
+        _ = opens_running.fetchSub(1, .acq_rel);
+        setError(err, c.G_IO_ERROR_BUSY, "too many opens are stuck");
+        return null;
+    }
+    const j: *OpenJob = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(OpenJob))));
+    j.* = .{ .file = @ptrCast(@alignCast(c.g_object_ref(t))), .cancellable = cancellable };
+    if (cancellable != null) _ = c.g_object_ref(cancellable);
+    c.g_mutex_init(&j.lock);
+    c.g_cond_init(&j.cond);
+    const th = c.g_thread_try_new("gungnir-open", openThread, j, err);
+    if (th == null) {
+        j.unref();
+        j.unref();
+        _ = opens_running.fetchSub(1, .acq_rel);
+        return null;
+    }
+    c.g_thread_unref(th);
+    const deadline = c.g_get_monotonic_time() + open_timeout_us;
+    c.g_mutex_lock(&j.lock);
+    while (!j.done) {
+        if (c.g_cond_wait_until(&j.cond, &j.lock, deadline) == 0) break;
+    }
+    const finished = j.done;
+    const s = j.stream;
+    const e = j.err;
+    if (!finished) j.abandoned = true;
+    c.g_mutex_unlock(&j.lock);
+    j.unref();
+    if (!finished) {
+        setError(err, c.G_IO_ERROR_TIMED_OUT, "the file did not open in time");
+        return null;
+    }
+    if (e != null) {
+        if (err != null) err.* = e else c.g_error_free(e);
+    }
+    return s;
+}
+
+/// A target on a mount known hung or gone is refused here, in memory, without even
+/// spending a thread on it.
+fn targetBlocked(t: *c.GFile, err: [*c][*c]c.GError) bool {
+    const p = c.g_file_get_path(t);
+    if (p == null) return false;
+    defer c.g_free(p);
+    if (!health.blocks(std.mem.span(p))) return false;
+    setError(err, c.G_IO_ERROR_NOT_MOUNTED, "the file's mount is hung or gone (reported by the gungnird mount health monitor)");
+    return true;
 }
 
 fn fileRead(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) [*c]c.GFileInputStream {
     const t = targetFile(asSelf(f), err) orelse return null;
     defer c.g_object_unref(t);
-    return c.g_file_read(t, cancellable, err);
+    return readBounded(t, cancellable, err);
 }
 
 fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) c.gboolean {
-    _ = cancellable;
     const s = asSelf(f);
     if (s.name == null) {
         setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "the root cannot be deleted");
@@ -521,8 +716,9 @@ fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GErr
     var link: Link = undefined;
     if (!link.open(op_timeout_ms, err)) return 0;
     defer link.close();
+    watch(&link, cancellable);
     var reply: ipc.Msg = undefined;
-    _ = link.client.request(msg_delete, req[0 .. 3 + name.len], &reply) catch |e| {
+    _ = requestRetry(&link, msg_delete, req[0 .. 3 + name.len], &reply) catch |e| {
         failure(&link.client, &reply, e, err);
         return 0;
     };
@@ -539,7 +735,6 @@ fn fileMove(
     progress_data: c.gpointer,
     err: [*c][*c]c.GError,
 ) callconv(.c) c.gboolean {
-    _ = cancellable;
     _ = progress;
     _ = progress_data;
     const s = asSelf(src);
@@ -569,8 +764,9 @@ fn fileMove(
     var link: Link = undefined;
     if (!link.open(op_timeout_ms, err)) return 0;
     defer link.close();
+    watch(&link, cancellable);
     var reply: ipc.Msg = undefined;
-    _ = link.client.request(msg_restore, req[0 .. at + to.len], &reply) catch |e| {
+    _ = requestRetry(&link, msg_restore, req[0 .. at + to.len], &reply) catch |e| {
         failure(&link.client, &reply, e, err);
         return 0;
     };
@@ -618,10 +814,17 @@ fn fileClassInit(g_class: c.gpointer, class_data: c.gpointer) callconv(.c) void 
 
 fn enumNext(e: [*c]c.GFileEnumerator, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GError) callconv(.c) ?*c.GFileInfo {
     _ = cancellable;
-    _ = err;
     const s: *GungnirEnum = @ptrCast(@alignCast(e));
     const list = s.infos orelse return null;
-    if (s.at >= list.*.len) return null;
+    if (s.at >= list.*.len) {
+        // GIO has no empty of its own: clients enumerate and delete. An ending without
+        // complaint would tell them they got everything.
+        if (s.partial != 0) {
+            s.partial = 0;
+            setError(err, c.G_IO_ERROR_FAILED, "not every item could be listed: too many, or a volume is hung");
+        }
+        return null;
+    }
     const info: *c.GFileInfo = @ptrCast(@alignCast(list.*.pdata[s.at]));
     s.at += 1;
     _ = c.g_object_ref(info);
@@ -698,7 +901,7 @@ test "a bad reply never reads past the page" {
 }
 
 test "a row parses" {
-    const bytes = [_]u8{ 1, 0, 'n', 1, 0, 'o', 1, 0, 't', 0, 0, 2, 5, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0 };
+    const bytes = [_]u8{ 1, 0, 'n', 1, 0, 'o', 1, 0, 't', 0, 0, 0, 0, 2, 5, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0 };
     var p: Parser = .{ .rest = &bytes };
     const r = p.row().?;
     try std.testing.expectEqualStrings("n", r.name);
@@ -712,4 +915,46 @@ test "the last component of a path" {
     try std.testing.expectEqualStrings("b", lastComponent("/a/b"));
     try std.testing.expectEqualStrings("b", lastComponent("/a/b/"));
     try std.testing.expectEqualStrings("b", lastComponent("b"));
+}
+
+test "a target on a hung mount is refused in memory" {
+    health.reset();
+    defer health.reset();
+    var buf: [64]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], 1, .little);
+    buf[8] = health.ev_first | health.ev_last;
+    std.mem.writeInt(u16, buf[9..11], 1, .little);
+    std.mem.writeInt(u64, buf[11..19], 40, .little);
+    buf[19] = health.hung;
+    std.mem.writeInt(u16, buf[20..22], 7, .little);
+    @memcpy(buf[22..29], "/hung-m");
+    health.onEvent(buf[0..29]);
+    const bad = c.g_file_new_for_path("/hung-m/a") orelse return error.OutOfMemory;
+    defer c.g_object_unref(bad);
+    var err: [*c]c.GError = null;
+    try std.testing.expect(targetBlocked(bad, &err));
+    defer c.g_error_free(err);
+    const fine = c.g_file_new_for_path("/elsewhere/a") orelse return error.OutOfMemory;
+    defer c.g_object_unref(fine);
+    try std.testing.expect(!targetBlocked(fine, null));
+}
+
+test "busy is waited out, within its bound, and nothing else is" {
+    const Stub = struct {
+        left: *u32,
+        err: md.Error,
+        fn run(a: @This()) md.Error![]const u8 {
+            if (a.left.* == 0) return "ok";
+            a.left.* -= 1;
+            return a.err;
+        }
+    };
+    var n: u32 = 3;
+    try std.testing.expectEqualStrings("ok", try whileBusy(Stub{ .left = &n, .err = error.Busy }, 5, 1));
+    n = 9;
+    try std.testing.expectError(error.Busy, whileBusy(Stub{ .left = &n, .err = error.Busy }, 5, 1));
+    try std.testing.expectEqual(@as(u32, 3), n);
+    n = 2;
+    try std.testing.expectError(error.Timeout, whileBusy(Stub{ .left = &n, .err = error.Timeout }, 5, 1));
+    try std.testing.expectEqual(@as(u32, 1), n);
 }

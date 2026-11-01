@@ -163,6 +163,8 @@ fn req(kind: OpKind, flags: u32, src: &Path, dest: Option<&Path>) -> OpRequest {
         timeout_ms: 0,
         src: b(src),
         dest: dest.map(b).unwrap_or_default(),
+        src_at: None,
+        dest_at: None,
     }
 }
 
@@ -236,6 +238,8 @@ fn start_requests_round_trip_and_bad_ones_are_refused() {
         timeout_ms: 1234,
         src: b"/a/b".to_vec(),
         dest: b"/c/d".to_vec(),
+        src_at: None,
+        dest_at: None,
     };
     assert_eq!(OpRequest::parse(&good.encode()), Ok(good.clone()));
     let fsync_root = OpRequest {
@@ -244,6 +248,8 @@ fn start_requests_round_trip_and_bad_ones_are_refused() {
         timeout_ms: 0,
         src: b"/".to_vec(),
         dest: Vec::new(),
+        src_at: None,
+        dest_at: None,
     };
     assert_eq!(OpRequest::parse(&fsync_root.encode()), Ok(fsync_root));
     let bad = |f: &dyn Fn(&mut OpRequest)| {
@@ -1329,6 +1335,229 @@ fn a_failed_delete_tree_reports_only_what_it_deleted() -> R {
             fs::remove_dir(&p)?;
             p.pop();
         }
+    }
+    Ok(())
+}
+
+/// A trash-style directory re-aimed at another one after its descriptor was taken.
+fn swapped_dir(t: &TestDir) -> R<(Anchor, PathBuf, PathBuf)> {
+    let files = t.join("files");
+    let (old, other) = (t.join("old"), t.join("other"));
+    fs::create_dir(&files)?;
+    fs::create_dir(&other)?;
+    fs::write(files.join("e"), b"item")?;
+    fs::write(other.join("e"), b"precious")?;
+    let dir = OwnedFd::from(fs::OpenOptions::new().read(true).open(&files)?);
+    fs::rename(&files, &old)?;
+    std::os::unix::fs::symlink(&other, &files)?;
+    let a = Anchor {
+        dir: Arc::new(dir),
+        leaf: CString::new("e")?,
+    };
+    Ok((a, files.join("e"), other.join("e")))
+}
+
+/// REV-3: an anchored delete acts on the checked directory, not on what the path became.
+#[test]
+fn an_anchored_delete_ignores_a_swapped_path() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-anchor-del")?;
+        let ops = start(engine, test_cfg())?;
+        let (a, src, other) = swapped_dir(&t)?;
+        let mut r = req(OpKind::DeleteTree, 0, &src, None);
+        r.src_at = Some(a);
+        let (d, _) = run(&ops, r)?;
+        assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read(&other)?, b"precious", "{engine:?}");
+        assert!(!t.join("old/e").exists(), "{engine:?}");
+    }
+    Ok(())
+}
+
+/// REV-3: the same for a move, by rename and through the copy fallback.
+#[test]
+fn an_anchored_move_ignores_a_swapped_path() -> R {
+    for engine in engines() {
+        for force_exdev in [false, true] {
+            let t = TestDir::new("op-anchor-mv")?;
+            let mut cfg = test_cfg();
+            cfg.force_exdev = force_exdev;
+            let ops = start(engine, cfg)?;
+            let (a, src, other) = swapped_dir(&t)?;
+            let landed = t.join("landed");
+            let mut r = req(OpKind::Move, 0, &src, Some(&landed));
+            r.src_at = Some(a);
+            let (d, _) = run(&ops, r)?;
+            assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
+            assert_eq!(fs::read(&landed)?, b"item", "{engine:?}");
+            assert_eq!(fs::read(&other)?, b"precious", "{engine:?}");
+            assert!(!t.join("old/e").exists(), "{engine:?}");
+        }
+    }
+    Ok(())
+}
+
+/// REV-3: the destination too: the file lands where the descriptor points.
+#[test]
+fn an_anchored_destination_ignores_a_swapped_path() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-anchor-to")?;
+        let ops = start(engine, test_cfg())?;
+        let (a, swapped, _) = swapped_dir(&t)?;
+        let from = t.join("from");
+        fs::write(&from, b"new")?;
+        fs::remove_file(t.join("old/e"))?;
+        let mut r = req(OpKind::Move, 0, &from, Some(&swapped));
+        r.dest_at = Some(a);
+        let (d, _) = run(&ops, r)?;
+        assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read(t.join("old/e"))?, b"new", "{engine:?}");
+        assert_eq!(fs::read(t.join("other/e"))?, b"precious", "{engine:?}");
+    }
+    Ok(())
+}
+
+/// REV-4: same inode, but opened through a mount that appeared after the first look.
+#[test]
+fn a_root_bound_over_itself_counts_as_another_mount() {
+    // SAFETY: an all-zero statx is valid.
+    let mut before: libc::statx = unsafe { std::mem::zeroed() };
+    before.stx_mask = libc::STATX_MNT_ID;
+    before.stx_mnt_id = 7;
+    let mut after = before;
+    assert!(!other_mount(&before, &after));
+    after.stx_mnt_id = 8;
+    assert!(same_file(&before, &after) && other_mount(&before, &after));
+    let mut root = before;
+    root.stx_attributes_mask = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    root.stx_attributes = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    assert!(other_mount(&before, &root));
+}
+
+/// REV2-2: the no-replace path of a filesystem without RENAME_NOREPLACE.
+#[test]
+fn no_replace_without_kernel_support_never_replaces() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-noreplace")?;
+        let mut cfg = test_cfg();
+        cfg.force_no_noreplace = true;
+        let ops = start(engine, cfg)?;
+        let (src, dest) = (t.join("s"), t.join("d"));
+        fs::write(&src, b"new")?;
+        fs::write(&dest, b"precious")?;
+        let (d, _) = run(&ops, req(OpKind::Move, 0, &src, Some(&dest)))?;
+        assert_eq!(os(&d), Some(libc::EEXIST), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read(&dest)?, b"precious", "{engine:?}");
+        assert_eq!(fs::read(&src)?, b"new", "{engine:?}");
+        fs::remove_file(&dest)?;
+        let (d, _) = run(&ops, req(OpKind::Move, 0, &src, Some(&dest)))?;
+        assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read(&dest)?, b"new", "{engine:?}");
+        assert!(!src.exists(), "{engine:?}");
+    }
+    Ok(())
+}
+
+/// REV2-9: an anchored destination is rename-only, and a refused move loses nothing.
+#[test]
+fn an_anchored_destination_never_falls_back_to_a_copy() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-anchor-exdev")?;
+        let mut cfg = test_cfg();
+        cfg.force_exdev = true;
+        let ops = start(engine, cfg)?;
+        let (a, swapped, _) = swapped_dir(&t)?;
+        let from = t.join("from");
+        fs::write(&from, b"new")?;
+        fs::remove_file(t.join("old/e"))?;
+        let mut r = req(OpKind::Move, 0, &from, Some(&swapped));
+        r.dest_at = Some(a);
+        let (d, _) = run(&ops, r)?;
+        assert_eq!(os(&d), Some(libc::EXDEV), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read(&from)?, b"new", "{engine:?}");
+    }
+    Ok(())
+}
+
+/// REV2-6: the sweep is off startup's path, and still does its work.
+#[test]
+fn the_detached_sweep_moves_the_ledger_aside_and_sweeps() -> R {
+    let t = TestDir::new("op-detach")?;
+    let ledger = t.join("ops-pending");
+    let dest = t.join("dest");
+    let tmp = t.join(".gungnir-00000000000000ab-0.tmp");
+    fs::write(&tmp, b"x")?;
+    fs::write(&ledger, ledger_start(0xab, &b(&dest)))?;
+    detach_temp_sweep(&ledger)?;
+    assert!(!ledger.exists());
+    let aside = ledger.with_extension("sweep");
+    let t0 = std::time::Instant::now();
+    while (tmp.exists() || aside.exists()) && t0.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!tmp.exists() && !aside.exists());
+    Ok(())
+}
+
+/// REV2-6: a run's op ids cannot collide with the last run's temp names.
+#[test]
+fn op_ids_differ_between_runs() {
+    assert_ne!(first_op_id(), first_op_id());
+}
+
+/// REV4: abandoned ops' entries live in their own file, and the next start sweeps them.
+#[test]
+fn the_kept_file_is_swept_at_the_next_start() -> R {
+    let t = TestDir::new("op-kept")?;
+    let ledger = t.join("ops-pending");
+    let tmp = t.join(".gungnir-00000000000000cd-0.tmp");
+    fs::write(&tmp, b"x")?;
+    fs::write(
+        ledger.with_extension("kept"),
+        ledger_start(0xcd, &b(&t.join("dest"))),
+    )?;
+    detach_temp_sweep(&ledger)?;
+    assert!(!ledger.with_extension("kept").exists());
+    let t0 = std::time::Instant::now();
+    while tmp.exists() && t0.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!tmp.exists());
+    Ok(())
+}
+
+/// REV4: an EXDEV move of a symlink copies the link it examined.
+#[test]
+fn a_symlink_moves_across_devices_intact() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-link-mv")?;
+        let mut cfg = test_cfg();
+        cfg.force_exdev = true;
+        let ops = start(engine, cfg)?;
+        let (src, dest) = (t.join("l"), t.join("m"));
+        std::os::unix::fs::symlink("target", &src)?;
+        let (d, _) = run(&ops, req(OpKind::Move, 0, &src, Some(&dest)))?;
+        assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
+        assert_eq!(fs::read_link(&dest)?, Path::new("target"), "{engine:?}");
+        assert!(fs::symlink_metadata(&src).is_err(), "{engine:?}");
+    }
+    Ok(())
+}
+
+/// A long flush is no stall: the limit that would stop a copy leaves an fsync alone.
+#[test]
+fn a_slow_fsync_is_not_a_stall() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-flush")?;
+        let mut cfg = test_cfg();
+        cfg.stall = Duration::from_millis(100);
+        cfg.grace = Duration::from_millis(50);
+        cfg.fsync_delay = Duration::from_millis(600);
+        let ops = start(engine, cfg)?;
+        let f = t.join("f");
+        fs::write(&f, b"x")?;
+        let (d, _) = run(&ops, req(OpKind::Fsync, 0, &f, None))?;
+        assert!(d.result.is_ok(), "{engine:?}: {:?}", d.result);
     }
     Ok(())
 }

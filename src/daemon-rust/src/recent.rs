@@ -8,7 +8,7 @@
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::Path,
     thread,
@@ -28,23 +28,25 @@ pub struct Entry {
     range: (usize, usize),
 }
 
+/// The value of attribute `name`, walking the attributes in order: a value is opaque,
+/// whatever it says, and anything that is not `name=<quoted value>` ends the walk.
 fn attr<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut i = 0;
-    while let Some(off) = find(&tag[i..], name) {
-        let at = i + off;
-        let boundary = at == 0 || tag[at - 1].is_ascii_whitespace();
-        let rest = &tag[at + name.len()..];
-        if boundary && rest.first() == Some(&b'=') {
-            let quote = *rest.get(1)?;
-            if quote == b'"' || quote == b'\'' {
-                let body = &rest[2..];
-                let end = body.iter().position(|&b| b == quote)?;
-                return Some(&body[..end]);
-            }
+    let mut rest = tag;
+    loop {
+        rest = rest.trim_ascii_start();
+        let eq = rest.iter().position(|&b| b == b'=')?;
+        let key = rest[..eq].trim_ascii_end();
+        rest = rest[eq + 1..].trim_ascii_start();
+        let (&quote, body) = rest.split_first()?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
         }
-        i = at + name.len();
+        let end = body.iter().position(|&b| b == quote)?;
+        if key == name {
+            return Some(&body[..end]);
+        }
+        rest = &body[end + 1..];
     }
-    None
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -90,29 +92,60 @@ fn tag_end(text: &[u8]) -> Option<usize> {
     None
 }
 
+/// The next real tag at or after `from`: `(start, end past its >)`. Comments, CDATA and
+/// processing instructions are not markup, whatever they contain.
+fn next_tag(text: &[u8], mut from: usize) -> Option<(usize, usize)> {
+    loop {
+        let at = from + find(text.get(from..)?, b"<")?;
+        let rest = &text[at..];
+        let close: Option<&[u8]> = if rest.starts_with(b"<!--") {
+            Some(b"-->")
+        } else if rest.starts_with(b"<![CDATA[") {
+            Some(b"]]>")
+        } else if rest.starts_with(b"<?") {
+            Some(b"?>")
+        } else {
+            None
+        };
+        match close {
+            Some(c) => from = at + find(rest, c)? + c.len(),
+            None => return Some((at, at + tag_end(rest)? + 1)),
+        }
+    }
+}
+
+/// Whether the tag in `tag` (from its `<`) is `name`, not merely starting with it.
+fn tag_is(tag: &[u8], name: &[u8]) -> bool {
+    tag.strip_prefix(name)
+        .and_then(|r| r.first())
+        .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/')
+}
+
 /// The bookmarks of `text`, in file order. Anything that is not a well-formed
 /// `<bookmark ...>` is skipped, never an error.
 #[must_use]
 pub fn parse(text: &[u8]) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut i = 0;
-    while let Some(off) = find(&text[i..], b"<bookmark") {
-        let start = i + off;
-        let after = text.get(start + 9).copied();
-        if !after.is_some_and(|b| b.is_ascii_whitespace()) {
-            i = start + 9;
+    while let Some((start, close)) = next_tag(text, i) {
+        i = close;
+        if !tag_is(&text[start..close], b"<bookmark") {
             continue;
         }
-        let Some(tag_len) = tag_end(&text[start..]) else {
-            break;
-        };
-        let tag = &text[start + 9..start + tag_len];
+        let tag = &text[start + 9..close - 1];
         let end = if tag.last() == Some(&b'/') {
-            start + tag_len + 1
-        } else if let Some(c) = find(&text[start..], b"</bookmark>") {
-            start + c + b"</bookmark>".len()
+            close
         } else {
-            break;
+            let mut from = close;
+            loop {
+                let Some((a, b)) = next_tag(text, from) else {
+                    return out;
+                };
+                if tag_is(&text[a..b], b"</bookmark") {
+                    break b;
+                }
+                from = b;
+            }
         };
         if let Some(href) = attr(tag, b"href") {
             out.push(Entry {
@@ -152,13 +185,24 @@ pub fn file_path(uri: &[u8]) -> Option<Vec<u8>> {
 /// # Errors
 /// It is too big or unreadable; a missing list is an empty one.
 pub fn load(path: &Path) -> io::Result<Vec<u8>> {
-    match fs::metadata(path) {
+    let f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-        Ok(m) if m.len() > XBEL_MAX => return Err(io::Error::from_raw_os_error(libc::EFBIG)),
-        Ok(_) => {}
+        r => r?,
+    };
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    fs::read(path)
+    // The cap counts bytes read: metadata says nothing about what a read returns.
+    let mut out = Vec::new();
+    f.take(XBEL_MAX + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > XBEL_MAX {
+        return Err(io::Error::from_raw_os_error(libc::EFBIG));
+    }
+    Ok(out)
 }
 
 /// Why [`forget`] failed.
@@ -188,6 +232,8 @@ pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
         .create(true)
         .truncate(false)
         .mode(0o600)
+        // A FIFO here must not hold the request; the lock is ours, never a link.
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(&lock_path)?;
     let t0 = Instant::now();
     loop {
@@ -317,6 +363,51 @@ mod tests {
         assert_eq!(left[0].uri, b"file:///b");
         let _ = fs::remove_file(&p);
         let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    /// An attribute's value is not attributes: `href` in a title selects nothing.
+    #[test]
+    fn a_value_cannot_pose_as_an_attribute() {
+        let text = br#"<xbel><bookmark title="x href='file:///bait'" href="file:///real"/></xbel>"#;
+        let e = parse(text);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(e[0].uri, b"file:///real");
+    }
+
+    /// A bookmark inside a comment is no bookmark, and cannot pair with a real close tag.
+    #[test]
+    fn comments_hide_bookmarks() {
+        let text = br#"<xbel>
+<!-- <bookmark href="file:///bait"> -->
+<bookmark href="file:///kept"></bookmark>
+</xbel>
+"#;
+        let e = parse(text);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(e[0].uri, b"file:///kept");
+        let p = tmp("comment");
+        fs::write(&p, text).unwrap();
+        assert!(matches!(
+            forget(&p, b"file:///bait"),
+            Err(ForgetError::NotFound)
+        ));
+        assert_eq!(fs::read(&p).unwrap(), text);
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    /// A FIFO or device in the list's place is refused, not read for ever.
+    #[test]
+    fn only_a_regular_file_is_read() {
+        let p = tmp("dev");
+        std::os::unix::fs::symlink("/dev/zero", &p).unwrap();
+        assert!(load(&p).is_err());
+        let _ = fs::remove_file(&p);
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(load(&p).is_err());
+        let _ = fs::remove_file(&p);
     }
 
     /// A temp file left by a crash under the same pid must not block every later forget.

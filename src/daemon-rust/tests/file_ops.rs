@@ -118,6 +118,8 @@ fn req(kind: OpKind, flags: u32, src: &Path, dest: Option<&Path>) -> OpRequest {
         timeout_ms: 0,
         src: b(src),
         dest: dest.map(b).unwrap_or_default(),
+        src_at: None,
+        dest_at: None,
     }
 }
 
