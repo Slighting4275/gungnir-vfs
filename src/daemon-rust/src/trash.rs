@@ -1601,6 +1601,14 @@ mod tests {
         fs::create_dir_all(t.0.join("a/b")).unwrap();
         symlink("../b", t.0.join("a/b/side")).unwrap();
         assert!(restore_parent(&d, t.0.join("a/b/side/f").as_os_str().as_bytes()).is_some());
+        // Bottom up, one at a time: a recursive remove holds a descriptor per level, and
+        // under a limit of 1024 this tree would outlive the test and block the next
+        // checkout in CI, which cannot remove it either.
+        let mut level = p;
+        while level != t.0 {
+            fs::remove_dir(&level).unwrap();
+            level.pop();
+        }
     }
 
     /// Odd spellings have no meaning: they would not compare equal to what GFile sends.
