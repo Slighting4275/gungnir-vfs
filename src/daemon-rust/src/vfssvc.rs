@@ -736,6 +736,15 @@ impl Svc {
         self.delete_item(d, &entry, ctx)
     }
 
+    fn clear_recent(&self) -> Result<(), Failure> {
+        let path = self.xbel.as_ref().ok_or(Failure::st(ST_IO_ERROR))?;
+        recent::clear(path).map_err(|e| match e {
+            recent::ForgetError::Busy => Failure::st(ST_BUSY),
+            recent::ForgetError::NotFound => Failure::st(ST_NOT_FOUND),
+            recent::ForgetError::Io(e) => io_failure(&e),
+        })
+    }
+
     fn restore(&self, name: &[u8], dest: &[u8], ctx: &Ctx) -> Result<(), Failure> {
         let found = self.dirs();
         let (d, entry) = trash::resolve(&found.dirs, name).ok_or_else(|| self.unresolved(name))?;
@@ -1174,7 +1183,14 @@ impl Session for VfsSession {
                     outcome(svc.restore(&name, &dest, ctx))
                 });
             }
-            MSG_TRASH_EMPTY => self.spawn(port, msg.seq, Svc::empty),
+            MSG_TRASH_EMPTY => {
+                let p = msg.payload();
+                if p.first() == Some(&SCHEME_RECENT) {
+                    self.spawn(port, msg.seq, move |svc, _| outcome(svc.clear_recent()));
+                } else {
+                    self.spawn(port, msg.seq, Svc::empty);
+                }
+            }
             MSG_VFS_STAT => {
                 let mut p = msg.payload();
                 let Some((&scheme, rest)) = p.split_first() else {

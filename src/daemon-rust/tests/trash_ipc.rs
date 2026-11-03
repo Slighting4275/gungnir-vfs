@@ -720,6 +720,29 @@ fn recent_lists_and_forgets_without_touching_the_file() -> R {
     Ok(())
 }
 
+#[test]
+fn recent_clears_over_the_wire() -> R {
+    let d = Dir::new("recent-clear")?;
+    fs::create_dir_all(d.join("data"))?;
+    let f = d.join("doc.txt");
+    fs::write(&f, b"keep me")?;
+    let xbel = format!(
+        "<?xml version=\"1.0\"?>\n<xbel version=\"1.0\">\n\
+         <bookmark href=\"file://{}\" added=\"x\"/>\n\
+         <bookmark href=\"https://example.invalid/\" added=\"x\"/>\n</xbel>\n",
+        f.display()
+    );
+    fs::write(d.join("data/recently-used.xbel"), &xbel)?;
+    let mut dm = start(&d, false, &[])?;
+    let rows = list(&mut dm.c, SCHEME_RECENT)?;
+    assert_eq!(rows.len(), 2);
+    let (st, _) = call(&mut dm.c, MSG_TRASH_EMPTY, &[SCHEME_RECENT])?;
+    assert_eq!(st, ST_OK);
+    assert!(list(&mut dm.c, SCHEME_RECENT)?.is_empty());
+    assert_eq!(fs::read(&f)?, b"keep me");
+    Ok(())
+}
+
 /// Bad requests are answered, never a panic.
 #[test]
 fn malformed_requests_are_refused() -> R {

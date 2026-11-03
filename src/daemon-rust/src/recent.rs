@@ -220,11 +220,7 @@ impl From<io::Error> for ForgetError {
     }
 }
 
-/// Remove every bookmark with `uri`. The target file itself is not touched.
-///
-/// # Errors
-/// See [`ForgetError`].
-pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
+fn with_lock<R>(path: &Path, f: impl FnOnce() -> Result<R, ForgetError>) -> Result<R, ForgetError> {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
     let lock = fs::OpenOptions::new()
@@ -246,18 +242,10 @@ pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let text = load(path)?;
-    let hits: Vec<_> = parse(&text).into_iter().filter(|e| e.uri == uri).collect();
-    if hits.is_empty() {
-        return Err(ForgetError::NotFound);
-    }
-    let mut out = Vec::with_capacity(text.len());
-    let mut at = 0;
-    for e in &hits {
-        out.extend_from_slice(&text[at..e.range.0]);
-        at = e.range.1;
-    }
-    out.extend_from_slice(&text[at..]);
+    f()
+}
+
+fn write_atomic(path: &Path, out: &[u8]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".gungnir-{}", std::process::id()));
     // Under the lock, so anything here is what a crash left.
@@ -268,14 +256,61 @@ pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(&out)?;
+        f.write_all(out)?;
         f.sync_all()?;
         fs::rename(&tmp, path)
     })();
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    Ok(r?)
+    r
+}
+
+/// Remove every bookmark with `uri`. The target file itself is not touched.
+///
+/// # Errors
+/// See [`ForgetError`].
+pub fn forget(path: &Path, uri: &[u8]) -> Result<(), ForgetError> {
+    with_lock(path, || {
+        let text = load(path)?;
+        let hits: Vec<_> = parse(&text).into_iter().filter(|e| e.uri == uri).collect();
+        if hits.is_empty() {
+            return Err(ForgetError::NotFound);
+        }
+        let mut out = Vec::with_capacity(text.len());
+        let mut at = 0;
+        for e in &hits {
+            out.extend_from_slice(&text[at..e.range.0]);
+            at = e.range.1;
+        }
+        out.extend_from_slice(&text[at..]);
+        Ok(write_atomic(path, &out)?)
+    })
+}
+
+/// Clear every bookmark from the list. The target files are not touched.
+///
+/// # Errors
+/// See [`ForgetError`].
+pub fn clear(path: &Path) -> Result<(), ForgetError> {
+    with_lock(path, || {
+        let text = load(path)?;
+        if text.is_empty() {
+            return Ok(());
+        }
+        let hits = parse(&text);
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(text.len());
+        let mut at = 0;
+        for e in &hits {
+            out.extend_from_slice(&text[at..e.range.0]);
+            at = e.range.1;
+        }
+        out.extend_from_slice(&text[at..]);
+        Ok(write_atomic(path, &out)?)
+    })
 }
 
 #[cfg(test)]
@@ -340,6 +375,21 @@ mod tests {
             forget(&p, b"file:///none"),
             Err(ForgetError::NotFound)
         ));
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    #[test]
+    fn clearing_removes_all_bookmarks() {
+        let p = tmp("clear");
+        fs::write(&p, XBEL).unwrap();
+        clear(&p).unwrap();
+        let left = fs::read(&p).unwrap();
+        assert!(parse(&left).is_empty());
+        assert!(find(&left, b"<xbel version").is_some());
+        assert!(find(&left, b"</xbel>").is_some());
+        // Clearing an already empty file succeeds idempotently
+        clear(&p).unwrap();
         let _ = fs::remove_file(&p);
         let _ = fs::remove_file(p.with_extension("xbel.lock"));
     }
