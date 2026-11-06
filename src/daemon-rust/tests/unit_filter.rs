@@ -677,6 +677,93 @@ fn the_unit_allows_every_call_of_the_no_replace_fallback() {
     );
 }
 
+/// RC-HC4-F01 / C-21.13 (D-043, D-073): the kernel and namespace protections are all set,
+/// and the rest of the static C-21 policy is as ruled. Static only: whether systemd
+/// enforces them is the live C-21.17/C-21.18 check.
+#[test]
+fn the_unit_keeps_the_c21_static_policy() {
+    let unit = unit_text();
+    let last = |k: &str| values(&unit, k).pop();
+    let is = |k: &str, v: &str| assert_eq!(last(k).as_deref(), Some(v), "{k}=");
+    let absent_or = |k: &str, v: &str| {
+        let got = last(k);
+        assert!(got.is_none() || got.as_deref() == Some(v), "{k}={got:?}");
+    };
+    // C-21.13
+    for k in [
+        "RestrictNamespaces",
+        "RestrictRealtime",
+        "RestrictSUIDSGID",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectKernelLogs",
+        "ProtectControlGroups",
+        "ProtectClock",
+        "ProtectHostname",
+    ] {
+        is(k, "yes");
+    }
+    // C-21.3 to C-21.12, C-21.14 to C-21.16: the file manager keeps its reach (D-043).
+    is("RestrictAddressFamilies", "AF_UNIX");
+    absent_or("ProtectHome", "no");
+    absent_or("PrivateTmp", "no");
+    is("ProtectSystem", "full");
+    for k in [
+        "ReadWritePaths",
+        "ReadOnlyPaths",
+        "InaccessiblePaths",
+        "TemporaryFileSystem",
+        "BindPaths",
+        "IPAddressDeny",
+    ] {
+        assert!(values(&unit, k).is_empty(), "{k}= is set");
+    }
+    is("NoNewPrivileges", "yes");
+    is("UMask", "0077");
+    absent_or("PrivateDevices", "no");
+    absent_or("MemoryDenyWriteExecute", "no");
+    is("SystemCallArchitectures", "native");
+    is("LockPersonality", "yes");
+    is("SystemCallErrorNumber", "EPERM");
+    is("LimitCORE", "0");
+    is("Type", "exec");
+    is(
+        "ExecStart",
+        "/usr/bin/gungnird --idle-timeout 300 --seccomp",
+    );
+    is("Restart", "on-failure");
+    // C-21.1/C-21.2: by name, no groups, and the D-073 names (plus linkat, MGR-GAP-F3).
+    let allow = unit_allow_list(&unit);
+    for call in [
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "clone3",
+        "symlinkat",
+        "newfstatat",
+        "memfd_create",
+        "prctl",
+        "seccomp",
+        "bind",
+        "listen",
+        "connect",
+        "rseq",
+        "statfs",
+        "flock",
+        "eventfd2",
+        "signalfd4",
+        "accept4",
+        "getsockopt",
+        "setsockopt",
+        "linkat",
+    ] {
+        assert!(
+            allow.iter().any(|n| n == call),
+            "SystemCallFilter= lacks {call}"
+        );
+    }
+}
+
 /// MGR-GAP-F3: under the unit's filter, a no-replace move on a filesystem without
 /// `RENAME_NOREPLACE` goes through `linkat` and works: same file at the destination, the
 /// source name gone, metadata moved, no temporary file; an existing destination is still
