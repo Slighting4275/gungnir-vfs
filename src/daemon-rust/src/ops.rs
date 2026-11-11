@@ -1136,7 +1136,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .map(|i| crate::hex_byte(s.as_bytes().get(i..i + 2)?))
         .collect()
 }
 

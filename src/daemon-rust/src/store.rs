@@ -85,7 +85,8 @@ fn euid() -> u32 {
 }
 
 /// Create the database directory (0700) if missing and refuse one that is not ours or
-/// is writable by others.
+/// is writable by others. One of ours that others may read or enter (an older install,
+/// another umask) is tightened to 0700 (SEC F-005).
 fn prepare_dir(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::DirBuilder::new()
@@ -95,6 +96,45 @@ fn prepare_dir(path: &Path) -> Result<()> {
         let md = fs::symlink_metadata(dir)?;
         if !md.is_dir() || md.uid() != euid() || md.mode() & 0o022 != 0 {
             return Err(Error::InsecureDbDir(dir.to_path_buf()));
+        }
+        if md.mode() & 0o077 != 0 {
+            // Through the directory itself (fchmod), never the path: a symlink swapped
+            // in since the check cannot redirect the chmod.
+            let d = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(dir)?;
+            let dm = d.metadata()?;
+            if !dm.is_dir() || dm.uid() != euid() {
+                return Err(Error::InsecureDbDir(dir.to_path_buf()));
+            }
+            d.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Tighten an existing `-wal`/`-shm` of ours to 0600: SQLite gives new ones the
+/// database's mode, but leaves the mode of existing ones alone (SEC F-005).
+fn tighten_sidecars(path: &Path) -> Result<()> {
+    for sfx in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(sfx);
+        let f = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&p)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let md = f.metadata()?;
+        if !md.is_file() || md.uid() != euid() {
+            return Err(Error::InsecureDbDir(PathBuf::from(p)));
+        }
+        if md.mode() & 0o077 != 0 {
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
     }
     Ok(())
@@ -215,7 +255,7 @@ fn prepare_files(path: &Path) -> Result<()> {
     if md.mode() & 0o077 != 0 {
         f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    Ok(())
+    tighten_sidecars(path)
 }
 
 /// Open (or create) the metadata DB, apply the PRAGMAs and schema.
@@ -226,6 +266,7 @@ fn prepare_files(path: &Path) -> Result<()> {
 pub fn open_db(path: &Path, busy_timeout: Duration) -> Result<Connection> {
     prepare_files(path)?;
     let conn = Connection::open(path)?;
+    harden(&conn)?;
     // Setup (switching to WAL, creating the schema) runs once, before anything is served:
     // it may wait out another opener (a second daemon on the same file starting at the
     // same moment, a backup), so it gets SQLite's usual patience. The short serving
@@ -245,6 +286,25 @@ pub fn open_db(path: &Path, busy_timeout: Duration) -> Result<Connection> {
     }
     conn.busy_timeout(busy_timeout)?;
     Ok(conn)
+}
+
+/// The file is only ours by convention: anything running as the user can add schema
+/// code to it. The daemon runs none it did not write (SEC R-008): no triggers, no views
+/// (its schema has neither), schema functions untrusted, and SQLite's defensive mode
+/// (no writable_schema, no direct shadow-table writes).
+fn harden(conn: &Connection) -> Result<()> {
+    use rusqlite::config::DbConfig;
+    for (opt, on) in [
+        (DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
+        (DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false),
+        (DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false),
+        (DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
+    ] {
+        if conn.set_db_config(opt, on)? != on {
+            return Err(Error::Protocol("SQLite refused a hardening option"));
+        }
+    }
+    Ok(())
 }
 
 fn setup(conn: &Connection) -> Result<()> {
@@ -766,12 +826,15 @@ impl Store {
             // many: a hint left at the old path would let a later delete there drop the
             // moved file's metadata). CAST keeps the result a BLOB: `||` yields TEXT,
             // which sorts after every BLOB and would fall out of these byte ranges.
+            // SQLite's substr offset (1-based): the first byte after `src/`.
+            let after = i64::try_from(src.len() + 1)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             let n = tx
                 .prepare_cached(
                     "UPDATE path_hint SET path = CAST(?3 || substr(path, ?4) AS BLOB), \
                      updated = ?5 WHERE path >= ?1 AND path < ?2",
                 )?
-                .execute(params![lo, hi, dest, src.len() + 1, now])?;
+                .execute(params![lo, hi, dest, after, now])?;
             rewritten = rewritten.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
             Ok((rewritten, forgotten))
         })

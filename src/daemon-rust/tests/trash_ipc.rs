@@ -13,7 +13,7 @@ use std::{
 };
 
 use gungnird::{
-    md::{Client, MSG_MD_REPLY, ST_BUSY, ST_NOT_FOUND, ST_OK},
+    md::{Client, MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_NOT_FOUND, ST_OK},
     ops,
     vfssvc::{
         MSG_TRASH_EMPTY, MSG_VFS_DELETE, MSG_VFS_LIST, MSG_VFS_RESTORE, SCHEME_RECENT,
@@ -881,5 +881,43 @@ fn request_threads_are_bounded() -> R {
     }
     assert!(ok >= 1, "nothing answered");
     assert!(busy >= 1, "no request was refused: ok {ok}");
+    Ok(())
+}
+
+/// SEC H-007: a restore destination with `.` or `..` components (or an empty one) is
+/// refused, the item left in the trash. GIO only ever sends canonical paths, and the
+/// lexical "lands on the trash's volume" test that picks the volume's checks means
+/// nothing for a path that climbs back with `..`.
+#[test]
+fn a_restore_destination_with_dot_components_is_refused() -> R {
+    for no_uring in engines() {
+        let d = Dir::new("dotdest")?;
+        let t = trash_dir(&d)?;
+        trashed(&t, "item", &d.join("orig"))?;
+        let mut dm = start(&d, no_uring, &[])?;
+        let base = d.0.as_os_str().as_bytes();
+        for bad in [
+            [base, b"/sub/../landed"].concat(),
+            [base, b"/./landed"].concat(),
+            [base, b"//landed"].concat(),
+            [base, b"/landed/.."].concat(),
+            [base, b"/landed/."].concat(),
+        ] {
+            let st = restore(&mut dm.c, b"h-item", &bad)?;
+            assert_eq!(
+                st,
+                ST_BAD_REQUEST,
+                "{}: {}",
+                no_uring,
+                String::from_utf8_lossy(&bad)
+            );
+            assert!(t.join("files/item").exists() && t.join("info/item.trashinfo").exists());
+        }
+        assert!(!d.join("landed").exists());
+        // A canonical destination still restores.
+        let good = [base, b"/landed"].concat();
+        assert_eq!(restore(&mut dm.c, b"h-item", &good)?, ST_OK);
+        assert_eq!(fs::read(d.join("landed"))?, b"payload");
+    }
     Ok(())
 }

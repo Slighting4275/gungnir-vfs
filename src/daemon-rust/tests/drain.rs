@@ -438,6 +438,14 @@ fn temp_files_of_unfinished_copies_are_swept_at_start() -> R {
     );
     fs::write(d.join("data/ops-pending"), ledger)?;
     let dm = Daemon::start(&d, true, &[])?;
+    // The sweep runs in the background (a hung mount must not hold up the start): wait
+    // for its report, not just for the socket.
+    let t0 = std::time::Instant::now();
+    while !dm.text().contains("removed 2 temp file(s)")
+        && t0.elapsed() < std::time::Duration::from_secs(10)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     for p in &ours {
         assert!(!p.exists(), "{} left\n{}", p.display(), dm.text());
     }

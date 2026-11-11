@@ -109,9 +109,7 @@ fn unhex(s: &[u8]) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
-    s.chunks(2)
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
-        .collect()
+    s.chunks(2).map(crate::hex_byte).collect()
 }
 
 impl TrashDir {
@@ -462,7 +460,7 @@ fn percent_decode(s: &[u8]) -> Option<Vec<u8>> {
     while i < s.len() {
         if s[i] == b'%' {
             let h = s.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?);
+            out.push(crate::hex_byte(h)?);
             i += 3;
         } else {
             out.push(s[i]);

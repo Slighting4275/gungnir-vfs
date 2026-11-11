@@ -293,38 +293,12 @@ fn serve_daemon(
         }
     }
     eprintln!("gungnird: file ops engine: {engine:?} ({why})");
-    // Temp files of copies and moves a previous run left unfinished (killed, or a stuck
-    // op abandoned at a drain): removed in the background, since they may sit on a mount
-    // that is still hung (BC-A2-F03b, BC-HC-F06).
-    let ledger_path = db_path.with_file_name("ops-pending");
-    if let Err(e) = ops::detach_temp_sweep(&ledger_path) {
-        eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display());
-    }
     let ops = Arc::new(Ops::start(
         ops_cfg,
         engine,
         Arc::new(MonitorGate::new(Arc::clone(&monitor))),
         Arc::new(DbMeta::new(Arc::clone(&resolver), db.clone())),
     )?);
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(&ledger_path)
-    {
-        Ok(f) => ops.set_temp_ledger(f),
-        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
-    }
-    let kept_path = ledger_path.with_extension("kept");
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(&kept_path)
-    {
-        Ok(f) => ops.set_kept_ledger(f),
-        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", kept_path.display()),
-    }
     if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
         // Every first worker has its ring before the filter goes in; a worker on plain
         // syscalls under a uring engine would be a silent fallback: refuse to start.
@@ -355,6 +329,7 @@ fn serve_daemon(
         env::var_os("XDG_DATA_HOME").as_deref(),
         env::var_os("HOME").as_deref(),
     );
+    let ops_for_ledger = Arc::clone(&ops);
     let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
     let handler: Arc<dyn ipc::Handler> = Arc::new(vfssvc::VfsHandler::new(handler, vfs));
 
@@ -365,6 +340,35 @@ fn serve_daemon(
     }
     // From here the store is in use: an error no longer removes it.
     *fresh = FreshStore::default();
+
+    // Temp files of copies and moves a previous run left unfinished (killed, or a stuck
+    // op abandoned at a drain): removed in the background, since they may sit on a mount
+    // that is still hung (BC-A2-F03b, BC-HC-F06). Only now, past the last refusal (the
+    // ring check, the sandbox): a refused start must leave the store as it found it,
+    // its ledger included (BC-CM-D01). No op can start before serving does.
+    let ledger_path = db_path.with_file_name("ops-pending");
+    if let Err(e) = ops::detach_temp_sweep(&ledger_path) {
+        eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display());
+    }
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&ledger_path)
+    {
+        Ok(f) => ops_for_ledger.set_temp_ledger(f),
+        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
+    }
+    let kept_path = ledger_path.with_extension("kept");
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&kept_path)
+    {
+        Ok(f) => ops_for_ledger.set_kept_ledger(f),
+        Err(e) => eprintln!("gungnird: temp ledger {}: {e}", kept_path.display()),
+    }
 
     // 6. Serve with signal handling and idle shutdown multiplexing (milestone 11)
     let cfg = ipc::Config {

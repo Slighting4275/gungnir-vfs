@@ -763,7 +763,9 @@ impl Svc {
         } else {
             dest.to_vec()
         };
-        if to.first() != Some(&b'/') {
+        // One spelling per place (SEC H-007): `inside` above is a lexical test, and a
+        // `..` could climb back onto the volume past it and its checks.
+        if !canonical_abs(&to) {
             return Err(Failure::st(ST_BAD_REQUEST));
         }
         // The check is the descriptor: what was checked is where the file lands.
@@ -861,6 +863,18 @@ impl Svc {
     }
 }
 
+/// An absolute path in its one canonical spelling: no empty, `.` or `..` component, no
+/// trailing slash, not `/` itself. What GIO sends (`g_file_get_path`) always is.
+fn canonical_abs(p: &[u8]) -> bool {
+    let Some(rest) = p.strip_prefix(b"/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split(|&b| b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..")
+}
+
 /// Nothing in a restore is a mount in an item to unmount: say what it is.
 fn restore_failure(f: Failure) -> Failure {
     if f.status == ST_MOUNT_INSIDE {
@@ -921,9 +935,7 @@ fn unhex(s: &[u8]) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
-    s.chunks(2)
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
-        .collect()
+    s.chunks(2).map(crate::hex_byte).collect()
 }
 
 fn put16(out: &mut Vec<u8>, s: &[u8]) {

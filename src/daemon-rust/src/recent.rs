@@ -170,7 +170,7 @@ pub fn file_path(uri: &[u8]) -> Option<Vec<u8>> {
     while i < rest.len() {
         if rest[i] == b'%' {
             let h = rest.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?);
+            out.push(crate::hex_byte(h)?);
             i += 3;
         } else {
             out.push(rest[i]);
@@ -317,6 +317,61 @@ pub fn clear(path: &Path) -> Result<(), ForgetError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// forget/clear slice the file with each entry's range: every range must lie in the
+    /// text, and they must come in order without overlapping, whatever the input.
+    #[test]
+    fn ranges_stay_in_bounds_and_in_order_on_random_input() {
+        const PARTS: &[&[u8]] = &[
+            b"<bookmark",
+            b"</bookmark>",
+            b"<bookmark href=\"f\"/>",
+            b" href=",
+            b"\"",
+            b"'",
+            b">",
+            b"/>",
+            b"<",
+            b"<!--",
+            b"-->",
+            b"<![CDATA[",
+            b"]]>",
+            b"<?",
+            b"?>",
+            b"&amp;",
+            b"=",
+            b" ",
+            b"\n",
+            b"\0",
+        ];
+        let mut x: u64 = 0x5eed_00aa_dead_beef;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let mut text = Vec::new();
+            for _ in 0..(next() % 24 + 1) {
+                if next() % 4 == 0 {
+                    text.push(next() as u8);
+                } else {
+                    text.extend_from_slice(PARTS[(next() % PARTS.len() as u64) as usize]);
+                }
+            }
+            let mut at = 0;
+            for e in parse(&text) {
+                let (a, b) = e.range;
+                assert!(
+                    at <= a && a < b && b <= text.len(),
+                    "{a}..{b} after {at} in {}",
+                    text.len()
+                );
+                at = b;
+            }
+        }
+    }
 
     const XBEL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <xbel version="1.0">

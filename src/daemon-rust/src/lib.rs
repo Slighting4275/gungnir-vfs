@@ -16,6 +16,20 @@ pub mod vfssvc;
 
 pub use store::open_db;
 
+/// One byte from exactly two hex digits (either case), as `%XX` escapes and the
+/// daemon's hex names spell it. Not `u8::from_str_radix`, which also takes a sign:
+/// `+f` decoded to 0x0f, so one byte had two spellings where GLib rejects the escape.
+#[must_use]
+pub(crate) fn hex_byte(pair: &[u8]) -> Option<u8> {
+    let [hi, lo] = pair else { return None };
+    let d = |b: u8| {
+        char::from(b)
+            .to_digit(16)
+            .and_then(|v| u8::try_from(v).ok())
+    };
+    Some((d(*hi)? << 4) | d(*lo)?)
+}
+
 /// Scratch directories for tests, under `<repo>/.build/tmp` (AGENTS.md §3: never /tmp).
 #[cfg(test)]
 pub(crate) mod testdir {

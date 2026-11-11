@@ -1156,3 +1156,82 @@ fn the_sandboxed_daemon_serves_metadata_and_file_ops() -> daemon::R {
     }
     Ok(())
 }
+
+/// SEC R-013: once sandboxed, prlimit64 and sched_setaffinity reach only the daemon
+/// itself (pid 0 or its own pid, low 32 bits as the kernel reads them): another process
+/// of the same user can be neither read nor changed (EPERM). The calls on the parent
+/// are made harmless anyway (no new limit; an empty CPU mask the kernel refuses).
+/// The test process's pid, read before the fork: inside the sandbox getppid is refused.
+static PARENT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[test]
+fn sandboxed_prlimit_and_affinity_reach_only_the_daemon_itself() {
+    fn body() -> i32 {
+        let parent = PARENT.load(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: getpid takes no arguments (allowed in the sandbox).
+        let me = unsafe { libc::getpid() };
+        if parent <= 0 || parent == me {
+            return 1;
+        }
+        let mut old = [0u64; 2];
+        for (i, pid) in [0, me].into_iter().enumerate() {
+            // SAFETY: a read of our own limit into `old` (no new limit).
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_prlimit64,
+                    pid,
+                    libc::RLIMIT_NOFILE,
+                    std::ptr::null::<u64>(),
+                    old.as_mut_ptr(),
+                )
+            };
+            if r != 0 {
+                return 10 + i as i32;
+            }
+        }
+        // SAFETY: as above, on the parent: refused before the kernel reads anything.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                parent,
+                libc::RLIMIT_NOFILE,
+                std::ptr::null::<u64>(),
+                old.as_mut_ptr(),
+            )
+        };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 20;
+        }
+        // Our own affinity, set to what it is: allowed.
+        let mut set = [0u64; 16];
+        // SAFETY: the kernel writes at most size_of_val(&set) bytes.
+        let n = unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, 128, set.as_mut_ptr()) };
+        if n <= 0 {
+            return 30;
+        }
+        for (i, pid) in [0, me].into_iter().enumerate() {
+            // SAFETY: reads `n` bytes of `set`.
+            let r = unsafe { libc::syscall(libc::SYS_sched_setaffinity, pid, n, set.as_ptr()) };
+            if r != 0 {
+                return 31 + i as i32;
+            }
+        }
+        // The parent's: refused by the filter (EPERM), never the kernel's EINVAL for the
+        // empty mask.
+        let empty = [0u64; 16];
+        // SAFETY: reads 128 bytes of `empty`.
+        let r = unsafe { libc::syscall(libc::SYS_sched_setaffinity, parent, 128, empty.as_ptr()) };
+        if errno_of(r) != Some(libc::EPERM) {
+            return 40;
+        }
+        0
+    }
+    // SAFETY: getpid takes no arguments.
+    PARENT.store(
+        unsafe { libc::getpid() },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    for mode in [SeccompMode::Filter, SeccompMode::Strict] {
+        assert_eq!(in_sandboxed_child(mode, body), 0, "{mode}");
+    }
+}

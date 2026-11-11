@@ -809,7 +809,7 @@ fn follow_ups_run_even_after_waiting_past_max_age() -> Result<()> {
         store,
         DbConfig {
             queue: 16,
-            max_age: Duration::from_millis(1),
+            max_age: Duration::from_secs(1), // fresh jobs never age out, even under valgrind
         },
     )?;
     let long_ago = Instant::now() - Duration::from_secs(10);
@@ -905,5 +905,65 @@ fn submit_wait_gets_room_when_the_queue_drains() -> Result<()> {
     });
     assert_eq!(h.submit_wait(mk(), Duration::from_secs(5)), Ok(()));
     let _ = release.join();
+    Ok(())
+}
+
+/// SEC F-005: an existing install with a loose directory (0755) and loose `-wal`/`-shm`
+/// files (0644, from an older version or another umask) is tightened at open, never
+/// left readable by other users.
+#[test]
+fn a_loose_existing_install_is_tightened() -> Result<()> {
+    let t = TestStore::new("loose")?;
+    let first = t.open()?; // keeps the WAL and shm files while it is open
+    let dir = t.path.parent().ok_or(Error::NoHome)?;
+    let side = |sfx: &str| {
+        let mut p = t.path.as_os_str().to_os_string();
+        p.push(sfx);
+        PathBuf::from(p)
+    };
+    assert!(side("-wal").exists() && side("-shm").exists());
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    for sfx in ["-wal", "-shm"] {
+        fs::set_permissions(side(sfx), fs::Permissions::from_mode(0o644))?;
+    }
+    drop(t.open()?);
+    assert_eq!(
+        fs::symlink_metadata(dir)?.mode() & 0o777,
+        0o700,
+        "directory"
+    );
+    for sfx in ["-wal", "-shm"] {
+        assert_eq!(
+            fs::symlink_metadata(side(sfx))?.mode() & 0o777,
+            0o600,
+            "{sfx}"
+        );
+    }
+    drop(first);
+    Ok(())
+}
+
+/// SEC R-008: the database is only ours by convention; anything running as the user can
+/// add a trigger (or view) to it. The daemon never runs schema code it did not write:
+/// a planted trigger on `metadata` does not fire on a normal set.
+#[test]
+fn a_planted_trigger_never_fires() -> Result<()> {
+    let t = TestStore::new("trigger")?;
+    drop(t.open()?);
+    {
+        let raw = rusqlite::Connection::open(&t.path)?;
+        raw.execute_batch(
+            "CREATE TABLE fired (x INTEGER);
+             CREATE TRIGGER planted AFTER INSERT ON metadata BEGIN
+               INSERT INTO fired VALUES (1);
+             END;",
+        )?;
+    }
+    let mut store = t.open()?;
+    store.set_linked(&id(1), "k", &enc(&Value::String("v".into())), None)?;
+    drop(store);
+    let raw = rusqlite::Connection::open(&t.path)?;
+    let fired: i64 = raw.query_row("SELECT count(*) FROM fired", [], |r| r.get(0))?;
+    assert_eq!(fired, 0, "a planted trigger ran inside the daemon");
     Ok(())
 }

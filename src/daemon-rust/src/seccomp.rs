@@ -87,6 +87,9 @@ enum Rule {
     UnixStream,
     /// Allowed when the full 64-bit argument `arg` is 0 (a NULL pointer), else refused.
     ArgZero64 { arg: u32, errno: i32 },
+    /// A pid argument: allowed when its low 32 bits (all the kernel reads of a pid) are 0
+    /// (the caller) or `pid` (this process), else refused (SEC R-013).
+    ArgZeroOrPid { arg: u32, pid: u32, errno: i32 },
 }
 
 /// The ioctl requests the daemon makes, from strace of its test suites (HANDOFF-A2,
@@ -239,7 +242,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_setrlimit as u32,
         libc::SYS_statfs as u32,
         libc::SYS_fstatfs as u32,
-        libc::SYS_sched_setaffinity as u32,
         libc::SYS_sched_getaffinity as u32,
         libc::SYS_restart_syscall as u32,
         libc::SYS_gettid as u32,
@@ -287,7 +289,6 @@ fn rules() -> Vec<(u32, Rule)> {
         libc::SYS_preadv as u32,
         libc::SYS_pwritev as u32,
         libc::SYS_accept4 as u32,
-        libc::SYS_prlimit64 as u32,
         libc::SYS_syncfs as u32,
         libc::SYS_sendmmsg as u32,
         libc::SYS_recvmmsg as u32,
@@ -342,7 +343,21 @@ fn rules() -> Vec<(u32, Rule)> {
     let af_unix = |nr: libc::c_long| (nr as u32, Rule::UnixStream);
     // SAFETY: getpid has no preconditions.
     let own_tgid = unsafe { libc::getpid() } as u32;
+    let own_pid = |nr: libc::c_long| {
+        (
+            nr as u32,
+            Rule::ArgZeroOrPid {
+                arg: 0,
+                pid: own_tgid,
+                errno: libc::EPERM,
+            },
+        )
+    };
     let checked = [
+        // Resource limits and CPU affinity of this process only, never of another one of
+        // the same user (SEC R-013): glibc's setrlimit is prlimit64(0, ...).
+        own_pid(libc::SYS_prlimit64),
+        own_pid(libc::SYS_sched_setaffinity),
         // AF_UNIX stream sockets only: the control socket and its peers (D-044 item 3);
         // no datagram socket to send to journald, a notify socket or the like (SEC-R-012).
         af_unix(libc::SYS_socket),
@@ -513,6 +528,14 @@ fn rule_block(rule: &Rule) -> Vec<libc::sock_filter> {
             bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
             allow,
             errno(e),
+        ],
+        // A = arg; A == 0 || A == pid ? allow : errno
+        Rule::ArgZeroOrPid { arg, pid, errno: e } => vec![
+            load(arg),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0),
+            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, pid, 1, 0),
+            errno(e),
+            allow,
         ],
         // A = arg; A & mask ? errno : allow
         Rule::ArgMaskClear {
