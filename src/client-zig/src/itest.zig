@@ -1549,6 +1549,43 @@ fn unhealthyMounts() c_int {
     return v;
 }
 
+/// Wait until the daemon reports `path` on a hung mount (its own view, over a second
+/// connection, no GIO call), then until the module's pushed table has caught up: at
+/// least one unhealthy mount, unchanged for 300 ms. The host may have other unhealthy
+/// mounts of its own (a dead AppImage FUSE mount, say), so the module's count is not
+/// assumed to be 1, and a count reached before the fake mount was probed proves nothing.
+fn waitHungKnown(ctx: *Ctx, path: [*c]const u8, timeout_ms: i64) ?[*:0]const u8 {
+    const t0 = nowMs();
+    const sock_path = ipc.resolveSocketPath(std.mem.span(ctx.sock), null, null) catch return "bad socket path";
+    while (true) {
+        if (nowMs() - t0 > timeout_ms) return "the daemon never reported the fake mount hung";
+        var conn = ipc.connectAndPing(&sock_path, 2_000) catch {
+            c.g_usleep(20 * 1000);
+            continue;
+        };
+        defer conn.close();
+        var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
+        const info = health.queryPath(&cl, std.mem.span(path)) catch {
+            c.g_usleep(20 * 1000);
+            continue;
+        };
+        if (info.state == health.hung) break;
+        c.g_usleep(20 * 1000);
+    }
+    var last = unhealthyMounts();
+    var since = nowMs();
+    while (last < 1 or nowMs() - since < 300) {
+        if (nowMs() - t0 > timeout_ms) return "no mount-health event reached the module";
+        c.g_usleep(10 * 1000);
+        const now = unhealthyMounts();
+        if (now != last) {
+            last = now;
+            since = nowMs();
+        }
+    }
+    return null;
+}
+
 /// gungnird (a test-hooks build) treats <tmp>/fake-hung as a mount whose probes never
 /// return. The module must learn that from the pushed health events alone (no call is
 /// made until then), then answer every GIO call under it within max_hung_call_ms without
@@ -1634,12 +1671,8 @@ fn checkHungMount(ctx: *Ctx) ?[*:0]const u8 {
     if (expectState(1, 5_000, 0)) |what| return what;
     // The probe deadline is 1 s; the event reaches the idle module through its event
     // thread. No GIO call is made meanwhile.
-    const t0 = nowMs();
-    while (unhealthyMounts() < 1) {
-        if (nowMs() - t0 > 5_000) return "no mount-health event reached the module";
-        c.g_usleep(10 * 1000);
-    }
-    if (unhealthyMounts() != 1) return "the module counts the wrong number of hung mounts";
+    if (waitHungKnown(ctx, path, 5_000)) |what| return what;
+    if (unhealthyMounts() < 1) return "the module counts no hung mount";
 
     const file = c.g_file_new_for_path(path);
     defer c.g_object_unref(file);
@@ -2046,6 +2079,8 @@ fn checkFileOps(ctx: *Ctx) ?[*:0]const u8 {
             if (info != null) c.g_object_unref(info);
             c.g_usleep(20 * 1000);
         }
+        // The count above may be another unhealthy mount of the host's: wait for this one.
+        if (waitHungKnown(ctx, hf, 10_000)) |what| return what;
         var r: OpRun = .{};
         if (runOp(1, m, hf, 0, &r)) |w| return w;
         if (r.code != c.G_IO_ERROR_TIMED_OUT) return "a copy into a hung mount was not refused with TIMED_OUT";

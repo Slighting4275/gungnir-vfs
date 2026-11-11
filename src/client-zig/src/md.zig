@@ -558,3 +558,21 @@ test "moved and removed requests" {
 test "a maximal set request fits one slot" {
     try std.testing.expect(1 + max_uuid_len + 8 * 4 + 4 + 2 + max_key_len + max_value_len <= ipc.payload_max);
 }
+
+// Replies come from the peer's memory: no input may trip a safety check or leak.
+test "decodeValue survives random replies without leaks" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_0101);
+    const r = prng.random();
+    var buf: [700]u8 = undefined;
+    for (0..100_000) |_| {
+        const n = r.uintLessThan(usize, buf.len);
+        r.bytes(buf[0..n]);
+        if (n >= 3) {
+            buf[0] = if (r.boolean()) value_string else value_stringv;
+            // Small counts and lengths, so valid shapes come up too.
+            buf[1] = r.uintLessThan(u8, 8);
+            buf[2] = 0;
+        }
+        if (decodeValue(std.testing.allocator, buf[0..n])) |v| v.deinit(std.testing.allocator) else |_| {}
+    }
+}

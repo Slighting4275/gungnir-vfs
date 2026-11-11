@@ -322,3 +322,33 @@ test "unescape decodes octal and keeps what is not an escape" {
     var small: [3]u8 = undefined;
     try t.expectEqualStrings("abc", unescape("abcdef", &small));
 }
+
+test "random mountinfo lines never trip a safety check" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_0404);
+    const r = prng.random();
+    const parts = [_][]const u8{ " ", " - ", "-", "/", "\\", "\\040", "\\0", "\\777", "/media/", "/run/media/", "/home/user/", "/.", "tmpfs", "ramfs", "none", "1", "\n" };
+    var line: [2048]u8 = undefined;
+    var lb: LineBuf = .{};
+    for (0..100_000) |_| {
+        var n: usize = 0;
+        for (0..r.uintLessThan(usize, 40)) |_| {
+            if (r.uintLessThan(u8, 4) == 0) {
+                const k = r.uintLessThan(usize, 6);
+                if (n + k > line.len) break;
+                r.bytes(line[n..][0..k]);
+                n += k;
+            } else {
+                const p = parts[r.uintLessThan(usize, parts.len)];
+                if (n + p.len > line.len) break;
+                @memcpy(line[n..][0..p.len], p);
+                n += p.len;
+            }
+        }
+        if (parseLine(line[0..n], &lb)) |e| {
+            _ = shouldDisplay(e, desk);
+            _ = shouldDisplay(e, .{ .name = "", .home = "", .is_root = true });
+        }
+        var out: [16]u8 = undefined;
+        _ = unescape(line[0..n], &out);
+    }
+}

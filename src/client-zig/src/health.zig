@@ -449,3 +449,24 @@ test "a client waiting for its reply hands events to on_event; queries round-tri
     try testing.expectError(error.Timeout, subscribe(&cl));
     reset();
 }
+
+// Events and query replies come from the peer: random ones never trip a safety check,
+// and the table only ever holds valid mount paths.
+test "random events and query replies are rejected or applied safely" {
+    defer reset();
+    var prng = std.Random.DefaultPrng.init(0x5eed_0202);
+    const r = prng.random();
+    var buf: [ipc.payload_max]u8 = undefined;
+    for (0..100_000) |_| {
+        const n = r.uintLessThan(usize, 200);
+        r.bytes(buf[0..n]);
+        if (n >= 11 and r.boolean()) {
+            buf[8] = r.uintLessThan(u8, 8); // flags: first/last/incomplete
+            buf[9] = r.uintLessThan(u8, 4); // count
+            buf[10] = 0;
+        }
+        onEvent(buf[0..n]);
+        _ = parseInfo(buf[0..n]) catch {};
+        _ = blocks("/a/b");
+    }
+}

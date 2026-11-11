@@ -576,3 +576,15 @@ test "statuses map to GIO error codes" {
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(md.st_unsupported, 0, op_copy, 0));
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_FAILED), ioErrorCode(99, 0, op_copy, 0));
 }
+
+test "random progress and done payloads never trip a safety check" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_0303);
+    const r = prng.random();
+    var buf: [64]u8 = undefined;
+    for (0..100_000) |_| {
+        const n = r.uintLessThan(usize, buf.len);
+        r.bytes(buf[0..n]);
+        _ = parseProgress(buf[0..n]);
+        _ = parseDone(buf[0..n]);
+    }
+}
