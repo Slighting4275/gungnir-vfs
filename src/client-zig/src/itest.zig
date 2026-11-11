@@ -2064,6 +2064,48 @@ fn runVolmonOff(tmp_arg: [*c]u8) c_int {
     return 0;
 }
 
+/// The removable drive the volmon modes look for (F01b). A desktop may have no storage
+/// the display rule keeps (GLib's rule hides /, /home, /boot and /tmp), so these modes
+/// re-run themselves in a private user+mount namespace with a ramfs mounted here: GLib
+/// displays it, and the caller's mounts are never touched.
+const fixture_mount = "/run/media/stick";
+const fixture_env = "GUNGNIR_ITEST_VOLMON_FIXTURE";
+
+/// Set in the re-run that has the fixture mounted. Without it (no user namespaces, no
+/// /run/media: some containers) the modes still check that the monitor lists exactly
+/// the filtered mountinfo set, which may then be empty.
+var volmon_fixture = false;
+
+const fixture_script =
+    \\mount -t tmpfs -o mode=0755 gungnir-fixture /run/media || exit 77
+    \\mkdir /run/media/stick || exit 77
+    \\mount -t ramfs gungnir-stick /run/media/stick || exit 77
+    \\export GUNGNIR_ITEST_VOLMON_FIXTURE=1
+    \\exec "$@"
+;
+
+/// Runs this itest again inside `unshare -Urm` with the fixture mounted; returns its exit
+/// code, or null when the namespace or the fixture cannot be made (then run directly).
+fn rerunWithFixture(argc: c_int, argv: [*c][*c]u8) ?c_int {
+    if (c.g_find_program_in_path("unshare")) |up| c.g_free(up) else return null;
+    var args: [16][*c]u8 = undefined;
+    const fixed = [_][*c]const u8{ "unshare", "-Urm", "--propagation", "private", "sh", "-c", fixture_script, "sh" };
+    const n_args: usize = @intCast(argc);
+    if (fixed.len + n_args + 1 > args.len) return null;
+    for (fixed, 0..) |a, i| args[i] = @constCast(a);
+    for (0..n_args) |i| args[fixed.len + i] = argv[i];
+    args[fixed.len + n_args] = null;
+    var status: c_int = 0;
+    if (c.g_spawn_sync(null, &args, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, &status, null) == 0) return null;
+    if (status & 0x7f != 0) return 1; // killed by a signal
+    const code = (status >> 8) & 0xff;
+    if (code == 77) {
+        std.debug.print("gungnir itest: no namespace fixture here; checking the live mount set only\n", .{});
+        return null;
+    }
+    return code;
+}
+
 /// volmon: GIO_USE_VOLUME_MONITOR=gungnir makes it the native monitor of
 /// g_volume_monitor_get(), and the type works on its own.
 fn runVolmon(tmp_arg: [*c]u8) c_int {
@@ -2079,7 +2121,7 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
         if (klass.is_supported.?() == 0) return fail("the volume monitor is unsupported with GIO_USE_VOLUME_MONITOR=gungnir");
         const dvm = c.g_volume_monitor_get();
         defer c.g_object_unref(dvm);
-        if (gungnirObjects(dvm) == 0) return fail("g_volume_monitor_get() lists no Gungnir mount with GIO_USE_VOLUME_MONITOR=gungnir");
+        if (volmon_fixture and gungnirObjects(dvm) == 0) return fail("g_volume_monitor_get() lists no Gungnir mount with GIO_USE_VOLUME_MONITOR=gungnir");
     }
     const vm_type = c.g_type_from_name("GungnirVolumeMonitor");
     if (vm_type == 0) return fail("GungnirVolumeMonitor type is not registered");
@@ -2093,6 +2135,7 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
     defer c.g_list_free_full(mounts, @ptrCast(&c.g_object_unref));
 
     var found_root = false;
+    var found_stick = false;
     var curr: ?*c.GList = mounts;
     while (curr) |node| : (curr = node.*.next) {
         const m: *c.GMount = @ptrCast(@alignCast(node.*.data));
@@ -2103,10 +2146,13 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
             if (path) |p| {
                 defer c.g_free(p);
                 if (std.mem.eql(u8, std.mem.span(p), "/")) found_root = true;
+                if (std.mem.eql(u8, std.mem.span(p), fixture_mount)) found_stick = true;
             }
         }
     }
-    if (!found_root) return fail("root mount / not found in GungnirVolumeMonitor mounts");
+    // F01b: like GLib's monitors, never the root filesystem; the removable stick, yes.
+    if (found_root) return fail("GungnirVolumeMonitor lists the root filesystem /");
+    if (volmon_fixture and !found_stick) return fail("GungnirVolumeMonitor does not list the removable fixture " ++ fixture_mount);
 
     const vols = c.g_volume_monitor_get_volumes(vm);
     if (vols == null) return fail("g_volume_monitor_get_volumes returned NULL");
@@ -2170,40 +2216,29 @@ fn countIn(self: [*c]u8, dir: [*:0]const u8, variant: [*:0]const u8) ?Count {
 }
 
 /// The reference set for the Gungnir monitor (D-062): the file URIs of the mount points
-/// of /proc/self/mountinfo that the shared filter accepts (mountfilter.zig), with
-/// mountinfo parsed here independently of the module. Each mount point once.
+/// of /proc/self/mountinfo that the shared display rule keeps (mountfilter.zig, F01b),
+/// read here independently of the module's cache. Each mount point once.
 fn referenceRoots(out: *c.GHashTable) bool {
     var raw: [*c]u8 = null;
     var len: c.gsize = 0;
     if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return false;
     defer c.g_free(raw);
+    const name = c.g_get_user_name();
+    const home = c.g_get_home_dir();
+    const user: mountfilter.User = .{
+        .name = if (name != null) std.mem.span(@as([*:0]const u8, @ptrCast(name))) else "",
+        .home = if (home != null) std.mem.span(@as([*:0]const u8, @ptrCast(home))) else "",
+        .is_root = std.os.linux.getuid() == 0,
+    };
     var lines = std.mem.splitScalar(u8, raw[0..len], '\n');
     while (lines.next()) |line| {
-        var f = std.mem.tokenizeScalar(u8, line, ' ');
-        var i: usize = 0;
-        var mp_raw: []const u8 = "";
-        while (i < 5) : (i += 1) mp_raw = f.next() orelse break;
-        if (i < 5) continue;
-        const fstype = while (f.next()) |t| {
-            if (std.mem.eql(u8, t, "-")) break f.next() orelse continue;
-        } else continue;
-        var buf: [1024]u8 = undefined;
-        var n: usize = 0;
-        var k: usize = 0;
-        while (k < mp_raw.len and n < buf.len - 1) : (n += 1) {
-            if (mp_raw[k] == '\\' and k + 3 < mp_raw.len) {
-                if (std.fmt.parseInt(u8, mp_raw[k + 1 .. k + 4], 8)) |b| {
-                    buf[n] = b;
-                    k += 4;
-                    continue;
-                } else |_| {}
-            }
-            buf[n] = mp_raw[k];
-            k += 1;
-        }
+        var line_buf: mountfilter.LineBuf = .{};
+        const entry = mountfilter.parseLine(line, &line_buf) orelse continue;
+        if (!mountfilter.shouldDisplay(entry, user)) continue;
+        var buf: [1025]u8 = undefined;
+        const n = @min(entry.mount_point.len, buf.len - 1);
+        @memcpy(buf[0..n], entry.mount_point[0..n]);
         buf[n] = 0;
-        const mp = buf[0..n];
-        if (!mountfilter.isStorageFs(fstype, mp)) continue;
         const uri = c.g_filename_to_uri(@ptrCast(&buf), null, null) orelse continue;
         _ = c.g_hash_table_add(out, uri);
     }
@@ -2376,12 +2411,12 @@ fn runVolmonInstalled(self: [*c]u8, module_dir: [*c]u8, tmp_arg: [*c]u8) c_int {
     if (none.gungnir != 0) return fail("installed module, no env: g_volume_monitor_get() lists Gungnir mounts");
     if (vfs.gungnir != 0) return fail("installed module, GIO_USE_VFS=gungnir only: g_volume_monitor_get() lists Gungnir mounts");
     if (vol.registered != 1) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: the module was not loaded");
-    if (vol.direct <= 0) return fail("the Gungnir monitor accepts no mount point at all");
+    if (volmon_fixture and vol.direct <= 0) return fail("the Gungnir monitor accepts no mount point at all");
     if (vol.distinct != vol.direct) return fail("the Gungnir monitor lists a mount point twice");
     if (vol.gungnir != vol.direct) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: Gungnir mounts != mount points");
     if (vol.all != vol.gungnir) return fail("installed module, GIO_USE_VOLUME_MONITOR=gungnir: other monitors' mounts too");
     // D-062: the count is the filtered mountinfo set, each root once, not a fixed number.
-    if (vol.ref <= 0) return fail("could not build the mountinfo reference set");
+    if (vol.ref < 0) return fail("could not build the mountinfo reference set");
     if (vol.refeq != 1 or vol.direct != vol.ref) return fail("the Gungnir mounts are not exactly the filtered /proc/self/mountinfo set");
     // DIB-F016: every mount has its volume, and that volume's mount is the same mount.
     if (vol.linked != vol.gungnir) return fail("a Gungnir mount has no volume, or its volume's mount is another object");
@@ -2394,6 +2429,10 @@ fn runVolmonInstalled(self: [*c]u8, module_dir: [*c]u8, tmp_arg: [*c]u8) c_int {
 pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (argc < 3) return fail("usage: gungnir-itest <module-dir> <mode> [args]");
     const mode = std.mem.span(argv[2]);
+    volmon_fixture = c.g_getenv(fixture_env) != null;
+    if (!volmon_fixture and (std.mem.eql(u8, mode, "volmon") or std.mem.eql(u8, mode, "volmon-installed"))) {
+        if (rerunWithFixture(argc, argv)) |rc| return rc;
+    }
 
     if (c.g_setenv("GIO_MODULE_DIR", argv[1], 1) == 0) return fail("g_setenv GIO_MODULE_DIR");
     // A volmon-installed child gets its indexed dir as argv[1], so this is the right dir.

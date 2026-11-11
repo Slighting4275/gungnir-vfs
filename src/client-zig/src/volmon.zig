@@ -22,34 +22,23 @@ pub var volume_type: c.GType = 0;
 
 // ---- Unescape octal paths from mountinfo --------------------------------------
 
-pub fn unescape(input: []const u8, out: []u8) []const u8 {
-    var in_idx: usize = 0;
-    var out_idx: usize = 0;
-    while (in_idx < input.len and out_idx < out.len) {
-        if (input[in_idx] == '\\' and in_idx + 3 < input.len) {
-            const b1 = input[in_idx + 1];
-            const b2 = input[in_idx + 2];
-            const b3 = input[in_idx + 3];
-            if (b1 >= '0' and b1 <= '7' and b2 >= '0' and b2 <= '7' and b3 >= '0' and b3 <= '7') {
-                const val: u16 = @as(u16, b1 - '0') * 64 + @as(u16, b2 - '0') * 8 + @as(u16, b3 - '0');
-                if (val <= 255) {
-                    out[out_idx] = @truncate(val);
-                    out_idx += 1;
-                    in_idx += 4;
-                    continue;
-                }
-            }
-        }
-        out[out_idx] = input[in_idx];
-        out_idx += 1;
-        in_idx += 1;
-    }
-    return out[0..out_idx];
-}
+pub const unescape = mountfilter.unescape;
 
 // ---- Mount filtering ---------------------------------------------------------
 
-pub const isStorageFs = mountfilter.isStorageFs;
+pub const shouldDisplay = mountfilter.shouldDisplay;
+
+/// The user the display rule is evaluated for, as GLib reads it: the user name, the home
+/// directory and whether the process runs as root. No syscall on any mount.
+pub fn processUser() mountfilter.User {
+    const name = c.g_get_user_name();
+    const home = c.g_get_home_dir();
+    return .{
+        .name = if (name != null) std.mem.span(@as([*:0]const u8, @ptrCast(name))) else "",
+        .home = if (home != null) std.mem.span(@as([*:0]const u8, @ptrCast(home))) else "",
+        .is_root = std.os.linux.getuid() == 0,
+    };
+}
 
 pub fn isNetworkFs(fstype: []const u8) bool {
     const net_types = [_][]const u8{
@@ -410,30 +399,14 @@ fn attachVolume(gmount: *GungnirMount) void {
 /// point mounted over again appears once, as its topmost (last) mount.
 fn mountsFrom(content: []const u8) !*c.GList {
     var list: ?*c.GList = null;
+    const user = processUser();
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |line| {
-        if (line.len == 0) continue;
-        var tok_it = std.mem.tokenizeScalar(u8, line, ' ');
-        // 0: mnt_id, 1: parent_id, 2: major:minor, 3: root, 4: mount_point
-        _ = tok_it.next() orelse continue; // mnt_id
-        _ = tok_it.next() orelse continue; // parent_id
-        _ = tok_it.next() orelse continue; // major:minor
-        _ = tok_it.next() orelse continue; // root
-        const mp_raw = tok_it.next() orelse continue;
-
-        // Skip to '-' separator
-        var fstype_tok: ?[]const u8 = null;
-        while (tok_it.next()) |tok| {
-            if (std.mem.eql(u8, tok, "-")) {
-                fstype_tok = tok_it.next();
-                break;
-            }
-        }
-        const fstype = fstype_tok orelse continue;
-        var mp_buf: [1024]u8 = undefined;
-        const mp = unescape(mp_raw, &mp_buf);
-
-        if (!isStorageFs(fstype, mp)) continue;
+        var line_buf: mountfilter.LineBuf = .{};
+        const entry = mountfilter.parseLine(line, &line_buf) orelse continue;
+        if (!shouldDisplay(entry, user)) continue;
+        const mp = entry.mount_point;
+        const fstype = entry.fstype;
 
         const obj = c.g_object_new(mount_type, @as(?*const u8, null));
         if (obj == null) continue;
@@ -663,15 +636,35 @@ test "unescape handles octal sequences" {
     try std.testing.expectEqualStrings("Truncated\\04", res_trunc);
 }
 
-test "isStorageFs filters virtual filesystems" {
-    try std.testing.expect(!isStorageFs("proc", "/proc"));
-    try std.testing.expect(!isStorageFs("sysfs", "/sys"));
-    try std.testing.expect(!isStorageFs("cgroup2", "/sys/fs/cgroup"));
-    try std.testing.expect(isStorageFs("ext4", "/"));
-    try std.testing.expect(isStorageFs("btrfs", "/home"));
-    try std.testing.expect(isStorageFs("nfs", "/mnt/share"));
-    try std.testing.expect(isStorageFs("tmpfs", "/tmp"));
-    try std.testing.expect(!isStorageFs("tmpfs", "/run/user/1000"));
+test "mountsFrom lists only what the display rule keeps, each mount point once" {
+    ensureRegisteredForTest();
+    const user = processUser();
+    // The fixture writes the home directory into mountinfo unescaped.
+    if (user.home.len < 2 or std.mem.indexOfAny(u8, user.home, " \t\n\\") != null or std.mem.indexOf(u8, user.home, "/.") != null)
+        return error.SkipZigTest;
+    var path_buf: [1100]u8 = undefined;
+    const own = std.fmt.bufPrint(&path_buf, "{s}/own-store", .{user.home}) catch return error.SkipZigTest;
+    var info_buf: [4096]u8 = undefined;
+    const info = std.fmt.bufPrint(&info_buf,
+        \\1 0 0:1 / / rw - btrfs /dev/sda2 rw
+        \\2 1 0:2 / /proc rw - proc proc rw
+        \\3 1 0:3 / /media rw - tmpfs tmpfs rw
+        \\4 3 0:4 / /media/stick rw - ramfs none2 rw
+        \\5 3 0:5 / /media/stick rw - vfat /dev/sdb1 rw
+        \\6 1 0:6 / {s} rw - ramfs none3 rw
+        \\7 1 0:7 /sub /media/bind rw - ext4 /dev/sdc1 rw
+        \\8 1 0:8 / /cursor/stores rw - fuse.agent-store agent rw
+        \\
+    , .{own}) catch return error.SkipZigTest;
+    const list = try mountsFrom(info);
+    defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+    try std.testing.expectEqual(@as(c.guint, 2), c.g_list_length(list));
+    const first: *GungnirMount = @ptrCast(@alignCast(list.*.data));
+    const second: *GungnirMount = @ptrCast(@alignCast(list.*.next.*.data));
+    // The stick was mounted over: only the topmost (vfat) mount is listed.
+    try std.testing.expectEqualStrings("/media/stick", std.mem.sliceTo(&first.mount_point, 0));
+    try std.testing.expectEqualStrings("vfat", std.mem.sliceTo(&first.fstype, 0));
+    try std.testing.expectEqualStrings(own, std.mem.sliceTo(&second.mount_point, 0));
 }
 
 test "isNetworkFs recognizes network filesystems" {
@@ -695,12 +688,12 @@ pub fn ensureRegisteredForTest() void {
 
 test "a mount and its volume point at each other and are freed together (DIB-F016)" {
     ensureRegisteredForTest();
-    const text = "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n" ++
-        "23 22 0:22 / /home rw - btrfs /dev/sda2 rw\n" ++
-        "24 22 0:23 / /home rw - btrfs /dev/sda3 rw\n" ++
+    const text = "22 1 0:21 / /media/disk rw - ext4 /dev/sda1 rw\n" ++
+        "23 22 0:22 / /media/home rw - btrfs /dev/sda2 rw\n" ++
+        "24 22 0:23 / /media/home rw - btrfs /dev/sda3 rw\n" ++
         "25 22 0:24 / /proc rw - proc proc rw\n";
     const list = try mountsFrom(text);
-    // /home mounted twice appears once (the top one); /proc is filtered out.
+    // /media/home mounted twice appears once (the top one); /proc is filtered out.
     try std.testing.expectEqual(@as(c.guint, 2), c.g_list_length(list));
     var vol_gone: c.gpointer = null;
     var mount_gone: c.gpointer = null;
@@ -731,8 +724,10 @@ test "a mount and its volume point at each other and are freed together (DIB-F01
 test "parseMounts extracts live mounts from mountinfo" {
     ensureRegisteredForTest();
     const mounts = parseMounts() catch |err| {
-        // If /proc/self/mountinfo is inaccessible in restricted sandbox, skip gracefully
-        if (err == error.CannotOpenMountinfo) return;
+        // If /proc/self/mountinfo is inaccessible in restricted sandbox, skip gracefully.
+        // A machine may also have no storage the display rule keeps (F01b: GLib hides
+        // /, /home and /boot); the fixtures above cover the rule itself.
+        if (err == error.CannotOpenMountinfo or err == error.NoMounts) return error.SkipZigTest;
         return err;
     };
     defer c.g_list_free_full(mounts, @ptrCast(&c.g_object_unref));
