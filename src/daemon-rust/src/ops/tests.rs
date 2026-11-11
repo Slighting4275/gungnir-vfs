@@ -1561,3 +1561,129 @@ fn a_slow_fsync_is_not_a_stall() -> R {
     }
     Ok(())
 }
+
+/// SEC-R-014 / DIR-C1-F01 fixture: `<t>/parent/dest` is a partial tree copy (op 0xe1)
+/// with a temp file in `dest/sub`; `<t>/outside` holds a lookalike temp file the sweep
+/// must never reach. Directory listing order: 1 parent, 2 dest, 3 dest/sub.
+struct SwapFixture {
+    t: TestDir,
+    ledger: PathBuf,
+    sub: PathBuf,
+    lookalike: PathBuf,
+}
+
+const SWAP_TEMP: &str = ".gungnir-00000000000000e1-0.tmp";
+
+fn swap_fixture(name: &str) -> R<SwapFixture> {
+    let t = TestDir::new(name)?;
+    let dest = t.join("parent/dest");
+    let sub = dest.join("sub");
+    fs::create_dir_all(&sub)?;
+    fs::create_dir(t.join("outside"))?;
+    fs::write(sub.join(SWAP_TEMP), b"partial copy")?;
+    let lookalike = t.join("outside").join(SWAP_TEMP);
+    fs::write(&lookalike, b"user data")?;
+    let ledger = t.join("ops-pending");
+    fs::write(&ledger, ledger_start(0xe1, &b(&dest)))?;
+    Ok(SwapFixture {
+        t,
+        ledger,
+        sub,
+        lookalike,
+    })
+}
+
+impl SwapFixture {
+    /// Replace `dest/sub` by a symlink to `outside`, keeping the real directory aside.
+    fn swap(&self) {
+        let aside = self.sub.with_file_name("sub.real");
+        fs::rename(&self.sub, aside).expect("move sub aside");
+        std::os::unix::fs::symlink(self.t.join("outside"), &self.sub).expect("symlink sub");
+    }
+}
+
+/// SEC-R-014: a directory swapped for a symlink after it was listed, before the sweep
+/// descends into it, must not lead the sweep outside the destination tree.
+#[test]
+fn the_sweep_does_not_descend_into_a_directory_swapped_for_a_symlink() -> R {
+    let f = swap_fixture("op-sweep-swap-descend")?;
+    let removed = sweep_temp_ledger_with(&f.ledger, &mut |p| {
+        if p == SweepPoint::Open(3) {
+            f.swap();
+        }
+    })?;
+    assert_eq!(
+        fs::read(&f.lookalike)?,
+        b"user data",
+        "the sweep followed a swapped-in symlink out of the destination"
+    );
+    assert_eq!(removed, 0);
+    Ok(())
+}
+
+/// SEC-R-014: a directory swapped for a symlink after its entries were listed, before the
+/// temp file in it is unlinked: the unlink must hit the directory that was listed.
+#[test]
+fn the_sweep_unlinks_in_the_directory_it_listed_not_through_a_swapped_path() -> R {
+    let f = swap_fixture("op-sweep-swap-unlink")?;
+    let removed = sweep_temp_ledger_with(&f.ledger, &mut |p| {
+        if p == SweepPoint::Listed(3) {
+            f.swap();
+        }
+    })?;
+    assert_eq!(
+        fs::read(&f.lookalike)?,
+        b"user data",
+        "the sweep unlinked through a swapped-in symlink"
+    );
+    let moved_temp = f.sub.with_file_name("sub.real").join(SWAP_TEMP);
+    assert!(!moved_temp.exists(), "the listed temp file was not removed");
+    assert_eq!(removed, 1);
+    Ok(())
+}
+
+/// SEC-R-014: without any race, the anchored sweep removes exactly the op's temp files,
+/// next to the destination and anywhere below it, and nothing else; it does not follow
+/// a symlink inside the tree, nor remove a directory with a temp-file name.
+#[test]
+fn the_sweep_removes_only_the_ops_temp_files() -> R {
+    let t = TestDir::new("op-sweep-only-ours")?;
+    let parent = t.join("parent");
+    let dest = parent.join("dest");
+    fs::create_dir_all(dest.join("a/b/c"))?;
+    fs::create_dir(t.join("outside"))?;
+    let ours = [
+        parent.join(".gungnir-00000000000000e2-0.tmp"),
+        dest.join(".gungnir-00000000000000e2-1.tmp"),
+        dest.join("a/b/c/.gungnir-00000000000000e2-7.tmp"),
+    ];
+    let keep = [
+        parent.join(".gungnir-00000000000000e3-0.tmp"), // another op's (it ended)
+        dest.join("a/.gungnir-00000000000000e2-0.txt"),
+        dest.join("a/b/gungnir-00000000000000e2-0.tmp"),
+        dest.join("a/b/c/file"),
+        t.join("outside").join(".gungnir-00000000000000e2-0.tmp"),
+    ];
+    for p in ours.iter().chain(keep.iter()) {
+        fs::write(p, b"x")?;
+    }
+    let dir_named_like_temp = dest.join(".gungnir-00000000000000e2-9.tmp");
+    fs::create_dir(&dir_named_like_temp)?;
+    std::os::unix::fs::symlink(t.join("outside"), dest.join("a/link"))?;
+    let ledger = t.join("ops-pending");
+    let mut text = ledger_start(0xe2, &b(&dest));
+    text.extend(ledger_start(0xe3, &b(&parent.join("other"))));
+    text.extend(ledger_end(0xe3));
+    fs::write(&ledger, text)?;
+    let removed = sweep_temp_ledger(&ledger)?;
+    for p in &ours {
+        assert!(!p.exists(), "not swept: {}", p.display());
+    }
+    for p in &keep {
+        assert!(p.exists(), "swept but not ours: {}", p.display());
+    }
+    assert!(dir_named_like_temp.is_dir());
+    assert_eq!(removed, ours.len());
+    assert_eq!(fs::metadata(&ledger)?.len(), 0, "the ledger is emptied");
+    Ok(())
+}

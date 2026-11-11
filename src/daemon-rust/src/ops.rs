@@ -1161,15 +1161,38 @@ const SWEEP_MAX_ENTRIES: usize = 100_000;
 /// followed, same filesystem, at most [`SWEEP_MAX_ENTRIES`] entries) is unlinked.
 /// Returns how many files were removed.
 ///
+/// Anchored (SEC-R-014): the destination's parent is opened once, by the path the op
+/// used, and everything after that goes through directory descriptors, one name at a
+/// time: subdirectories are opened with `openat(O_DIRECTORY | O_NOFOLLOW)` relative to
+/// the directory that listed them, and temp files are removed with `unlinkat` relative
+/// to the directory they were listed in. A directory swapped for a symlink while the
+/// sweep runs is refused (`ELOOP`/`ENOTDIR`), never followed, so the sweep cannot leave
+/// the tree it started in. Single-name `openat` is all this needs (a name from
+/// `readdir` has no `/` and is never `..`), so it works on every kernel and libc
+/// without `openat2`. `unlinkat` without `AT_REMOVEDIR` never removes a directory.
+///
 /// # Errors
 /// The ledger cannot be read or emptied.
 pub fn sweep_temp_ledger(ledger: &std::path::Path) -> std::io::Result<usize> {
-    use std::{
-        collections::BTreeMap,
-        ffi::OsStr,
-        os::unix::{ffi::OsStrExt, fs::MetadataExt},
-        path::Path,
-    };
+    sweep_temp_ledger_with(ledger, &mut |_| {})
+}
+
+/// Points of [`sweep_temp_ledger_with`]'s test seam, numbering directories from 1 in the
+/// order the sweep visits them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepPoint {
+    /// About to open the n-th directory.
+    Open(usize),
+    /// The n-th directory is listed; none of its entries has been acted on yet.
+    Listed(usize),
+}
+
+/// [`sweep_temp_ledger`] with a test seam called at each [`SweepPoint`].
+fn sweep_temp_ledger_with(
+    ledger: &std::path::Path,
+    at: &mut dyn FnMut(SweepPoint),
+) -> std::io::Result<usize> {
+    use std::{collections::BTreeMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, rc::Rc};
     let text = match std::fs::read(ledger) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1191,54 +1214,80 @@ pub fn sweep_temp_ledger(ledger: &std::path::Path) -> std::io::Result<usize> {
         }
     }
     let mut removed = 0usize;
+    let mut dirs_read = 0usize;
     for (id, dest) in &open {
         let prefix = format!(".gungnir-{id}-");
-        let ours = |n: &OsStr| {
-            let n = n.as_bytes();
-            n.starts_with(prefix.as_bytes()) && n.ends_with(b".tmp")
-        };
+        let ours = |n: &[u8]| n.starts_with(prefix.as_bytes()) && n.ends_with(b".tmp");
         let dest = Path::new(OsStr::from_bytes(dest));
         if !dest.is_absolute() {
             continue;
         }
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(p) = dest.parent() {
-            dirs.push(p.to_owned());
-        }
-        let top = std::fs::symlink_metadata(dest).ok();
-        let dev = top.as_ref().map(MetadataExt::dev);
-        let mut below = top
-            .is_some_and(|m| m.is_dir())
-            .then(|| vec![dest.to_owned()]);
+        let (Some(parent), Some(leaf)) = (dest.parent(), dest.file_name()) else {
+            continue;
+        };
+        let (Ok(parent), Ok(leaf)) = (
+            CString::new(parent.as_os_str().as_bytes()),
+            CString::new(leaf.as_bytes()),
+        ) else {
+            continue;
+        };
         let mut seen = 0usize;
-        let mut sweep_dir = |dir: &Path, walk: &mut Option<Vec<std::path::PathBuf>>| {
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                return;
+        // The anchor: the directory the op wrote into, resolved as the op resolved it.
+        dirs_read += 1;
+        at(SweepPoint::Open(dirs_read));
+        // SAFETY: `parent` is NUL-terminated and outlives the call.
+        let fd = unsafe {
+            libc::openat(
+                libc::AT_FDCWD,
+                parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+        // SAFETY: a fresh fd that nothing else owns.
+        let Some(top_dir) = SweepDir::list(unsafe { OwnedFd::from_raw_fd(fd) }, &mut seen) else {
+            continue;
+        };
+        at(SweepPoint::Listed(dirs_read));
+        for (name, _) in &top_dir.entries {
+            if ours(name.to_bytes()) && top_dir.unlink(name) {
+                removed += 1;
+            }
+        }
+        // The destination itself, if it is a directory (a partial tree copy): walked
+        // depth first, each directory opened by name from the one that listed it.
+        let mut pending: Vec<(Rc<SweepDir>, CString)> = vec![(Rc::new(top_dir), leaf)];
+        let mut dev: Option<libc::dev_t> = None;
+        while let Some((from, name)) = pending.pop() {
+            if seen > SWEEP_MAX_ENTRIES {
+                break;
+            }
+            dirs_read += 1;
+            at(SweepPoint::Open(dirs_read));
+            let Some(fd) = open_dir_nofollow(from.fd(), &name) else {
+                continue;
             };
-            for e in rd.flatten() {
-                seen += 1;
-                if seen > SWEEP_MAX_ENTRIES {
-                    return;
-                }
-                let name = e.file_name();
-                let Ok(md) = e.metadata() else { continue };
-                if ours(&name) && !md.is_dir() {
-                    if std::fs::remove_file(e.path()).is_ok() {
-                        removed += 1;
-                    }
-                } else if md.is_dir()
-                    && Some(md.dev()) == dev
-                    && let Some(w) = walk.as_mut()
-                {
-                    w.push(e.path());
+            drop(from);
+            // Same filesystem as the destination: never into a mount below it.
+            let Some(d) = fd_dev(&fd) else { continue };
+            if *dev.get_or_insert(d) != d {
+                continue;
+            }
+            let Some(dir) = SweepDir::list(fd, &mut seen) else {
+                continue;
+            };
+            at(SweepPoint::Listed(dirs_read));
+            let dir = Rc::new(dir);
+            for (name, ty) in &dir.entries {
+                let maybe_dir = *ty == libc::DT_DIR || *ty == libc::DT_UNKNOWN;
+                if ours(name.to_bytes()) && *ty != libc::DT_DIR && dir.unlink(name) {
+                    removed += 1;
+                } else if maybe_dir {
+                    pending.push((Rc::clone(&dir), name.clone()));
                 }
             }
-        };
-        for d in &dirs {
-            sweep_dir(d, &mut None);
-        }
-        while let Some(d) = below.as_mut().and_then(Vec::pop) {
-            sweep_dir(&d, &mut below);
         }
     }
     std::fs::OpenOptions::new()
@@ -1246,6 +1295,55 @@ pub fn sweep_temp_ledger(ledger: &std::path::Path) -> std::io::Result<usize> {
         .open(ledger)?
         .set_len(0)?;
     Ok(removed)
+}
+
+/// One directory of the temp sweep: its descriptor and the entries it listed (at most
+/// [`SWEEP_MAX_ENTRIES`] counted in `seen` across the whole op).
+struct SweepDir {
+    stream: DirStream,
+    entries: Vec<(CString, u8)>,
+}
+
+impl SweepDir {
+    fn list(fd: OwnedFd, seen: &mut usize) -> Option<Self> {
+        let mut stream = DirStream::open(fd).ok()?;
+        let mut entries = Vec::new();
+        while let Ok(Some(e)) = stream.next() {
+            *seen += 1;
+            if *seen > SWEEP_MAX_ENTRIES {
+                break;
+            }
+            entries.push(e);
+        }
+        Some(Self { stream, entries })
+    }
+
+    fn fd(&self) -> RawFd {
+        self.stream.fd()
+    }
+
+    /// Unlink `name` in this directory (never a directory itself: no `AT_REMOVEDIR`).
+    fn unlink(&self, name: &CStr) -> bool {
+        // SAFETY: a live directory fd and a NUL-terminated name that outlives the call.
+        unsafe { libc::unlinkat(self.fd(), name.as_ptr(), 0) == 0 }
+    }
+}
+
+/// `name` in `dir` opened as a directory: one component, never through a symlink.
+fn open_dir_nofollow(dir: RawFd, name: &CStr) -> Option<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
+    // SAFETY: a fresh fd that nothing else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The device of the open file `fd`.
+fn fd_dev(fd: &OwnedFd) -> Option<libc::dev_t> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a live fd and room for one `stat`, read only after fstat succeeded.
+    (unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } == 0)
+        .then(|| unsafe { st.assume_init() }.st_dev)
 }
 
 /// Ids unique across runs: temp names carry them, and a sweep of the previous run's may
