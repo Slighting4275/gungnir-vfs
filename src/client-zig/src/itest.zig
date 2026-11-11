@@ -2247,7 +2247,8 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
     defer c.g_object_unref(vm);
 
     const mounts = c.g_volume_monitor_get_mounts(vm);
-    if (mounts == null) return fail("g_volume_monitor_get_mounts returned NULL");
+    // An empty GList is NULL: with no fixture, a host may have no storage to list.
+    if (mounts == null and volmon_fixture) return fail("g_volume_monitor_get_mounts returned NULL");
     defer c.g_list_free_full(mounts, @ptrCast(&c.g_object_unref));
 
     var found_root = false;
@@ -2271,7 +2272,7 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
     if (volmon_fixture and !found_stick) return fail("GungnirVolumeMonitor does not list the removable fixture " ++ fixture_mount);
 
     const vols = c.g_volume_monitor_get_volumes(vm);
-    if (vols == null) return fail("g_volume_monitor_get_volumes returned NULL");
+    if (vols == null and volmon_fixture) return fail("g_volume_monitor_get_volumes returned NULL");
     defer c.g_list_free_full(vols, @ptrCast(&c.g_object_unref));
 
     return 0;
@@ -2748,6 +2749,9 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
         const base = privateDir(argv[3], "trash-metadata-data") orelse return fail("could not create the data directory");
         defer c.g_free(base);
         if (c.g_setenv("XDG_DATA_HOME", base, 1) == 0) return fail("g_setenv XDG_DATA_HOME");
+        // GLib trashes into the home trash only for a file on $HOME's device: in CI
+        // containers HOME (/root) and the checkout (/builds) are different mounts.
+        if (c.g_setenv("HOME", base, 1) == 0) return fail("g_setenv HOME");
         const rc = runDaemon(argv[3], argv[4], "trash-metadata", &checkTrashMetadata);
         var rm = [_][*c]u8{ @constCast("rm"), @constCast("-rf"), @constCast("--"), @constCast(base), null };
         _ = c.g_spawn_sync(null, &rm, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, null, null);
