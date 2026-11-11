@@ -11,6 +11,7 @@
 use std::{
     ffi::OsStr,
     fs,
+    os::fd::AsRawFd,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -83,12 +84,8 @@ fn euid() -> u32 {
 }
 
 /// Create the database directory (0700) if missing and refuse one that is not ours or
-/// is writable by others; create the file 0600 (and tighten an existing file of ours).
-/// SQLite gives `-wal` and `-shm` the database file's mode.
-fn prepare_files(path: &Path) -> Result<()> {
-    if path.as_os_str() == ":memory:" {
-        return Ok(());
-    }
+/// is writable by others.
+fn prepare_dir(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::DirBuilder::new()
             .recursive(true)
@@ -99,6 +96,93 @@ fn prepare_files(path: &Path) -> Result<()> {
             return Err(Error::InsecureDbDir(dir.to_path_buf()));
         }
     }
+    Ok(())
+}
+
+/// One daemon per store (DIR-C1-F02): an exclusive `flock` on `<db>.lock`, held for the
+/// daemon's whole life. The socket's own lock only serialises daemons on one socket; two
+/// daemons on different sockets sharing a store would each sweep the other's live temp
+/// files and move its temp ledger aside. The lock file is never removed while another
+/// daemon could be waiting on it, only by a failed start that created the store and
+/// still holds it (see `FreshStore` in main.rs). Closed on exec, so a live upgrade
+/// (an `execve` of the same process) takes it again.
+#[derive(Debug)]
+pub struct StoreLock {
+    _file: fs::File,
+    path: PathBuf,
+    created: bool,
+}
+
+impl StoreLock {
+    /// The lock file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether this start created the lock file.
+    #[must_use]
+    pub fn created(&self) -> bool {
+        self.created
+    }
+}
+
+/// Take the store's lock (see [`StoreLock`]), creating its directory as
+/// [`open_db`] would. `None` for an in-memory database.
+///
+/// # Errors
+/// [`Error::StoreInUse`] if another daemon holds it, [`Error::InsecureDbDir`], or I/O
+/// errors.
+pub fn lock_store(db: &Path) -> Result<Option<StoreLock>> {
+    if db.as_os_str() == ":memory:" {
+        return Ok(None);
+    }
+    prepare_dir(db)?;
+    let mut path = db.as_os_str().to_os_string();
+    path.push(".lock");
+    let path = PathBuf::from(path);
+    let open = |create_new: bool| {
+        let mut o = fs::OpenOptions::new();
+        o.read(true).write(true).mode(0o600);
+        if create_new {
+            o.create_new(true);
+        }
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+    };
+    let (file, created) = match open(true) {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (open(false)?, false),
+        Err(e) => return Err(e.into()),
+    };
+    let md = file.metadata()?;
+    if !md.is_file() || md.uid() != euid() {
+        return Err(Error::InsecureDbDir(path));
+    }
+    // SAFETY: flock on an fd this function owns; no pointers.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
+            Error::StoreInUse(db.to_path_buf())
+        } else {
+            e.into()
+        });
+    }
+    Ok(Some(StoreLock {
+        _file: file,
+        path,
+        created,
+    }))
+}
+
+/// Create the database directory as [`prepare_dir`] does; create the file 0600 (and
+/// tighten an existing file of ours). SQLite gives `-wal` and `-shm` the database
+/// file's mode.
+fn prepare_files(path: &Path) -> Result<()> {
+    if path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+    prepare_dir(path)?;
     let f = fs::OpenOptions::new()
         .read(true)
         .write(true)

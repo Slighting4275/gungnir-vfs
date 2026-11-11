@@ -193,18 +193,23 @@ fn run() -> Result<()> {
     // the store, no store either (DIR-A2-F01, DIR-HC-O1): the sandbox can only go in
     // after the threads exist, so it cannot be checked before the bind.
     let mut fresh = FreshStore::default();
+    let mut store_lock = None;
     let r = serve_daemon(
         &listener,
         opts.db_path,
         idle_timeout,
         opts.seccomp,
         &mut fresh,
+        &mut store_lock,
     );
     if r.is_err() {
         listener.cleanup();
         fresh.remove();
     }
-    // The lock is released when `listener` drops, after the cleanup.
+    // Both locks are released after the cleanup: the store's here, the socket's when
+    // `listener` drops. Released earlier, another daemon could take the store this
+    // start is still removing (DIR-C1-F02).
+    drop(store_lock);
     r
 }
 
@@ -215,10 +220,22 @@ fn serve_daemon(
     idle_timeout: Option<Duration>,
     seccomp: Option<SeccompMode>,
     fresh: &mut FreshStore,
+    store_lock: &mut Option<store::StoreLock>,
 ) -> Result<()> {
-    // 2. Open metadata database in WAL mode
+    // 2. Open metadata database in WAL mode, as the only daemon on it (DIR-C1-F02): the
+    // store lock comes before anything reads or writes the store, its temp ledger
+    // included, and before what this start would create is noted (a refused start must
+    // never take another daemon's new store for its own).
     let db_path = resolve_db_path(db_path)?;
-    *fresh = FreshStore::note(&db_path);
+    let new_dirs = FreshStore::missing_dirs(&db_path);
+    // A lock refused for an insecure directory leaves no empty directory of ours behind.
+    fresh.dirs.clone_from(&new_dirs);
+    *store_lock = store::lock_store(&db_path)?;
+    let new_lock = store_lock
+        .as_ref()
+        .filter(|l| l.created())
+        .map(|l| l.path().to_path_buf());
+    *fresh = FreshStore::note(&db_path, new_dirs, new_lock);
     let db = store::spawn(
         Store::open(&db_path, StoreConfig::default())?,
         DbConfig::default(),
@@ -413,12 +430,30 @@ fn serve_daemon(
 #[derive(Default)]
 struct FreshStore {
     files: Vec<PathBuf>,
+    /// The store lock file, if this start created it with the store; removed last of the
+    /// files, while the lock is still held (DIR-C1-F02).
+    lock: Option<PathBuf>,
     dirs: Vec<PathBuf>,
 }
 
 impl FreshStore {
-    /// What a start with the store at `db` would create: nothing if it exists.
-    fn note(db: &std::path::Path) -> Self {
+    /// The directories above `db` that do not exist yet, innermost first.
+    fn missing_dirs(db: &std::path::Path) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let mut d = db.parent();
+        while let Some(p) = d {
+            if p.as_os_str().is_empty() || std::fs::symlink_metadata(p).is_ok() {
+                break;
+            }
+            dirs.push(p.to_path_buf());
+            d = p.parent();
+        }
+        dirs
+    }
+
+    /// What a start with the store at `db` would create: nothing if it exists. `dirs`
+    /// were missing and `lock` was created before the store lock was taken.
+    fn note(db: &std::path::Path, dirs: Vec<PathBuf>, lock: Option<PathBuf>) -> Self {
         // The temp ledger next to the store (BC-A2-F03) and its kept file are created by
         // every start.
         let ledger = db.with_file_name("ops-pending");
@@ -430,6 +465,7 @@ impl FreshStore {
                 .collect();
             return Self {
                 files,
+                lock: None,
                 dirs: Vec::new(),
             };
         }
@@ -445,16 +481,7 @@ impl FreshStore {
             p.push(sfx);
             files.push(PathBuf::from(p));
         }
-        let mut dirs = Vec::new();
-        let mut d = db.parent();
-        while let Some(p) = d {
-            if p.as_os_str().is_empty() || std::fs::symlink_metadata(p).is_ok() {
-                break;
-            }
-            dirs.push(p.to_path_buf());
-            d = p.parent();
-        }
-        Self { files, dirs }
+        Self { files, lock, dirs }
     }
 
     /// Remove the new store, and the directories created for it if they are empty.
@@ -467,6 +494,9 @@ impl FreshStore {
             {
                 n += 1;
             }
+        }
+        if let Some(l) = &self.lock {
+            let _ = std::fs::remove_file(l);
         }
         for d in &self.dirs {
             let _ = std::fs::remove_dir(d);

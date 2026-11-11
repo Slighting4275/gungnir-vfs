@@ -177,6 +177,8 @@ pub enum Error {
     NoSocketPath,
     SocketPathTooLong(PathBuf),
     AlreadyRunning(PathBuf),
+    /// Another daemon holds the store's lock (DIR-C1-F02).
+    StoreInUse(PathBuf),
     NotASocket(PathBuf),
     InsecureSocketDir(PathBuf),
     InsecureDbDir(PathBuf),
@@ -204,6 +206,11 @@ impl fmt::Display for Error {
             Error::NoSocketPath => write!(f, "no socket path (set XDG_RUNTIME_DIR or HOME)"),
             Error::SocketPathTooLong(p) => write!(f, "socket path too long: {}", p.display()),
             Error::AlreadyRunning(p) => write!(f, "already listening on {}", p.display()),
+            Error::StoreInUse(p) => write!(
+                f,
+                "another gungnird is already using the store {}",
+                p.display()
+            ),
             Error::NotASocket(p) => write!(f, "{} exists and is not a socket", p.display()),
             Error::InsecureSocketDir(p) => write!(
                 f,
