@@ -629,6 +629,12 @@ impl Listener {
         self.path.as_deref()
     }
 
+    /// The fd of the held instance lock, if any (carried across a live upgrade).
+    #[must_use]
+    pub fn lock_fd(&self) -> Option<RawFd> {
+        self._lock.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
     /// Construct a socket-activated `Listener` around an already open `UnixListener`.
     #[must_use]
     pub fn new_socket_activated(socket: UnixListener, path: Option<PathBuf>) -> Self {
@@ -720,6 +726,62 @@ fn socket_is_live(path: &Path) -> Result<bool> {
         Some(libc::ECONNREFUSED | libc::ENOENT) => Ok(false),
         Some(e) => Err(io::Error::from_raw_os_error(e).into()),
     }
+}
+
+/// Environment of a live upgrade's new image: the fds of the locks the old image held,
+/// left open across the `execve` (BC-CM-D02). Set only by [`perform_live_upgrade`].
+pub const UPGRADE_SOCKET_LOCK_ENV: &str = "GUNGNIR_UPGRADE_SOCKET_LOCK_FD";
+/// See [`UPGRADE_SOCKET_LOCK_ENV`]: the store lock (`<db>.lock`).
+pub const UPGRADE_STORE_LOCK_ENV: &str = "GUNGNIR_UPGRADE_STORE_LOCK_FD";
+
+/// The fd number a live upgrade left in `var`, removing the variable. Call only while the
+/// process is single-threaded (start-up).
+#[must_use]
+pub fn take_upgrade_fd(var: &str) -> Option<RawFd> {
+    let v = env::var_os(var)?;
+    // SAFETY: start-up, before any thread exists; nothing reads the environment
+    // concurrently.
+    unsafe { env::remove_var(var) };
+    v.to_str()?.parse::<RawFd>().ok().filter(|fd| *fd > 2)
+}
+
+/// Adopt `fd`, inherited across a live upgrade, as the lock file `lock_path`: it must be
+/// that very file (same device and inode, a regular file of ours) and still hold the
+/// exclusive `flock` (re-taken on the same open file, which succeeds only for the holder's
+/// own open file). Never reopens the path, so there is no moment without the lock.
+///
+/// # Errors
+/// [`Error::Io`] if `fd` is not that lock, or the lock is not held through it; the fd is
+/// then left as it was.
+pub fn adopt_lock_fd(fd: RawFd, lock_path: &Path) -> Result<fs::File> {
+    let mismatch = || {
+        Error::Io(io::Error::other(format!(
+            "the lock fd {fd} inherited from a live upgrade is not {}",
+            lock_path.display()
+        )))
+    };
+    let mut st = mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat on an fd number; reads the buffer only on success.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return Err(mismatch());
+    }
+    // SAFETY: fstat succeeded.
+    let st = unsafe { st.assume_init() };
+    let md = fs::symlink_metadata(lock_path).map_err(|_| mismatch())?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG
+        || (st.st_dev, st.st_ino) != (md.dev(), md.ino())
+        || st.st_uid != euid()
+    {
+        return Err(mismatch());
+    }
+    // SAFETY: flock on a validated fd; no pointers.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(mismatch());
+    }
+    // SAFETY: fcntl on a validated fd; no pointers.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: the fd was handed to this image for exactly this; nothing else owns it.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 /// Take the single-instance lock of the socket at `path`: an exclusive non-blocking
@@ -869,7 +931,17 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     let path = socket_path_from_fd(raw_fd);
     // Refused, not served unlocked (BC-HC-F07): a daemon already holds this socket's
     // lock, or the lock cannot be taken. The socket itself is systemd's and stays.
-    let lock = path.as_deref().map(lock_socket).transpose()?;
+    // A live upgrade's new image adopts the lock its old image held (BC-CM-D02).
+    let carried = take_upgrade_fd(UPGRADE_SOCKET_LOCK_ENV);
+    let lock = match (&path, carried) {
+        (Some(p), Some(fd)) => {
+            let mut lp = OsString::from(p.as_os_str());
+            lp.push(".lock");
+            Some(adopt_lock_fd(fd, Path::new(&lp))?)
+        }
+        (Some(p), None) => Some(lock_socket(p)?),
+        (None, _) => None,
+    };
 
     // SAFETY: raw_fd is validated above.
     let socket = unsafe { UnixListener::from_raw_fd(raw_fd) };
@@ -931,7 +1003,7 @@ fn cstring(b: &[u8]) -> io::Result<CString> {
 ///
 /// # Errors
 /// Always, when it returns: why the socket could not be prepared or `execve` failed.
-pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
+pub fn perform_live_upgrade(listener: &Listener, store_lock: Option<RawFd>) -> Result<()> {
     const SD_LISTEN_FDS_START: i32 = 3;
     let exe = upgrade_exe()?;
     let c_exe = cstring(exe.as_os_str().as_bytes())?;
@@ -940,11 +1012,47 @@ pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
         .collect::<io::Result<Vec<_>>>()?;
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|s| s.as_ptr()).collect();
     argv.push(ptr::null());
+
+    let raw_fd = listener.socket.as_raw_fd();
+    // What fd 3 is now (if it is not the listener): a copy to put back, and its flags.
+    // Made first: when fd 3 is a lock (the socket's lock is opened before the bind), the
+    // copy is what carries that lock into the new image (BC-CM-D02).
+    let mut saved: Option<(OwnedFd, i32)> = None;
+    // SAFETY: fcntl on fds this process owns; no pointers.
+    let flags3 = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
+    if raw_fd != SD_LISTEN_FDS_START && flags3 >= 0 {
+        // SAFETY: as above; the result is a fresh fd owned by nobody else.
+        let copy = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_DUPFD_CLOEXEC, 4) };
+        if copy < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: just created above.
+        saved = Some((unsafe { OwnedFd::from_raw_fd(copy) }, flags3));
+    }
+    // The locks the new image adopts, at the fds they will have there.
+    let at_exec = |fd: RawFd| match &saved {
+        Some((copy, _)) if fd == SD_LISTEN_FDS_START => copy.as_raw_fd(),
+        _ => fd,
+    };
+    let locks: Vec<(&str, RawFd)> = [
+        (UPGRADE_SOCKET_LOCK_ENV, listener.lock_fd()),
+        (UPGRADE_STORE_LOCK_ENV, store_lock),
+    ]
+    .into_iter()
+    .filter_map(|(k, fd)| fd.map(|fd| (k, at_exec(fd))))
+    .collect();
+
     let mut envs = Vec::new();
     for (k, v) in env::vars_os() {
         if matches!(
             k.to_str(),
-            Some("LISTEN_FDS" | "LISTEN_PID" | "LISTEN_FDNAMES")
+            Some(
+                "LISTEN_FDS"
+                    | "LISTEN_PID"
+                    | "LISTEN_FDNAMES"
+                    | UPGRADE_SOCKET_LOCK_ENV
+                    | UPGRADE_STORE_LOCK_ENV
+            )
         ) {
             continue;
         }
@@ -957,33 +1065,41 @@ pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
     envs.push(cstring(
         format!("LISTEN_PID={}", std::process::id()).as_bytes(),
     )?);
+    for (k, fd) in &locks {
+        envs.push(cstring(format!("{k}={fd}").as_bytes())?);
+    }
     let mut envp: Vec<*const libc::c_char> = envs.iter().map(|s| s.as_ptr()).collect();
     envp.push(ptr::null());
 
-    let raw_fd = listener.socket.as_raw_fd();
-    // What fd 3 is now (if it is not the listener): a copy to put back, and its flags.
-    let mut saved: Option<(OwnedFd, i32)> = None;
-    // SAFETY: fcntl on fds this process owns; no pointers.
-    let flags3 = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
-    if raw_fd != SD_LISTEN_FDS_START {
-        if flags3 >= 0 {
-            // SAFETY: as above; the result is a fresh fd owned by nobody else.
-            let copy = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_DUPFD_CLOEXEC, 4) };
-            if copy < 0 {
-                return Err(Error::Io(io::Error::last_os_error()));
-            }
-            // SAFETY: just created above.
-            saved = Some((unsafe { OwnedFd::from_raw_fd(copy) }, flags3));
+    // From here on, every change is undone if the exec fails. The lock fds stay open
+    // across the exec (no FD_CLOEXEC): the locks are never released, so no other daemon
+    // can take them in between (BC-CM-D02).
+    let mut lock_flags: Vec<(RawFd, i32)> = Vec::new();
+    for (_, fd) in &locks {
+        // SAFETY: fcntl on fds this process owns; no pointers.
+        let f = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+        // SAFETY: as above.
+        if f < 0 || unsafe { libc::fcntl(*fd, libc::F_SETFD, f & !libc::FD_CLOEXEC) } < 0 {
+            let e = io::Error::last_os_error();
+            restore_lock_flags(&lock_flags);
+            return Err(Error::Io(e));
         }
+        lock_flags.push((*fd, f));
+    }
+    if raw_fd != SD_LISTEN_FDS_START {
         // SAFETY: dup2 onto fd 3; the new fd 3 has no FD_CLOEXEC.
         if unsafe { libc::dup2(raw_fd, SD_LISTEN_FDS_START) } < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
+            let e = io::Error::last_os_error();
+            restore_lock_flags(&lock_flags);
+            return Err(Error::Io(e));
         }
     } else if flags3 < 0
         // SAFETY: as above.
         || unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, flags3 & !libc::FD_CLOEXEC) } < 0
     {
-        return Err(Error::Io(io::Error::last_os_error()));
+        let e = io::Error::last_os_error();
+        restore_lock_flags(&lock_flags);
+        return Err(Error::Io(e));
     }
 
     eprintln!("gungnird: live upgrade: re-execing {}...", exe.display());
@@ -992,7 +1108,9 @@ pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
     unsafe { libc::execve(c_exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     let err = io::Error::last_os_error();
 
-    // Back to how it was: the listener at its own fd (CLOEXEC), fd 3 what it was.
+    // Back to how it was: the listener at its own fd (CLOEXEC), fd 3 what it was, the
+    // lock fds close-on-exec again.
+    restore_lock_flags(&lock_flags);
     // SAFETY: fcntl/dup2/close on fds this process owns.
     unsafe {
         if raw_fd == SD_LISTEN_FDS_START {
@@ -1008,6 +1126,13 @@ pub fn perform_live_upgrade(listener: &Listener) -> Result<()> {
         err.kind(),
         format!("execve {}: {err}", exe.display()),
     )))
+}
+
+fn restore_lock_flags(saved: &[(RawFd, i32)]) {
+    for (fd, f) in saved {
+        // SAFETY: fcntl on fds this process owns; no pointers.
+        unsafe { libc::fcntl(*fd, libc::F_SETFD, *f) };
+    }
 }
 
 /// A signalfd for `SIGINT` and `SIGTERM` (blocked process-wide by

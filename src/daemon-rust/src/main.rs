@@ -155,6 +155,9 @@ fn run() -> Result<()> {
     ipc::block_lifecycle_signals()?;
     // Before anything can replace the binary (BC-HC-F05).
     ipc::remember_startup_exe();
+    // The store lock a live upgrade's old image left open (BC-CM-D02); read while the
+    // process is still single-threaded.
+    let carried_store_lock = ipc::take_upgrade_fd(ipc::UPGRADE_STORE_LOCK_ENV);
 
     let opts = parse_cli_args(env::args_os()).map_err(|msg| {
         eprintln!("gungnird: error: {msg}");
@@ -201,6 +204,7 @@ fn run() -> Result<()> {
         opts.seccomp,
         &mut fresh,
         &mut store_lock,
+        carried_store_lock,
     );
     if r.is_err() {
         listener.cleanup();
@@ -221,6 +225,7 @@ fn serve_daemon(
     seccomp: Option<SeccompMode>,
     fresh: &mut FreshStore,
     store_lock: &mut Option<store::StoreLock>,
+    carried_store_lock: Option<std::os::fd::RawFd>,
 ) -> Result<()> {
     // 2. Open metadata database in WAL mode, as the only daemon on it (DIR-C1-F02): the
     // store lock comes before anything reads or writes the store, its temp ledger
@@ -230,7 +235,7 @@ fn serve_daemon(
     let new_dirs = FreshStore::missing_dirs(&db_path);
     // A lock refused for an insecure directory leaves no empty directory of ours behind.
     fresh.dirs.clone_from(&new_dirs);
-    *store_lock = store::lock_store(&db_path)?;
+    *store_lock = store::lock_store(&db_path, carried_store_lock)?;
     let new_lock = store_lock
         .as_ref()
         .filter(|l| l.created())
@@ -416,7 +421,8 @@ fn serve_daemon(
                 if let Err(e) = db.flush_and_checkpoint() {
                     eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
                 }
-                if let Err(e) = ipc::perform_live_upgrade(listener) {
+                let store_fd = store_lock.as_ref().map(store::StoreLock::fd);
+                if let Err(e) = ipc::perform_live_upgrade(listener, store_fd) {
                     eprintln!("gungnird: live upgrade failed, still serving: {e}");
                 }
             }

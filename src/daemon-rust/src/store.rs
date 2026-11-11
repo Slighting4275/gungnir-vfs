@@ -125,15 +125,23 @@ impl StoreLock {
     pub fn created(&self) -> bool {
         self.created
     }
+
+    /// The lock's fd (carried across a live upgrade, BC-CM-D02).
+    #[must_use]
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        self._file.as_raw_fd()
+    }
 }
 
 /// Take the store's lock (see [`StoreLock`]), creating its directory as
-/// [`open_db`] would. `None` for an in-memory database.
+/// [`open_db`] would. `None` for an in-memory database. `carried` is the lock's fd a live
+/// upgrade's old image left open ([`crate::ipc::UPGRADE_STORE_LOCK_ENV`]): adopted, never
+/// reopened, so the lock is held throughout the upgrade (BC-CM-D02).
 ///
 /// # Errors
-/// [`Error::StoreInUse`] if another daemon holds it, [`Error::InsecureDbDir`], or I/O
-/// errors.
-pub fn lock_store(db: &Path) -> Result<Option<StoreLock>> {
+/// [`Error::StoreInUse`] if another daemon holds it, [`Error::InsecureDbDir`], a carried
+/// fd that is not this store's lock, or I/O errors.
+pub fn lock_store(db: &Path, carried: Option<std::os::fd::RawFd>) -> Result<Option<StoreLock>> {
     if db.as_os_str() == ":memory:" {
         return Ok(None);
     }
@@ -141,6 +149,14 @@ pub fn lock_store(db: &Path) -> Result<Option<StoreLock>> {
     let mut path = db.as_os_str().to_os_string();
     path.push(".lock");
     let path = PathBuf::from(path);
+    if let Some(fd) = carried {
+        let file = crate::ipc::adopt_lock_fd(fd, &path)?;
+        return Ok(Some(StoreLock {
+            _file: file,
+            path,
+            created: false,
+        }));
+    }
     let open = |create_new: bool| {
         let mut o = fs::OpenOptions::new();
         o.read(true).write(true).mode(0o600);
