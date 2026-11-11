@@ -797,3 +797,113 @@ fn wal_checkpoint_flushes_and_truncates() -> Result<()> {
     }
     Ok(())
 }
+
+/// T-010 (PR-F008): metadata follow-ups of file ops and GIO notifications record what
+/// already happened on disk; one that waited past max_age still runs (in order), where a
+/// client's own request of the same age is answered Busy.
+#[test]
+fn follow_ups_run_even_after_waiting_past_max_age() -> Result<()> {
+    let t = TestStore::new("followups")?;
+    let store = t.open()?;
+    let h = spawn(
+        store,
+        DbConfig {
+            queue: 16,
+            max_age: Duration::from_millis(1),
+        },
+    )?;
+    let long_ago = Instant::now() - Duration::from_secs(10);
+    let run = |req: DbReq, enqueued: Instant| -> Result<DbResult> {
+        let (tx, rx) = mpsc::channel();
+        h.submit(Job {
+            req,
+            enqueued,
+            done: Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        })
+        .map_err(|_| Error::Protocol("queue full"))?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| Error::Protocol("db thread did not answer"))
+    };
+    let v = enc(&Value::String("note".into()));
+    let set = DbReq::Set(id(1), "k".into(), v.clone(), Some((b"/a".to_vec(), 1)));
+    assert_eq!(run(set, Instant::now())?, Ok(Vec::new()));
+
+    // A client's request that waited too long: shed.
+    assert_eq!(
+        run(DbReq::Get(id(1), "k".into()), long_ago)?,
+        Err(MdError::Busy)
+    );
+    // Follow-ups that waited too long: still run.
+    let copied = DbReq::Copied(id(1), id(2), b"/b".to_vec(), false);
+    assert!(
+        run(copied, long_ago)?.is_ok(),
+        "a late copy follow-up was dropped"
+    );
+    assert_eq!(
+        run(DbReq::Get(id(2), "k".into()), Instant::now())?,
+        Ok(v.clone())
+    );
+    let moved = DbReq::Moved(b"/b".to_vec(), b"/c".to_vec(), id(2));
+    assert!(
+        run(moved, long_ago)?.is_ok(),
+        "a late move follow-up was dropped"
+    );
+    let removed = DbReq::RemovedPaths(vec![(b"/c".to_vec(), false)]);
+    assert!(
+        run(removed, long_ago)?.is_ok(),
+        "a late remove follow-up was dropped"
+    );
+    assert!(run(DbReq::RemovedTree(b"/x".to_vec()), long_ago)?.is_ok());
+    assert!(run(DbReq::Removed(b"/a".to_vec(), None), long_ago)?.is_ok());
+    Ok(())
+}
+
+/// T-010: a worker's follow-up waits for room in a full queue (within its bound) rather
+/// than being dropped; past the bound it is refused.
+#[test]
+fn submit_wait_gets_room_when_the_queue_drains() -> Result<()> {
+    let t = TestStore::new("submitwait")?;
+    let h = spawn(
+        t.open()?,
+        DbConfig {
+            queue: 1,
+            max_age: Duration::from_secs(60),
+        },
+    )?;
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    h.submit(Job {
+        req: DbReq::Get(id(1), "k".into()),
+        enqueued: Instant::now(),
+        done: Box::new(move |_| {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    })
+    .map_err(|_| Error::Protocol("blocker refused"))?;
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| Error::Protocol("blocker never ran"))?;
+    let mk = || Job {
+        req: DbReq::RemovedTree(b"/x".to_vec()),
+        enqueued: Instant::now(),
+        done: Box::new(|_| {}),
+    };
+    h.submit(mk())
+        .map_err(|_| Error::Protocol("queue slot refused"))?;
+    // Full now: a short wait gives up...
+    assert_eq!(
+        h.submit_wait(mk(), Duration::from_millis(30)),
+        Err(MdError::Busy)
+    );
+    // ...and a longer one gets in once the blocker is released.
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let _ = release_tx.send(());
+    });
+    assert_eq!(h.submit_wait(mk(), Duration::from_secs(5)), Ok(()));
+    let _ = release.join();
+    Ok(())
+}

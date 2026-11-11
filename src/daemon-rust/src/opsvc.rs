@@ -74,7 +74,9 @@ impl<B: Backend> DbMeta<B> {
                 let _ = tx.try_send(r);
             }),
         };
-        if let Err(e) = self.db.submit(job) {
+        // A worker thread: it may wait for room (T-010), within the same bound as for
+        // the answer.
+        if let Err(e) = self.db.submit_wait(job, self.wait) {
             eprintln!("gungnird: file op metadata update dropped: {e}");
             return;
         }

@@ -6,7 +6,8 @@
 //! is full) and never wait for them: the job's completion callback writes the reply. A
 //! lock held by another process (a second daemon on the same file, a `sqlite3` shell)
 //! costs at most `busy_timeout` x (`busy_retries` + 1) per job and then answers Busy;
-//! jobs that sat in the queue longer than `max_age` are answered Busy without running.
+//! jobs that sat in the queue longer than `max_age` are answered Busy without running,
+//! except follow-ups ([`DbReq::is_follow_up`]), which record what already happened on disk.
 
 use std::{
     ffi::OsStr,
@@ -966,6 +967,25 @@ pub enum DbReq {
     Checkpoint,
 }
 
+impl DbReq {
+    /// A record of something that already happened on disk (a file op's or GIO's move,
+    /// copy or delete), not a question a client is waiting on. Skipping one would leave
+    /// the store disagreeing with the files: a copy without its metadata, rows of a
+    /// deleted file, a stale hint (T-010, PR-F008). So it is never aged out: the queue
+    /// is FIFO, so a late one still runs in order.
+    #[must_use]
+    pub fn is_follow_up(&self) -> bool {
+        matches!(
+            self,
+            Self::Removed(..)
+                | Self::Moved(..)
+                | Self::Copied(..)
+                | Self::RemovedTree(_)
+                | Self::RemovedPaths(_)
+        )
+    }
+}
+
 /// Reply body on success (see `md` for the layouts), or the failure status.
 pub type DbResult = std::result::Result<Vec<u8>, MdError>;
 
@@ -1009,6 +1029,29 @@ impl DbHandle {
         match self.tx.try_send(job) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(MdError::Busy),
+        }
+    }
+
+    /// [`submit`](Self::submit), but waiting up to `wait` for room while the queue is
+    /// full. Only for threads that may wait (file-op workers), never a ring thread.
+    ///
+    /// # Errors
+    /// [`MdError::Busy`] if the queue stays full for `wait`, or the thread is gone.
+    pub fn submit_wait(&self, job: Job, wait: Duration) -> std::result::Result<(), MdError> {
+        let deadline = Instant::now() + wait;
+        let mut job = job;
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(MdError::Busy),
+                Err(TrySendError::Full(j)) => {
+                    if Instant::now() >= deadline {
+                        return Err(MdError::Busy);
+                    }
+                    job = j;
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
         }
     }
 
@@ -1072,6 +1115,7 @@ fn db_thread(mut store: Store, rx: &Receiver<Job>, max_age: Duration) {
     while let Ok(job) = rx.recv() {
         let r = if job.enqueued.elapsed() > max_age
             && !matches!(job.req, DbReq::Purge(_) | DbReq::Checkpoint)
+            && !job.req.is_follow_up()
         {
             Err(MdError::Busy)
         } else {
