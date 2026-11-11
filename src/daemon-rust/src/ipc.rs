@@ -617,6 +617,9 @@ pub struct Listener {
     pub path: Option<PathBuf>,
     pub socket_activated: bool,
     _lock: Option<fs::File>,
+    /// Device and inode of the socket file this daemon bound (BC-HC-F07): its path is
+    /// unlinked on exit only while it is still that file, never another daemon's.
+    bound: Option<(u64, u64)>,
 }
 
 impl Listener {
@@ -634,13 +637,21 @@ impl Listener {
             path,
             socket_activated: true,
             _lock: None,
+            bound: None,
         }
     }
 
-    /// Clean up the socket file if this daemon bound it directly and not via socket activation.
+    /// Remove the socket file if this daemon bound it itself (not socket activation) and
+    /// the path is still that file (BC-HC-F07): a socket another daemon bound there since,
+    /// after this one's was removed or replaced, is left alone.
     pub fn cleanup(&self) {
-        if !self.socket_activated
-            && let Some(path) = &self.path
+        if self.socket_activated {
+            return;
+        }
+        if let (Some(path), Some(bound)) = (&self.path, self.bound)
+            && let Ok(md) = fs::symlink_metadata(path)
+            && md.file_type().is_socket()
+            && (md.dev(), md.ino()) == bound
         {
             let _ = fs::remove_file(path);
         }
@@ -711,6 +722,35 @@ fn socket_is_live(path: &Path) -> Result<bool> {
     }
 }
 
+/// Take the single-instance lock of the socket at `path`: an exclusive non-blocking
+/// `flock` on `<path>.lock` (0600). Both ways of starting take it, and both refuse to
+/// serve without it (BC-HC-F07).
+///
+/// # Errors
+/// [`Error::AlreadyRunning`] if another daemon holds it, or I/O errors.
+fn lock_socket(path: &Path) -> Result<fs::File> {
+    let mut lock_path = OsString::from(path.as_os_str());
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)?;
+    // SAFETY: flock on an fd this function owns; no pointers.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::WouldBlock {
+            Err(Error::AlreadyRunning(path.to_path_buf()))
+        } else {
+            Err(e.into())
+        };
+    }
+    Ok(lock)
+}
+
 /// Bind the control socket, creating its directory (0700) and checking an existing one.
 /// An exclusive `flock` on `<socket>.lock` serialises daemon start-up, so two daemons
 /// starting at once can never unlink each other's socket. A stale socket left by a dead
@@ -729,24 +769,7 @@ pub fn bind(path: &Path) -> Result<Listener> {
         .mode(0o700)
         .create(dir)?;
     check_socket_dir(dir)?;
-
-    let mut lock_path = OsString::from(path.as_os_str());
-    lock_path.push(".lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        let e = io::Error::last_os_error();
-        return if e.kind() == io::ErrorKind::WouldBlock {
-            Err(Error::AlreadyRunning(path.to_path_buf()))
-        } else {
-            Err(e.into())
-        };
-    }
+    let lock = lock_socket(path)?;
 
     match fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_socket() => {
@@ -762,11 +785,13 @@ pub fn bind(path: &Path) -> Result<Listener> {
     let socket = UnixListener::bind(path)?;
     socket.set_nonblocking(true)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let md = fs::symlink_metadata(path)?;
     Ok(Listener {
         socket,
         path: Some(path.to_path_buf()),
         socket_activated: false,
         _lock: Some(lock),
+        bound: Some((md.dev(), md.ino())),
     })
 }
 
@@ -842,29 +867,9 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     }
 
     let path = socket_path_from_fd(raw_fd);
-    let lock = if let Some(p) = &path {
-        let mut lock_path = OsString::from(p.as_os_str());
-        lock_path.push(".lock");
-        if let Ok(lock_file) = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-        {
-            // SAFETY: flock non-blocking lock attempt on valid fd.
-            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                Some(lock_file)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Refused, not served unlocked (BC-HC-F07): a daemon already holds this socket's
+    // lock, or the lock cannot be taken. The socket itself is systemd's and stays.
+    let lock = path.as_deref().map(lock_socket).transpose()?;
 
     // SAFETY: raw_fd is validated above.
     let socket = unsafe { UnixListener::from_raw_fd(raw_fd) };
@@ -875,6 +880,7 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
         path,
         socket_activated: true,
         _lock: lock,
+        bound: None,
     }))
 }
 
