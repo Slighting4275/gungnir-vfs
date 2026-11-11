@@ -7,6 +7,14 @@
 //! Non-blocking rule: all mount and volume information is read from /proc/self/mountinfo
 //! (procfs-only, no syscall on underlying or remote filesystems). Mount health states from
 //! health.zig flag hung or gone network/FUSE mounts.
+//!
+//! Change signals (BC-HC-F01c): the monitor watches /proc/self/mountinfo, whose fd the
+//! kernel marks with POLLPRI on every mount table change, through a GLib fd source on
+//! the main context the monitor was created on (no polling, no thread). On a change it
+//! re-reads mountinfo, lists the mounts the display rule keeps (mountfilter.zig), and
+//! emits mount-removed/volume-removed and volume-added/mount-added on that context for
+//! the difference; unchanged mounts keep their objects. While the watch runs, only it
+//! refreshes the cached list, so a getter racing a change can never swallow its signal.
 const std = @import("std");
 const c = @import("c");
 const mountfilter = @import("mountfilter.zig");
@@ -328,6 +336,12 @@ pub const GungnirVolumeMonitor = extern struct {
     mounts: ?*c.GList,
     last: [*c]u8,
     last_len: c.gsize,
+    /// The mountinfo watch (BC-HC-F01c) and the context it is attached to; null if
+    /// mountinfo could not be watched (then getters refresh the list themselves).
+    watch: ?*c.GSource,
+    watch_ctx: ?*c.GMainContext,
+    /// The watched mountinfo fd (GLib's fd source does not own it), -1 if none.
+    watch_fd: c.gint,
 };
 
 pub const GungnirVolumeMonitorClass = extern struct {
@@ -461,6 +475,13 @@ fn refObject(src: c.gconstpointer, data: c.gpointer) callconv(.c) c.gpointer {
 /// the cached objects while mountinfo is unchanged, else freshly parsed ones.
 fn currentMounts(monitor: [*c]c.GVolumeMonitor) ?*c.GList {
     const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(monitor orelse return null));
+    c.g_mutex_lock(&self.lock);
+    if (self.watch != null) {
+        // The watch keeps the list current, and signals each change (BC-HC-F01c).
+        defer c.g_mutex_unlock(&self.lock);
+        return c.g_list_copy_deep(self.mounts, &refObject, null);
+    }
+    c.g_mutex_unlock(&self.lock);
     var raw: [*c]u8 = null;
     var len: c.gsize = 0;
     if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return null;
@@ -536,10 +557,129 @@ fn monitorGetVolumeForUuid(monitor: [*c]c.GVolumeMonitor, uuid_c: [*c]const u8) 
     return null;
 }
 
+// ---- Change signals (BC-HC-F01c) -----------------------------------------------
+
+/// Same mount for the change signals: same mount point and filesystem type.
+fn sameMount(a: *const GungnirMount, b: *const GungnirMount) bool {
+    return std.mem.eql(u8, std.mem.sliceTo(&a.mount_point, 0), std.mem.sliceTo(&b.mount_point, 0)) and
+        std.mem.eql(u8, std.mem.sliceTo(&a.fstype, 0), std.mem.sliceTo(&b.fstype, 0));
+}
+
+fn findMount(list: ?*c.GList, m: *const GungnirMount) ?*c.GList {
+    var it = list;
+    while (it) |node| : (it = node.*.next) {
+        const other: *const GungnirMount = @ptrCast(@alignCast(node.*.data));
+        if (sameMount(other, m)) return node;
+    }
+    return null;
+}
+
+/// Re-read mountinfo and emit the signals for what changed; runs on the watch's context.
+fn refreshAndSignal(self: *GungnirVolumeMonitor) void {
+    var raw: [*c]u8 = null;
+    var len: c.gsize = 0;
+    if (c.g_file_get_contents("/proc/self/mountinfo", &raw, &len, null) == 0) return;
+    var removed: ?*c.GList = null; // strong refs, emitted after the lock is released
+    var added: ?*c.GList = null;
+    {
+        c.g_mutex_lock(&self.lock);
+        defer c.g_mutex_unlock(&self.lock);
+        if (self.last != null and self.last_len == len and std.mem.eql(u8, self.last[0..self.last_len], raw[0..len])) {
+            c.g_free(raw);
+            return;
+        }
+        var fresh: ?*c.GList = mountsFrom(raw[0..len]) catch null;
+        // Keep the old object of every mount still there; the new one goes.
+        var it = fresh;
+        while (it) |node| : (it = node.*.next) {
+            const m: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+            if (findMount(self.mounts, m)) |old| {
+                c.g_object_unref(@ptrCast(m));
+                node.*.data = c.g_object_ref(old.*.data);
+            } else {
+                added = c.g_list_prepend(added, c.g_object_ref(@ptrCast(m)));
+            }
+        }
+        var o = self.mounts;
+        while (o) |node| : (o = node.*.next) {
+            const m: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+            if (findMount(fresh, m) == null) removed = c.g_list_prepend(removed, c.g_object_ref(@ptrCast(m)));
+        }
+        c.g_list_free_full(self.mounts, @ptrCast(&c.g_object_unref));
+        self.mounts = fresh;
+        fresh = null;
+        c.g_free(self.last);
+        self.last = raw;
+        self.last_len = len;
+    }
+    const vm: ?*anyopaque = @ptrCast(self);
+    const removed_in_order = c.g_list_reverse(removed);
+    defer c.g_list_free_full(removed_in_order, @ptrCast(&c.g_object_unref));
+    const added_in_order = c.g_list_reverse(added);
+    defer c.g_list_free_full(added_in_order, @ptrCast(&c.g_object_unref));
+    var r = removed_in_order;
+    while (r) |node| : (r = node.*.next) {
+        const m: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+        c.g_signal_emit_by_name(@ptrCast(m), "unmounted");
+        c.g_signal_emit_by_name(vm, "mount-removed", m);
+        if (m.volume) |v| {
+            c.g_signal_emit_by_name(@ptrCast(v), "removed");
+            c.g_signal_emit_by_name(vm, "volume-removed", v);
+        }
+    }
+    var a = added_in_order;
+    while (a) |node| : (a = node.*.next) {
+        const m: *GungnirMount = @ptrCast(@alignCast(node.*.data));
+        if (m.volume) |v| c.g_signal_emit_by_name(vm, "volume-added", v);
+        c.g_signal_emit_by_name(vm, "mount-added", m);
+    }
+}
+
+/// The kernel flagged /proc/self/mountinfo (POLLPRI): the mount table changed.
+fn onMountinfo(fd: c.gint, cond: c.GIOCondition, data: c.gpointer) callconv(.c) c.gboolean {
+    _ = fd;
+    _ = cond;
+    // gboolean values: GLib's G_SOURCE_* macros translate to bool.
+    const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(data orelse return 0)); // G_SOURCE_REMOVE
+    refreshAndSignal(self);
+    return 1; // G_SOURCE_CONTINUE
+}
+
+/// Watch /proc/self/mountinfo on the caller's thread-default context.
+fn startWatch(self: *GungnirVolumeMonitor) void {
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd: c.gint = @intCast(rc);
+    const src = c.g_unix_fd_source_new(fd, c.G_IO_PRI | c.G_IO_ERR) orelse {
+        _ = linux.close(fd);
+        return;
+    };
+    c.g_source_set_callback(src, @ptrCast(&onMountinfo), @ptrCast(self), null);
+    c.g_source_set_static_name(src, "gungnir-mountinfo");
+    const ctx = c.g_main_context_ref_thread_default();
+    _ = c.g_source_attach(src, ctx);
+    self.watch = src;
+    self.watch_ctx = ctx;
+    self.watch_fd = fd;
+}
+
+fn stopWatch(self: *GungnirVolumeMonitor) void {
+    const src = self.watch orelse return;
+    self.watch = null;
+    c.g_source_destroy(src);
+    c.g_source_unref(src);
+    if (self.watch_fd >= 0) _ = std.os.linux.close(self.watch_fd);
+    self.watch_fd = -1;
+    if (self.watch_ctx) |ctx| c.g_main_context_unref(ctx);
+    self.watch_ctx = null;
+}
+
 var monitor_parent_class: ?*c.GObjectClass = null;
 
 fn monitorFinalize(obj: [*c]c.GObject) callconv(.c) void {
     const self: *GungnirVolumeMonitor = @ptrCast(@alignCast(obj));
+    stopWatch(self);
     c.g_list_free_full(self.mounts, @ptrCast(&c.g_object_unref));
     self.mounts = null;
     c.g_free(self.last);
@@ -574,6 +714,13 @@ fn monitorInstanceInit(instance: [*c]c.GTypeInstance, g_class: c.gpointer) callc
     self.mounts = null;
     self.last = null;
     self.last_len = 0;
+    self.watch = null;
+    self.watch_ctx = null;
+    self.watch_fd = -1;
+    // The baseline the first change is compared with, then the watch (BC-HC-F01c).
+    const m: [*c]c.GVolumeMonitor = @ptrCast(@alignCast(instance));
+    c.g_list_free_full(currentMounts(m), @ptrCast(&c.g_object_unref));
+    startWatch(self);
 }
 
 const monitor_type_info = c.GTypeInfo{

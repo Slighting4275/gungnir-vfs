@@ -2161,6 +2161,166 @@ fn runVolmon(tmp_arg: [*c]u8) c_int {
     return 0;
 }
 
+// ---- volmon-signals (BC-HC-F01c) ----------------------------------------------------
+
+/// What the change-signal handlers saw: Gungnir mounts only, by root path.
+const SignalLog = struct {
+    added: [8][256]u8 = undefined,
+    n_added: usize = 0,
+    removed: [8][256]u8 = undefined,
+    n_removed: usize = 0,
+    other: usize = 0,
+
+    fn has(paths: []const [256]u8, want: []const u8) bool {
+        for (paths) |*p| {
+            if (std.mem.eql(u8, std.mem.sliceTo(p, 0), want)) return true;
+        }
+        return false;
+    }
+};
+
+fn record(into: *[8][256]u8, n: *usize, other: *usize, mount: ?*c.GMount) void {
+    const m = mount orelse return;
+    const name = c.g_type_name_from_instance(@ptrCast(@alignCast(m)));
+    if (name == null or !std.mem.startsWith(u8, std.mem.span(name), "Gungnir")) {
+        other.* += 1;
+        return;
+    }
+    const root = c.g_mount_get_root(m) orelse return;
+    defer c.g_object_unref(root);
+    const path = c.g_file_get_path(root) orelse return;
+    defer c.g_free(path);
+    if (n.* >= into.len) return;
+    const p = std.mem.span(path);
+    const k = @min(p.len, into[n.*].len - 1);
+    @memcpy(into[n.*][0..k], p[0..k]);
+    into[n.*][k] = 0;
+    n.* += 1;
+}
+
+fn onMountAdded(vm: ?*c.GVolumeMonitor, mount: ?*c.GMount, data: c.gpointer) callconv(.c) void {
+    _ = vm;
+    const log: *SignalLog = @ptrCast(@alignCast(data orelse return));
+    record(&log.added, &log.n_added, &log.other, mount);
+}
+
+fn onMountRemoved(vm: ?*c.GVolumeMonitor, mount: ?*c.GMount, data: c.gpointer) callconv(.c) void {
+    _ = vm;
+    const log: *SignalLog = @ptrCast(@alignCast(data orelse return));
+    record(&log.removed, &log.n_removed, &log.other, mount);
+}
+
+/// Run `argv` (mount/umount/mkdir inside the fixture namespace); true on exit 0.
+fn sh(argv: []const [*:0]const u8) bool {
+    var a: [8][*c]u8 = undefined;
+    if (argv.len + 1 > a.len) return false;
+    for (argv, 0..) |x, i| a[i] = @constCast(x);
+    a[argv.len] = null;
+    var status: c_int = 0;
+    if (c.g_spawn_sync(null, &a, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, &status, null) == 0) return false;
+    return c.g_spawn_check_wait_status(status, null) != 0;
+}
+
+/// Iterate the default context until `done` or `ms` pass; the elapsed ms.
+fn pumpUntil(log: *const SignalLog, done: *const fn (*const SignalLog) bool, ms: i64) i64 {
+    const t0 = c.g_get_monotonic_time();
+    while (!done(log)) {
+        const el = @divTrunc(c.g_get_monotonic_time() - t0, 1000);
+        if (el >= ms) return el;
+        if (c.g_main_context_iteration(null, 0) == 0) c.g_usleep(500);
+    }
+    return @divTrunc(c.g_get_monotonic_time() - t0, 1000);
+}
+
+fn addedNew(log: *const SignalLog) bool {
+    return SignalLog.has(log.added[0..log.n_added], "/run/media/new");
+}
+
+fn removedNew(log: *const SignalLog) bool {
+    return SignalLog.has(log.removed[0..log.n_removed], "/run/media/new");
+}
+
+fn never(_: *const SignalLog) bool {
+    return false;
+}
+
+/// The Gungnir mount object at `path` in `vm`'s list, unreferenced (still owned by the
+/// monitor's cache), or null.
+fn mountObjectAt(vm: *c.GVolumeMonitor, path: []const u8) ?*anyopaque {
+    const list = c.g_volume_monitor_get_mounts(vm);
+    defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
+    var it: ?*c.GList = list;
+    while (it) |node| : (it = node.*.next) {
+        const m: *c.GMount = @ptrCast(@alignCast(node.*.data));
+        const root = c.g_mount_get_root(m) orelse continue;
+        defer c.g_object_unref(root);
+        const p = c.g_file_get_path(root) orelse continue;
+        defer c.g_free(p);
+        if (std.mem.eql(u8, std.mem.span(p), path)) return @ptrCast(m);
+    }
+    return null;
+}
+
+/// Bound for one change signal: the stock GLib monitor answers in 3-22 ms (BC); a
+/// POLLPRI wake plus one mountinfo read must stay well under a second.
+const signal_bound_ms = 1000;
+
+/// volmon-signals (BC-HC-F01c): with GIO_USE_VOLUME_MONITOR=gungnir, plugging in and
+/// removing storage the display rule keeps emits mount-added/mount-removed on the
+/// monitor's context; hidden mounts emit nothing; unchanged mounts keep their objects;
+/// an idle monitor does not poll. Needs the namespace fixture (it mounts and unmounts).
+fn runVolmonSignals(tmp_arg: [*c]u8) c_int {
+    _ = tmp_arg;
+    if (!volmon_fixture) {
+        std.debug.print("gungnir itest volmon-signals: no namespace fixture; nothing to mount, skipped\n", .{});
+        return 0;
+    }
+    if (c.g_setenv("GIO_USE_VOLUME_MONITOR", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VOLUME_MONITOR");
+    const vm = c.g_volume_monitor_get() orelse return fail("no volume monitor");
+    defer c.g_object_unref(vm);
+    var log: SignalLog = .{};
+    _ = c.g_signal_connect_data(@ptrCast(vm), "mount-added", @ptrCast(&onMountAdded), &log, null, 0);
+    _ = c.g_signal_connect_data(@ptrCast(vm), "mount-removed", @ptrCast(&onMountRemoved), &log, null, 0);
+    const stick_before = mountObjectAt(vm, fixture_mount) orelse return fail("the fixture stick is not listed");
+    while (c.g_main_context_iteration(null, 0) != 0) {}
+
+    // No polling: an idle monitor dispatches (almost) nothing.
+    var dispatched: usize = 0;
+    const idle0 = c.g_get_monotonic_time();
+    while (c.g_get_monotonic_time() - idle0 < 300_000) {
+        if (c.g_main_context_iteration(null, 0) != 0) dispatched += 1 else c.g_usleep(1000);
+    }
+    if (dispatched > 2) return fail("the idle monitor keeps dispatching (busy polling)");
+
+    // KEEP: a removable drive appears. A getter right after the mount must not swallow
+    // the signal.
+    if (!sh(&.{ "mkdir", "-p", "/run/media/new" }) or !sh(&.{ "mount", "-t", "ramfs", "gungnir-new", "/run/media/new" }))
+        return fail("could not mount the new drive in the fixture");
+    c.g_list_free_full(c.g_volume_monitor_get_mounts(vm), @ptrCast(&c.g_object_unref));
+    const t_add = pumpUntil(&log, &addedNew, signal_bound_ms);
+    if (!addedNew(&log)) return fail("no mount-added for /run/media/new within the bound");
+    std.debug.print("gungnir itest volmon-signals: mount-added after {d} ms\n", .{t_add});
+    if (mountObjectAt(vm, fixture_mount) != stick_before) return fail("an unchanged mount got a new object");
+
+    // DROP: mounts the display rule hides emit nothing.
+    const before_drop = log.n_added + log.n_removed;
+    if (!sh(&.{ "mkdir", "-p", "/run/media/hidden", "/run/media/.dot" }) or
+        !sh(&.{ "mount", "-t", "tmpfs", "gungnir-hidden", "/run/media/hidden" }) or
+        !sh(&.{ "mount", "-t", "ramfs", "gungnir-dot", "/run/media/.dot" }))
+        return fail("could not mount the hidden fixtures");
+    _ = pumpUntil(&log, &never, 300);
+    if (log.n_added + log.n_removed != before_drop) return fail("a hidden mount emitted a change signal");
+
+    // KEEP: the drive goes away.
+    if (!sh(&.{ "umount", "/run/media/new" })) return fail("could not unmount the new drive");
+    const t_rm = pumpUntil(&log, &removedNew, signal_bound_ms);
+    if (!removedNew(&log)) return fail("no mount-removed for /run/media/new within the bound");
+    std.debug.print("gungnir itest volmon-signals: mount-removed after {d} ms\n", .{t_rm});
+    if (mountObjectAt(vm, "/run/media/new") != null) return fail("the removed drive is still listed");
+    if (log.n_added != 1 or log.n_removed != 1) return fail("unexpected extra change signals");
+    return 0;
+}
+
 /// The line gio-querymodules must write for the module: every extension point it
 /// implements, so an installed module is loaded for the volume monitor too.
 const cache_line = "libgiogungnir.so: gio-vfs,gio-native-volume-monitor";
@@ -2430,7 +2590,9 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (argc < 3) return fail("usage: gungnir-itest <module-dir> <mode> [args]");
     const mode = std.mem.span(argv[2]);
     volmon_fixture = c.g_getenv(fixture_env) != null;
-    if (!volmon_fixture and (std.mem.eql(u8, mode, "volmon") or std.mem.eql(u8, mode, "volmon-installed"))) {
+    if (!volmon_fixture and (std.mem.eql(u8, mode, "volmon") or std.mem.eql(u8, mode, "volmon-installed") or
+        std.mem.eql(u8, mode, "volmon-signals")))
+    {
         if (rerunWithFixture(argc, argv)) |rc| return rc;
     }
 
@@ -2477,5 +2639,6 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     }
     if (std.mem.eql(u8, mode, "volmon") and argc == 4) return runVolmon(argv[3]);
     if (std.mem.eql(u8, mode, "volmon-off") and argc == 4) return runVolmonOff(argv[3]);
+    if (std.mem.eql(u8, mode, "volmon-signals") and argc == 4) return runVolmonSignals(argv[3]);
     return fail("unknown mode or wrong argument count");
 }

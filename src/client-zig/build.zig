@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // @cImport is gone on Zig master: translate the GIO headers in the build graph.
     // The one-line umbrella header is generated here, not committed as a .h file.
-    const header = b.addWriteFiles().add("gungnir_c.h", "#include <gio/gio.h>\n");
+    const header = b.addWriteFiles().add("gungnir_c.h", "#include <gio/gio.h>\n#include <glib-unix.h>\n");
     const translate = b.addTranslateC(.{
         .root_source_file = header,
         .target = target,
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     // Gungnir mounts with no env or GIO_USE_VFS only, one per mount point with
     // GIO_USE_VOLUME_MONITOR=gungnir (BC-HC-F01 v2, D-051).
     const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris", "volmon", "volmon-off", "volmon-installed" }) |mode| {
+    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris", "volmon", "volmon-off", "volmon-installed", "volmon-signals" }) |mode| {
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());
