@@ -43,6 +43,13 @@ impl Gate for MonitorGate {
     fn mount_of(&self, path: &[u8]) -> Option<PathBuf> {
         self.0.lookup(path).map(|r| r.hint.mount_point)
     }
+
+    fn gone(&self, mount_point: &[u8]) -> bool {
+        self.0.lookup(mount_point).is_some_and(|r| {
+            matches!(r.state, crate::health::Health::Gone)
+                && r.hint.mount_point.as_os_str().as_bytes() == mount_point
+        })
+    }
 }
 
 /// Metadata follows the files: identities through the M4 resolver (its deadline and the

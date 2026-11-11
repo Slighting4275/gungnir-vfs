@@ -278,6 +278,31 @@ fn mount_of<'a>(tops: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
         .max_by_key(|t| t.components().count())
 }
 
+/// The mount points of a `/proc/self/mountinfo` text whose topmost mount is FUSE: a FUSE
+/// mount found gone has lost its server for good (a remount is a new mount), so it can
+/// hold no trash anyone can reach again.
+fn fuse_mounts(text: &str) -> Vec<PathBuf> {
+    let mut top: Vec<(PathBuf, bool)> = Vec::new();
+    for line in text.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(raw) = left.split(' ').nth(4) else {
+            continue;
+        };
+        let fstype = right.split(' ').next().unwrap_or("");
+        let fuse = fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.");
+        let p = PathBuf::from(std::ffi::OsString::from_vec(unescape(raw.as_bytes())));
+        // A later line mounted over the same point: it is what the path reaches now.
+        top.retain(|(q, _)| *q != p);
+        top.push((p, fuse));
+    }
+    top.into_iter()
+        .filter(|(_, f)| *f)
+        .map(|(p, _)| p)
+        .collect()
+}
+
 /// The mount points of a `/proc/self/mountinfo` text that are btrfs: opening anything
 /// else to find out would touch mounts that may hang.
 fn btrfs_mounts(text: &str) -> Vec<PathBuf> {
@@ -492,7 +517,14 @@ impl Svc {
         }
         tops.extend(below);
         tops.extend(subvols);
+        let fuse = fuse_mounts(&table);
         for top in tops {
+            // A FUSE mount whose server is gone can never be read again (a stale AppImage
+            // mount, say): no trash there to miss, so it does not make listings partial.
+            // Hung mounts, and network mounts that may come back, still do.
+            if fuse.contains(&top) && self.ops.gone(top.as_os_str().as_bytes()) {
+                continue;
+            }
             if self.blocked(&top) {
                 // Only a volume with a trash matters, and asking would touch it: a hung
                 // mount from the mount table is named, as it may hold one.
@@ -1264,6 +1296,25 @@ impl Session for VfsSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuse_mounts_are_the_topmost_fuse_ones() {
+        let table = "1 0 0:1 / / rw - btrfs /dev/sda2 rw\n\
+            2 1 0:2 / /tmp/.mount_app rw - fuse.app app ro\n\
+            3 1 0:3 / /home/u/remote rw - fuse.sshfs h:/ rw\n\
+            4 1 0:4 / /mnt/x rw - fuse dead rw\n\
+            5 4 0:5 / /mnt/x rw - ext4 /dev/sdb1 rw\n\
+            6 1 0:6 / /m\\040n rw - fuseblk /dev/sdc1 rw\n";
+        let got = fuse_mounts(table);
+        assert_eq!(
+            got,
+            [
+                PathBuf::from("/tmp/.mount_app"),
+                PathBuf::from("/home/u/remote"),
+                PathBuf::from("/m n"),
+            ]
+        );
+    }
 
     /// A mount nested in a snapshot is not the snapshot: home on it says nothing of that.
     #[test]

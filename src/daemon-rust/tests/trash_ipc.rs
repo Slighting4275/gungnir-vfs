@@ -921,3 +921,82 @@ fn a_restore_destination_with_dot_components_is_refused() -> R {
     }
     Ok(())
 }
+
+/// One page of the trash list: its items and whether it may be incomplete (body byte 6,
+/// set when a volume could not be looked at).
+fn list_page(c: &mut Client) -> R<(u16, bool)> {
+    let mut p = vec![SCHEME_TRASH];
+    p.extend_from_slice(&0u32.to_le_bytes());
+    let (st, body) = call(c, MSG_VFS_LIST, &p)?;
+    assert_eq!(st, ST_OK, "list");
+    Ok((u16::from_le_bytes(body[4..6].try_into()?), body[6] != 0))
+}
+
+/// A FUSE mount whose server is gone (a stale AppImage mount, say) can never be read
+/// again: the trash listing leaves it out and stays complete, instead of ending every
+/// listing with an error. The daemon runs in a user+mount namespace holding such a mount.
+#[test]
+fn a_dead_fuse_mount_does_not_make_the_trash_listing_incomplete() -> R {
+    let d = Dir::new("deadfuse")?;
+    let t = trash_dir(&d)?;
+    trashed(&t, "item", &d.join("orig"))?;
+    let dead = d.join("dead");
+    let sock = d.join("s.sock");
+    let script = "mkdir -p \"$1\" || exit 9; exec 3<>/dev/fuse || exit 9; \
+        mount -i -t fuse.dead -o fd=3,rootmode=40000,user_id=0,group_id=0 dead \"$1\" || exit 9; \
+        exec 3>&-; shift; exec \"$@\"";
+    let mut child = Command::new("unshare")
+        .args(["-Urm", "--propagation", "private", "sh", "-c", script, "sh"])
+        .arg(&dead)
+        .arg(env!("CARGO_BIN_EXE_gungnird"))
+        .arg("--seccomp")
+        .arg("-s")
+        .arg(&sock)
+        .arg("-d")
+        .arg(d.join("data/gungnir/metadata.db"))
+        .env("HOME", &d.0)
+        .env("XDG_DATA_HOME", d.join("data"))
+        .env_remove("GUNGNIR_SECCOMP")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(d.join("log"))?)
+        .spawn()?;
+    let t0 = Instant::now();
+    while !sock.exists() {
+        if let Some(st) = child.try_wait()? {
+            eprintln!("note: no user+mount namespace with FUSE here ({st}); skipped");
+            return Ok(());
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            return Err("gungnird did not start".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // The health monitor probes FUSE mounts: wait until it has found this one gone.
+    let gone = || {
+        fs::read_to_string(d.join("log"))
+            .is_ok_and(|l| l.contains(&format!("{} (fuse) Healthy -> Gone", dead.display())))
+    };
+    while !gone() {
+        if t0.elapsed() > Duration::from_secs(15) {
+            let _ = child.kill();
+            return Err(format!(
+                "the dead mount was never seen gone\n{}",
+                fs::read_to_string(d.join("log"))?
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut c = Client::connect(&sock, Duration::from_secs(5))?;
+    let (n, partial) = list_page(&mut c)?;
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(n, 1, "the trashed item is listed");
+    assert!(
+        !partial,
+        "a dead FUSE mount made the trash listing incomplete"
+    );
+    Ok(())
+}

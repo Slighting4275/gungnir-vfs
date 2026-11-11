@@ -474,6 +474,11 @@ pub trait Gate: Send + Sync {
     fn blocking(&self, path: &[u8]) -> Option<PathBuf>;
     /// The mount point `path` is on (to mark it suspect after a timeout).
     fn mount_of(&self, path: &[u8]) -> Option<PathBuf>;
+    /// `mount_point` is itself a mount whose health monitor found it gone (not merely
+    /// hung or suspect). Without health information, never.
+    fn gone(&self, _mount_point: &[u8]) -> bool {
+        false
+    }
 }
 
 /// No health information: nothing is refused, timeouts mark nothing.
@@ -899,6 +904,12 @@ impl Ops {
     #[must_use]
     pub fn blocked(&self, path: &[u8]) -> Option<PathBuf> {
         self.sh.blocked(path)
+    }
+
+    /// See [`Gate::gone`].
+    #[must_use]
+    pub fn gone(&self, mount_point: &[u8]) -> bool {
+        self.sh.gate.gone(mount_point)
     }
 
     /// Queue an op. Paths on hung, gone or suspect mounts and a full queue are refused
