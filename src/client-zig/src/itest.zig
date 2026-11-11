@@ -806,6 +806,87 @@ fn onChanged(m: ?*c.GFileMonitor, f: ?*c.GFile, o: ?*c.GFile, e: c.GFileMonitorE
     s.hits += 1;
 }
 
+/// The note of `f` (`metadata::note`), g_free it; null if it has none.
+fn noteOf(f: *c.GFile) [*c]u8 {
+    const info = c.g_file_query_info(f, "metadata::note", c.G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, null, null) orelse return null;
+    defer c.g_object_unref(info);
+    const v = c.g_file_info_get_attribute_string(info, "metadata::note");
+    return if (v != null) c.g_strdup(v) else null;
+}
+
+fn inodeOf(f: *c.GFile) u64 {
+    const info = c.g_file_query_info(f, "unix::inode", c.G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, null, null) orelse return 0;
+    defer c.g_object_unref(info);
+    return c.g_file_info_get_attribute_uint64(info, "unix::inode");
+}
+
+fn noteIs(f: *c.GFile, want: []const u8) bool {
+    const n = noteOf(f);
+    defer c.g_free(n);
+    return n != null and std.mem.eql(u8, std.mem.span(n), want);
+}
+
+/// trash-metadata (M9-F02, T-010): a file's metadata survives the trash and a restore by
+/// g_file_move from its trash item, as `gio move` (always OVERWRITE) and file managers
+/// do it; the file comes back by rename, the same inode. A taken destination without
+/// OVERWRITE is EXISTS, both files untouched. The item URI is built, not listed, so a
+/// hung volume elsewhere cannot fail the listing.
+fn checkTrashMetadata(ctx: *Ctx) ?[*:0]const u8 {
+    const data = c.g_getenv("XDG_DATA_HOME") orelse return "XDG_DATA_HOME is not set";
+    const files = c.g_build_filename(data, "Trash", "files", @as([*c]const u8, null));
+    defer c.g_free(files);
+    const path = tmpPath(ctx.tmp_dir, "note.txt");
+    defer c.g_free(path);
+    defer removeFile(path);
+    const f = c.g_file_new_for_path(path) orelse return "no GFile";
+    defer c.g_object_unref(f);
+    const item = c.g_file_new_for_uri("trash:///h-note.txt") orelse return "no trash item GFile";
+    defer c.g_object_unref(item);
+    const in_trash = c.g_build_filename(files, "note.txt", @as([*c]const u8, null));
+    defer c.g_free(in_trash);
+
+    if (c.g_file_set_contents(path, "hello", -1, null) == 0) return "could not write the file";
+    if (c.g_file_set_attribute_string(f, "metadata::note", "keep me", c.G_FILE_QUERY_INFO_NONE, null, null) == 0)
+        return "could not set metadata::note";
+    if (!noteIs(f, "keep me")) return "metadata::note did not stick";
+    const ino = inodeOf(f);
+
+    // 1. gio move: OVERWRITE with a free destination restores by rename.
+    if (c.g_file_trash(f, null, null) == 0) return "g_file_trash failed";
+    if (c.g_file_query_exists(f, null) != 0) return "the trashed file is still in place";
+    var err: [*c]c.GError = null;
+    if (c.g_file_move(item, f, c.G_FILE_COPY_OVERWRITE, null, null, null, &err) == 0) {
+        c.g_printerr("trash-metadata: move: %s\n", err.*.message);
+        c.g_error_free(err);
+        return "a restore with OVERWRITE failed";
+    }
+    if (inodeOf(f) != ino) return "the restore copied the file instead of renaming it back";
+    if (!noteIs(f, "keep me")) return "metadata::note was lost across trash and restore (OVERWRITE)";
+    if (c.g_file_test(in_trash, c.G_FILE_TEST_EXISTS) != 0) return "the restored item is still in the trash";
+
+    // 2. A taken destination without OVERWRITE: EXISTS, nothing changed.
+    if (c.g_file_trash(f, null, null) == 0) return "g_file_trash failed (2)";
+    if (c.g_file_set_contents(path, "other", -1, null) == 0) return "could not write the blocking file";
+    err = null;
+    if (c.g_file_move(item, f, c.G_FILE_COPY_NONE, null, null, null, &err) != 0) return "a restore onto a taken path succeeded";
+    const exists = c.g_error_matches(err, c.g_io_error_quark(), c.G_IO_ERROR_EXISTS) != 0;
+    c.g_error_free(err);
+    if (!exists) return "a restore onto a taken path did not fail with EXISTS";
+    var text: [*c]u8 = null;
+    if (c.g_file_get_contents(path, &text, null, null) == 0) return "the blocking file is gone";
+    const kept = std.mem.eql(u8, std.mem.span(text), "other");
+    c.g_free(text);
+    if (!kept) return "the blocking file was overwritten";
+    if (c.g_file_test(in_trash, c.G_FILE_TEST_EXISTS) == 0) return "the item left the trash on a refused restore";
+
+    // 3. A plain restore (no flags) once the path is free.
+    removeFile(path);
+    if (c.g_file_move(item, f, c.G_FILE_COPY_NONE, null, null, null, null) == 0) return "a plain restore failed";
+    if (inodeOf(f) != ino) return "the plain restore copied the file";
+    if (!noteIs(f, "keep me")) return "metadata::note was lost across trash and restore";
+    return null;
+}
+
 fn checkVfsUris(ctx: *Ctx) ?[*:0]const u8 {
     const data = c.g_getenv("XDG_DATA_HOME");
     if (data == null) return "XDG_DATA_HOME is not set";
@@ -2628,6 +2709,15 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     if (std.mem.eql(u8, mode, "ui-thread") and argc == 5) return runDaemon(argv[3], argv[4], "ui-thread", &checkUiThread);
     if (std.mem.eql(u8, mode, "hung-mount") and argc == 5) return runDaemon(argv[3], argv[4], "hung-mount", &checkHungMount);
     if (std.mem.eql(u8, mode, "file-ops") and argc == 5) return runDaemon(argv[3], argv[4], "file-ops", &checkFileOps);
+    if (std.mem.eql(u8, mode, "trash-metadata") and argc == 5) {
+        const base = privateDir(argv[3], "trash-metadata-data") orelse return fail("could not create the data directory");
+        defer c.g_free(base);
+        if (c.g_setenv("XDG_DATA_HOME", base, 1) == 0) return fail("g_setenv XDG_DATA_HOME");
+        const rc = runDaemon(argv[3], argv[4], "trash-metadata", &checkTrashMetadata);
+        var rm = [_][*c]u8{ @constCast("rm"), @constCast("-rf"), @constCast("--"), @constCast(base), null };
+        _ = c.g_spawn_sync(null, &rm, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, null, null);
+        return rc;
+    }
     if (std.mem.eql(u8, mode, "vfs-uris") and argc == 5) {
         const base = privateDir(argv[3], "vfs-uris-data") orelse return fail("could not create the data directory");
         defer c.g_free(base);

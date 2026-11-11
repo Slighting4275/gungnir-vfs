@@ -856,7 +856,13 @@ fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GErr
     return 1;
 }
 
-/// Moving an item out of the trash to a local path restores it.
+/// Moving an item out of the trash to a local path restores it: the daemon renames it
+/// back (same file, so its metadata stays with it), never replacing anything.
+/// G_FILE_COPY_OVERWRITE allows a replace, it does not ask for one: `gio move` sets it on
+/// every move, and refusing it sent every such restore to GLib's copy-and-delete
+/// fallback, a new file without the item's metadata (M9-F02). So the restore is always
+/// tried; only when the destination is taken and OVERWRITE allows replacing it does this
+/// answer NOT_SUPPORTED, leaving that explicit replace to GLib's fallback.
 fn fileMove(
     src: ?*c.GFile,
     dest: ?*c.GFile,
@@ -869,8 +875,8 @@ fn fileMove(
     _ = progress;
     _ = progress_data;
     const s = asSelf(src);
-    if (s.scheme != scheme_trash or s.name == null or flags & c.G_FILE_COPY_OVERWRITE != 0) {
-        setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "only a move out of the trash, without overwriting");
+    if (s.scheme != scheme_trash or s.name == null) {
+        setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "only a move out of the trash");
         return 0;
     }
     if (inside(s, err)) return 0;
@@ -899,7 +905,16 @@ fn fileMove(
     watch(&link, cancellable);
     var reply: ipc.Msg = undefined;
     _ = requestRetry(&link, msg_restore, req[0 .. at + to.len], &reply) catch |e| {
-        failure(&link.client, &reply, e, err);
+        var mine: [*c]c.GError = null;
+        failure(&link.client, &reply, e, &mine);
+        if (flags & c.G_FILE_COPY_OVERWRITE != 0 and
+            c.g_error_matches(mine, c.g_io_error_quark(), c.G_IO_ERROR_EXISTS) != 0)
+        {
+            c.g_error_free(mine);
+            setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "the destination exists; replacing it is left to the copy fallback");
+            return 0;
+        }
+        c.g_propagate_error(err, mine);
         return 0;
     };
     return 1;
