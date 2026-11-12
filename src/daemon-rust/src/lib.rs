@@ -179,7 +179,8 @@ pub mod testenv {
     }
 
     /// Run `cmd` (program, then arguments) as a second, unprivileged user in directory
-    /// `cwd`, for the cross-user tests: a user namespace maps a subordinate uid
+    /// `cwd`, for the cross-user tests. As root: `nobody` (uid 65534). Otherwise a user
+    /// namespace maps a subordinate uid
     /// (`newuidmap`, `/etc/subuid`), so the process really runs as another uid than
     /// ours; the directory is entered before the switch, so its ancestors need not be
     /// open to that user. `Ok(None)` (after [`missing`]) where no second user can be made.
@@ -191,6 +192,19 @@ pub mod testenv {
         cwd: &Path,
         cmd: &[&std::ffi::OsStr],
     ) -> Result<Option<std::process::Output>, String> {
+        // As root (the CI job that runs these tests), any unprivileged uid is a real other
+        // user: drop straight to `nobody`. A container's newuidmap cannot map ranges.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return Command::new("setpriv")
+                .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+                .args(cmd)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
         let usable = Command::new("unshare")
             .args(["--user", "--map-auto", "--map-root-user", "true"])
             .stderr(std::process::Stdio::null())

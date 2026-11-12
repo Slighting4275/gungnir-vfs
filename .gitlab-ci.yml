@@ -303,6 +303,13 @@ rust:test-hooks:
     # What did not run here, one line each (or that nothing was skipped).
     - |
       grep '^SKIP' .build/test-hooks.log || echo "No SKIP lines: every test-hooks test ran."
+    # The cross-user tests need a second user. As tester they cannot have one here (the
+    # container's newuidmap cannot map a range), so they run again as root, which drops to
+    # `nobody` (testenv::as_other_user): no opt-out, they must run or fail.
+    - |
+      chown -R root:root "$CI_PROJECT_DIR/.build"
+      env -u GUNGNIR_ALLOW_MISSING cargo test --release --features test-hooks --no-fail-fast \
+        --test lifecycle --test trash_ipc -- another_user another_users
 
 # Milestone 8: the thread-pool fallback engine, forced. Its own job, in every pipeline,
 # needing only rust:build, so an io_uring failure in rust:test never hides it (D-048,
