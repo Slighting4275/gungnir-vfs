@@ -246,6 +246,14 @@ fn with_lock<R>(path: &Path, f: impl FnOnce() -> Result<R, ForgetError>) -> Resu
 }
 
 fn write_atomic(path: &Path, out: &[u8]) -> io::Result<()> {
+    // A link (a dotfiles manager's) is followed and its target replaced, beside it: the
+    // rename used to replace the link with a plain file, and the real list stopped
+    // changing. A dangling link is an error, never turned into a file.
+    let target = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let path = target.as_path();
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".gungnir-{}", std::process::id()));
     // Under the lock, so anything here is what a crash left.
@@ -432,6 +440,54 @@ mod tests {
         ));
         let _ = fs::remove_file(&p);
         let _ = fs::remove_file(p.with_extension("xbel.lock"));
+    }
+
+    #[test]
+    fn a_symlinked_list_stays_a_link_and_its_target_is_rewritten() {
+        // The temp was renamed over the path: a linked recently-used.xbel (a dotfiles
+        // manager's) became a plain file, and the real list never changed again.
+        let dir = tmp("link").with_extension("d");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("real")).unwrap();
+        let (link, real) = (
+            dir.join("recently-used.xbel"),
+            dir.join("real/recently-used.xbel"),
+        );
+        fs::write(&real, XBEL).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        forget(&link, b"file:///home/u/a%20b.txt").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced"
+        );
+        assert_eq!(
+            parse(&fs::read(&real).unwrap()).len(),
+            2,
+            "the real list did not change"
+        );
+        clear(&link).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(parse(&fs::read(&real).unwrap()).is_empty());
+        // A dangling link is an error, never replaced by a file.
+        fs::remove_file(&real).unwrap();
+        fs::write(&real, XBEL).unwrap();
+        fs::rename(&real, dir.join("real/moved")).unwrap();
+        assert!(forget(&link, b"file:///home/u/q&a.txt").is_err());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
