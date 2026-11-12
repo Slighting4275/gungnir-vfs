@@ -283,6 +283,27 @@ rust:test:
     # --no-fail-fast: one failing test binary must not hide the results of the others.
     - runuser -u tester -- cargo test --release --no-fail-fast
 
+# The tests that need the test-hooks build (AGENTS.md: cargo test must also pass with
+# --features test-hooks): about 20 more, among them the cross-user security tests (another
+# user refused at the socket, someone else's trash never ours), drain and live-upgrade
+# refusals, volume trash on hung mounts. Without this job they ran on no pipeline.
+rust:test-hooks:
+  stage: test
+  extends: .rust
+  timeout: 25 minutes
+  needs: ["rust:build"]
+  variables:
+    GUNGNIR_REQUIRE_URING: "1"
+    GUNGNIR_ALLOW_MISSING: "1"
+  script:
+    - *as-tester
+    - |
+      set -o pipefail
+      runuser -u tester -- cargo test --release --features test-hooks --no-fail-fast 2>&1 | tee .build/test-hooks.log
+    # What did not run here, one line each (or that nothing was skipped).
+    - |
+      grep '^SKIP' .build/test-hooks.log || echo "No SKIP lines: every test-hooks test ran."
+
 # Milestone 8: the thread-pool fallback engine, forced. Its own job, in every pipeline,
 # needing only rust:build, so an io_uring failure in rust:test never hides it (D-048,
 # RC-F022).
