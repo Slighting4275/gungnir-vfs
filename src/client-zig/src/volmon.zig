@@ -877,13 +877,13 @@ test "parseMounts reads a mountinfo file and lists its mounts" {
     ensureRegisteredForTest();
     // A fixture file, so the test never depends on what this machine has mounted (a
     // machine whose only storage is /, /home and /boot has nothing the rule keeps).
-    // Under ~/.cache/gungnir, where test files belong (AGENTS.md).
-    const user = processUser();
-    var dir_buf: [1100]u8 = undefined;
-    const dir = try std.mem.printSentinel(&dir_buf, "{s}/.cache/gungnir", .{user.home}, 0);
-    _ = std.os.linux.mkdir(dir, 0o700);
-    var path_buf: [1200]u8 = undefined;
-    const path = try std.mem.printSentinel(&path_buf, "{s}/zig-unit-mountinfo-{d}", .{ dir, std.os.linux.getpid() }, 0);
+    // Under <repo>/.build/tmp, where test files belong (AGENTS.md), like the itest's: the
+    // tests run in src/client-zig. (~/.cache/gungnir failed in CI: a fresh container has
+    // no ~/.cache.)
+    _ = std.os.linux.mkdir("../../.build", 0o755);
+    _ = std.os.linux.mkdir("../../.build/tmp", 0o700);
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "../../.build/tmp/zig-unit-mountinfo-{d}", .{std.os.linux.getpid()}, 0);
     const text = "22 1 0:21 / /media/disk rw - ext4 /dev/sda1 rw\n" ++
         "23 1 0:22 / /proc rw - proc proc rw\n" ++
         "24 1 0:23 / /media/usb rw - vfat /dev/sdb1 rw\n";
