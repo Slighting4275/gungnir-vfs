@@ -512,37 +512,80 @@ pub fn probe() -> io::Result<()> {
 }
 
 /// Set (to anything but "" or "0") where io_uring must work, e.g. the CI job that tests
-/// the io_uring engine: tests then fail instead of skipping when it is unavailable.
+/// the io_uring engine: no test may skip it, even with [`ALLOW_NO_URING_ENV`] set.
 pub const REQUIRE_URING_ENV: &str = "GUNGNIR_REQUIRE_URING";
 
-/// Whether a test may use the io_uring engine here: `true` if [`probe`] passes. If it
-/// fails, `Err` with the reason when [`REQUIRE_URING_ENV`] is set (the test must fail),
-/// else `Ok(false)` after a skip note on stderr. `require` is the variable's value.
+/// Set (to anything but "" or "0") on a machine without io_uring (an old kernel, a
+/// container that blocks it) to skip the io_uring tests on purpose; each says so. Unset,
+/// a missing io_uring fails them: a skip is never silent.
+pub const ALLOW_NO_URING_ENV: &str = "GUNGNIR_ALLOW_NO_URING";
+
+fn env_on(v: Option<&std::ffi::OsStr>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether a test may use the io_uring engine here: `Ok(true)` if [`probe`] passes. If
+/// it fails, `Ok(false)` after a SKIP line on stderr only when `allow` is on and
+/// `require` is not; otherwise `Err` with the reason (the test must fail).
 ///
 /// # Errors
-/// io_uring is unavailable and required.
-pub fn uring_for_tests(what: &str, require: Option<&std::ffi::OsStr>) -> Result<bool, String> {
-    match probe() {
+/// io_uring is unavailable and no skip was asked for.
+pub fn uring_for_tests(
+    what: &str,
+    allow: Option<&std::ffi::OsStr>,
+    require: Option<&std::ffi::OsStr>,
+) -> Result<bool, String> {
+    let probe = probe();
+    let why = probe.as_ref().err().map(ToString::to_string);
+    let r = uring_decision(probe, what, allow, require);
+    if r == Ok(false) {
+        // Straight to stderr, not eprintln!: the test harness swallows that for tests
+        // that pass, and a skip must always show.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "SKIP ({ALLOW_NO_URING_ENV}=1): io_uring unavailable here ({}): {what} did not run",
+            why.unwrap_or_default()
+        );
+    }
+    r
+}
+
+fn uring_decision(
+    probe: io::Result<()>,
+    what: &str,
+    allow: Option<&std::ffi::OsStr>,
+    require: Option<&std::ffi::OsStr>,
+) -> Result<bool, String> {
+    match probe {
         Ok(()) => Ok(true),
-        Err(e) if require.is_some_and(|v| !v.is_empty() && v != "0") => Err(format!(
-            "{REQUIRE_URING_ENV} is set but io_uring is unavailable here ({e}): {what}"
+        Err(_) if env_on(allow) && !env_on(require) => Ok(false),
+        Err(e) => Err(format!(
+            "io_uring is unavailable here ({e}): {what}; set {ALLOW_NO_URING_ENV}=1 to skip \
+             the io_uring tests on purpose{}",
+            if env_on(require) {
+                format!(" ({REQUIRE_URING_ENV} is set, so not here)")
+            } else {
+                String::new()
+            }
         )),
-        Err(e) => {
-            eprintln!("note: io_uring unavailable here ({e}): {what} skipped");
-            Ok(false)
-        }
     }
 }
 
-/// [`uring_for_tests`] with the environment's [`REQUIRE_URING_ENV`]; panics (fails the
-/// test) when io_uring is required but unavailable.
+/// [`uring_for_tests`] with the environment's [`ALLOW_NO_URING_ENV`] and
+/// [`REQUIRE_URING_ENV`]; panics (fails the test) unless io_uring works or a skip was
+/// asked for.
 ///
 /// # Panics
 /// As described.
 #[must_use]
 pub fn uring_for_tests_env(what: &str) -> bool {
-    uring_for_tests(what, std::env::var_os(REQUIRE_URING_ENV).as_deref())
-        .unwrap_or_else(|e| panic!("{e}"))
+    uring_for_tests(
+        what,
+        std::env::var_os(ALLOW_NO_URING_ENV).as_deref(),
+        std::env::var_os(REQUIRE_URING_ENV).as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 impl UringIo {
@@ -827,26 +870,51 @@ mod tests {
         Ok(())
     }
 
-    /// GUNGNIR_REQUIRE_URING turns the skip into a failure (D-061); unset or "0" keeps the
-    /// skip. Checked against this machine's probe result either way.
+    /// Without io_uring a test fails unless GUNGNIR_ALLOW_NO_URING is set: a skip has to
+    /// be asked for, never silent. GUNGNIR_REQUIRE_URING (CI) overrides the opt-out.
     #[test]
-    fn require_uring_turns_a_skip_into_a_failure() {
+    fn missing_io_uring_fails_unless_a_skip_is_asked_for() {
+        use std::ffi::OsStr;
+        let gone = || Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        let one = Some(OsStr::new("1"));
+        for (allow, require, skips) in [
+            (None, None, false),
+            (Some(OsStr::new("")), None, false),
+            (Some(OsStr::new("0")), None, false),
+            (one, None, true),
+            (one, one, false),
+            (None, one, false),
+        ] {
+            let got = uring_decision(gone(), "decision test", allow, require);
+            if skips {
+                assert_eq!(got, Ok(false), "{allow:?} {require:?}");
+            } else {
+                assert!(
+                    got.as_ref()
+                        .is_err_and(|e| e.contains("io_uring is unavailable")),
+                    "{allow:?} {require:?}: {got:?}"
+                );
+            }
+            // Where io_uring works, every setting runs the test.
+            assert_eq!(
+                uring_decision(Ok(()), "decision test", allow, require),
+                Ok(true)
+            );
+        }
+    }
+
+    /// The same rule against this machine's real probe result (D-061).
+    #[test]
+    fn the_live_probe_and_the_switches_agree() {
         use std::ffi::OsStr;
         let up = probe().is_ok();
-        for (req, fails) in [
-            (None, false),
-            (Some(OsStr::new("")), false),
-            (Some(OsStr::new("0")), false),
-            (Some(OsStr::new("1")), true),
-        ] {
-            let got = uring_for_tests("switch test", req);
-            match (up, fails) {
-                (true, _) => assert_eq!(got, Ok(true), "{req:?}"),
-                (false, false) => assert_eq!(got, Ok(false), "{req:?}"),
-                (false, true) => assert!(
-                    got.as_ref().is_err_and(|e| e.contains(REQUIRE_URING_ENV)),
-                    "{req:?}: {got:?}"
-                ),
+        let one = Some(OsStr::new("1"));
+        for (allow, require) in [(None, None), (one, None), (None, one), (one, one)] {
+            let got = uring_decision(probe(), "switch test", allow, require);
+            match (up, allow.is_some() && require.is_none()) {
+                (true, _) => assert_eq!(got, Ok(true), "{allow:?} {require:?}"),
+                (false, true) => assert_eq!(got, Ok(false), "{allow:?} {require:?}"),
+                (false, false) => assert!(got.is_err(), "{allow:?} {require:?}: {got:?}"),
             }
         }
     }

@@ -61,12 +61,36 @@ fn daemon(d: &Dir, env: &[(&str, &str)]) -> Command {
 }
 
 /// Run a start that must be refused: its status and stderr.
+///
+/// A daemon that does not refuse (it starts serving) is stopped after 10 s and reported
+/// as such, so the test fails instead of waiting forever: without io_uring the mixed-ring
+/// start fell back to threads and served, and the test hung.
 fn refused(d: &Dir, env: &[(&str, &str)]) -> R<(ExitStatus, String)> {
-    let out = daemon(d, env).output()?;
-    Ok((
-        out.status,
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    use std::io::Read;
+    let mut child = daemon(d, env).spawn()?;
+    let mut stderr = child.stderr.take().ok_or("no stderr pipe")?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let t0 = Instant::now();
+    let (st, late) = loop {
+        if let Some(st) = child.try_wait()? {
+            break (st, false);
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            // SAFETY: a signal to our own child.
+            unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+            break (child.wait()?, true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut err = reader.join().map_err(|_| "stderr reader panicked")?;
+    if late {
+        err.push_str("\n(test: the daemon did not refuse; stopped after 10 s)");
+    }
+    Ok((st, err))
 }
 
 /// Start a normal daemon, check it serves, stop it with SIGTERM: its stderr.
@@ -180,7 +204,12 @@ fn a_mixed_engine_refusal_leaves_no_socket_and_no_store() -> R {
         &[("GUNGNIR_NO_URING", "0"), ("GUNGNIR_TEST_MIXED_RINGS", "1")],
     )?;
     if !err.contains("file ops engine: Uring") {
-        eprintln!("skipped: no io_uring engine here\n{err}");
+        // A fallback is acceptable only where io_uring is unavailable and a skip was asked
+        // for (GUNGNIR_ALLOW_NO_URING=1); otherwise this fails.
+        assert!(
+            !gungnird::ops::io::uring_for_tests_env("the mixed-engine refusal test"),
+            "io_uring works here, but the daemon did not use it\n{err}"
+        );
         return Ok(());
     }
     assert!(!st.success(), "{st}\n{err}");

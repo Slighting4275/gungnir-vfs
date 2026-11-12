@@ -293,24 +293,38 @@ fn an_empty_ring_pool_ends_a_sandboxed_daemon_rather_than_mixing_engines() -> R 
     fs::create_dir(&out)?;
     let uring = [(ops::RING_LOSS_ENV, "1"), (ops::NO_URING_ENV, "0")];
     let mut dm = Daemon::start(&d, true, &uring)?;
-    let text = dm.text();
-    let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
-    let started = start_copy(&mut c, &src, &out.join("dst"));
-    let (st, _) = dm.wait_exit(Duration::from_secs(10))?;
-    let log = dm.text();
-    if text.contains("thread engine") {
-        return Ok(()); // no io_uring here: nothing to lose
+    // Which engine it chose (it was checked as "thread engine", which it never logs, after
+    // a wait for an exit a thread-engine daemon never makes: a misleading failure).
+    let t0 = Instant::now();
+    while !dm.text().contains("file ops engine:") {
+        if t0.elapsed() > Duration::from_secs(5) {
+            return Err(format!("no engine line\n{}", dm.text()).into());
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    drop(started);
-    assert!(!st.success(), "exit {st}\n{log}");
-    assert!(log.contains("no restricted io_uring ring left"), "{log}");
-    assert!(!out.join("dst").exists());
-    drop(dm);
-    let dm = Daemon::start(&d, true, &[(ops::NO_URING_ENV, "0")])?;
-    let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
-    assert_eq!(start_copy(&mut c, &src, &out.join("dst"))?, ST_OK);
-    assert_eq!(done_result(&mut c)?, Ok(()), "{}", dm.text());
-    assert_eq!(temps(&out), Vec::<String>::new());
+    if dm.text().contains("file ops engine: Uring") {
+        let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+        let started = start_copy(&mut c, &src, &out.join("dst"));
+        let (st, _) = dm.wait_exit(Duration::from_secs(10))?;
+        let log = dm.text();
+        drop(started);
+        assert!(!st.success(), "exit {st}\n{log}");
+        assert!(log.contains("no restricted io_uring ring left"), "{log}");
+        assert!(!out.join("dst").exists());
+        drop(dm);
+        let dm = Daemon::start(&d, true, &[(ops::NO_URING_ENV, "0")])?;
+        let mut c = Client::connect(&dm.sock, Duration::from_secs(5))?;
+        assert_eq!(start_copy(&mut c, &src, &out.join("dst"))?, ST_OK);
+        assert_eq!(done_result(&mut c)?, Ok(()), "{}", dm.text());
+        assert_eq!(temps(&out), Vec::<String>::new());
+    } else {
+        // Only where io_uring is unavailable and a skip was asked for; else this fails.
+        assert!(
+            !ops::io::uring_for_tests_env("the ring-loss half of the drain test"),
+            "io_uring works here, but the daemon did not use it\n{}",
+            dm.text()
+        );
+    }
 
     let t = Dir::new("ringloss-threads")?;
     let src = t.join("big");

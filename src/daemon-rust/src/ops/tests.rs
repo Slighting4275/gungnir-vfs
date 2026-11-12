@@ -1,9 +1,9 @@
 //! Unit tests of the file-op engines and scheduler. Every behavioural test runs on both
-//! engines: the thread pool always, io_uring when it passes its probe (skipped, with a
-//! note, where it does not: old kernels, seccomp, containers). `GUNGNIR_NO_URING` only
-//! changes which engine the daemon picks ([`choose_engine`]); these tests name their
-//! engine, so they run both whatever it says. With `GUNGNIR_REQUIRE_URING` set (the CI
-//! io_uring job), an unavailable io_uring fails them.
+//! engines: the thread pool and io_uring. Where io_uring is unavailable (old kernels,
+//! seccomp, containers) they fail, unless `GUNGNIR_ALLOW_NO_URING=1` asks to skip its
+//! half on purpose (each prints a SKIP line; `GUNGNIR_REQUIRE_URING` overrides that).
+//! `GUNGNIR_NO_URING` only changes which engine the daemon picks ([`choose_engine`]);
+//! these tests name their engine, so they run both whatever it says.
 
 use std::{
     ffi::CString,
@@ -1031,7 +1031,7 @@ fn engine_choice_honours_the_environment_switch() {
     match io::probe() {
         Ok(()) => assert_eq!(k, EngineKind::Uring),
         Err(_) => {
-            // Where io_uring is required this is a failure, not a thread-engine pass (RC-F027).
+            // Without io_uring this fails unless a skip was asked for (RC-F027).
             assert!(!io::uring_for_tests_env("the engine choice"));
             assert_eq!(
                 (k, why.starts_with("io_uring unavailable")),
@@ -1093,7 +1093,8 @@ fn uring_waits_stop_on_cancel_even_if_the_kernel_does_not_answer() -> R {
 
 /// Run the named test again in a fresh user+mount namespace (`unshare -rm`), where it
 /// may bind-mount. Returns true in the inner run; false (the outer run is done: passed,
-/// or skipped where namespaces are not available) otherwise.
+/// or skipped, with a SKIP line, where namespaces are not available) otherwise. A failed
+/// inner run's output is part of the error.
 fn in_mount_namespace(test: &str) -> R<bool> {
     const INNER: &str = "GUNGNIR_TEST_IN_MOUNT_NS";
     if std::env::var_os(INNER).is_some() {
@@ -1104,18 +1105,35 @@ fn in_mount_namespace(test: &str) -> R<bool> {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
+    // Straight to stderr, not eprintln!: the harness swallows that for passing tests.
+    let say = |line: &str| {
+        let _ = writeln!(std::io::stderr().lock(), "{line}");
+    };
     if !usable {
-        eprintln!("note: no user+mount namespace here: {test} skipped");
+        say(&format!(
+            "SKIP: no user+mount namespace here: {test} did not run"
+        ));
         return Ok(false);
     }
-    let st = std::process::Command::new("unshare")
+    let out = std::process::Command::new("unshare")
         .arg("-rm")
         .arg(std::env::current_exe()?)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(INNER, "1")
-        .status()?;
-    if !st.success() {
-        return Err(format!("{test} failed inside its mount namespace ({st})").into());
+        .output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The inner run's own SKIP lines (an io_uring half skipped on purpose) must show.
+    text.lines().filter(|l| l.starts_with("SKIP")).for_each(say);
+    if !out.status.success() {
+        return Err(format!(
+            "{test} failed inside its mount namespace ({}):\n{text}",
+            out.status
+        )
+        .into());
     }
     Ok(false)
 }
