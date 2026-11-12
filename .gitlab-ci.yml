@@ -93,6 +93,15 @@ default:
     mkdir -p .build/tmp
     chmod go-w .build .build/tmp
 
+# The test jobs run their tests as an unprivileged user, like gungnird itself (a per-user
+# daemon): as root, the tests of what an unreadable file does cannot run (root reads
+# everything). The runner's checkout (sources, caches, .build) is handed to that user.
+# runuser keeps the job's environment (PATH with Zig, CARGO_HOME, ...), only HOME changes.
+.as-tester: &as-tester
+  - |
+    id tester >/dev/null 2>&1 || useradd -m -U tester
+    chown -R tester:tester "$CI_PROJECT_DIR"
+
 # Every job normally finishes in under 4 minutes, so a stalled runner or a hung step
 # fails at 20 minutes instead of the project's (by default 1 hour). Test jobs: 25.
 .rust:
@@ -263,9 +272,13 @@ rust:test:
     # The io_uring engine tests must run here: fail, never skip, if io_uring is
     # unavailable (ENOSYS/EPERM/ENOMEM in the runner's container). D-061.
     GUNGNIR_REQUIRE_URING: "1"
+    # What this container cannot have (btrfs) is skipped, each test on a SKIP line in the
+    # log; everything else must run (gungnird::testenv).
+    GUNGNIR_ALLOW_MISSING: "1"
   script:
+    - *as-tester
     # --no-fail-fast: one failing test binary must not hide the results of the others.
-    - cargo test --release --no-fail-fast
+    - runuser -u tester -- cargo test --release --no-fail-fast
 
 # Milestone 8: the thread-pool fallback engine, forced. Its own job, in every pipeline,
 # needing only rust:build, so an io_uring failure in rust:test never hides it (D-048,
@@ -277,8 +290,10 @@ rust:test-no-uring:
   needs: ["rust:build"]
   variables:
     GUNGNIR_NO_URING: "1"
+    GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - cargo test --release --no-fail-fast
+    - *as-tester
+    - runuser -u tester -- cargo test --release --no-fail-fast
 
 zig:test:
   stage: test
@@ -286,8 +301,11 @@ zig:test:
   # rust:build's gungnird artifact + the cargo cache keep the itest's cargo build incremental.
   timeout: 25 minutes
   needs: ["zig:build", "rust:build"]
+  variables:
+    GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - ./zb test --summary all
+    - *as-tester
+    - runuser -u tester -- ./zb test --summary all
     # The itest's test-hooks daemon lives in .build/target-hooks, never over the artifact.
     - |
       if grep -q 'TEST HOOK' .build/target/release/gungnird; then

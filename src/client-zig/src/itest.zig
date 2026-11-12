@@ -2192,7 +2192,10 @@ const fixture_env = "GUNGNIR_ITEST_VOLMON_FIXTURE";
 /// the filtered mountinfo set, which may then be empty.
 var volmon_fixture = false;
 
+/// No /run/media (a CI container has /run only): a private tmpfs over /run in this
+/// namespace makes one, touching nothing outside it.
 const fixture_script =
+    \\if [ ! -d /run/media ]; then mount -t tmpfs -o mode=0755 gungnir-run /run && mkdir /run/media || exit 77; fi
     \\mount -t tmpfs -o mode=0755 gungnir-fixture /run/media || exit 77
     \\mkdir /run/media/stick || exit 77
     \\mount -t ramfs gungnir-stick /run/media/stick || exit 77
@@ -2203,7 +2206,7 @@ const fixture_script =
 /// Runs this itest again inside `unshare -Urm` with the fixture mounted; returns its exit
 /// code, or null when the namespace or the fixture cannot be made (then run directly).
 fn rerunWithFixture(argc: c_int, argv: [*c][*c]u8) ?c_int {
-    if (c.g_find_program_in_path("unshare")) |up| c.g_free(up) else return null;
+    if (c.g_find_program_in_path("unshare")) |up| c.g_free(up) else return noFixture("no unshare");
     var args: [16][*c]u8 = undefined;
     const fixed = [_][*c]const u8{ "unshare", "-Urm", "--propagation", "private", "sh", "-c", fixture_script, "sh" };
     const n_args: usize = @intCast(argc);
@@ -2212,14 +2215,33 @@ fn rerunWithFixture(argc: c_int, argv: [*c][*c]u8) ?c_int {
     for (0..n_args) |i| args[fixed.len + i] = argv[i];
     args[fixed.len + n_args] = null;
     var status: c_int = 0;
-    if (c.g_spawn_sync(null, &args, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, &status, null) == 0) return null;
+    if (c.g_spawn_sync(null, &args, null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, &status, null) == 0) return noFixture("unshare could not be started");
     if (status & 0x7f != 0) return 1; // killed by a signal
     const code = (status >> 8) & 0xff;
-    if (code == 77) {
-        std.debug.print("gungnir itest: no namespace fixture here; checking the live mount set only\n", .{});
-        return null;
-    }
+    if (code == 77) return noFixture("the user+mount namespace or its mounts failed");
     return code;
+}
+
+/// Set (to anything but "" or "0") to skip on purpose what this machine cannot run
+/// (as in the Rust tests, gungnird::testenv).
+const allow_missing_env = "GUNGNIR_ALLOW_MISSING";
+
+fn allowMissing() bool {
+    const v = c.g_getenv(allow_missing_env) orelse return false;
+    const s = std.mem.span(v);
+    return s.len != 0 and !std.mem.eql(u8, s, "0");
+}
+
+/// The namespace fixture cannot be made here (`why`): the modes then fail, unless
+/// GUNGNIR_ALLOW_MISSING asks to skip their fixture part, which they say on a SKIP line.
+/// Null means run directly (live mount set only); a code ends the itest.
+fn noFixture(why: []const u8) ?c_int {
+    if (!allowMissing()) {
+        std.debug.print("gungnir itest: no namespace fixture here ({s}), so the volume monitor modes cannot run their checks; set " ++ allow_missing_env ++ "=1 to skip them on purpose\n", .{why});
+        return 1;
+    }
+    std.debug.print("SKIP (" ++ allow_missing_env ++ "=1): no namespace fixture here ({s}): only the live mount set is checked\n", .{why});
+    return null;
 }
 
 /// volmon: GIO_USE_VOLUME_MONITOR=gungnir makes it the native monitor of
@@ -2389,7 +2411,8 @@ const signal_bound_ms = 1000;
 fn runVolmonSignals(tmp_arg: [*c]u8) c_int {
     _ = tmp_arg;
     if (!volmon_fixture) {
-        std.debug.print("gungnir itest volmon-signals: no namespace fixture; nothing to mount, skipped\n", .{});
+        // Reached only when noFixture allowed it (GUNGNIR_ALLOW_MISSING).
+        std.debug.print("SKIP (" ++ allow_missing_env ++ "=1): no namespace fixture here: volmon-signals did not run\n", .{});
         return 0;
     }
     if (c.g_setenv("GIO_USE_VOLUME_MONITOR", "gungnir", 1) == 0) return fail("g_setenv GIO_USE_VOLUME_MONITOR");

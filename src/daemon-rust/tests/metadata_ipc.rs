@@ -355,7 +355,14 @@ fn only_identify_drops_stale_rows() -> R {
     let path = d.file("f")?;
     let id = c.identify(&path)?;
     if (id.btime_sec, id.btime_nsec) == (0, 0) {
-        eprintln!("skipped: this filesystem reports no btime");
+        // No btime on this filesystem: the whole test runs on a tmpfs instead.
+        drop(c);
+        drop(d);
+        gungnird::testenv::rerun_on_tmpfs(
+            "only_identify_drops_stale_rows",
+            &gungnird::testenv::scratch_base(),
+            "file creation time (btime)",
+        )?;
         return Ok(());
     }
     let keep = Value::String("keep".into());

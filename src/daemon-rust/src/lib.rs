@@ -30,6 +30,162 @@ pub(crate) fn hex_byte(pair: &[u8]) -> Option<u8> {
     Some((d(*hi)? << 4) | d(*lo)?)
 }
 
+/// What a test does when this machine lacks something it needs (btrfs, a filesystem
+/// feature, a user namespace, a non-root user): it fails, unless
+/// `GUNGNIR_ALLOW_MISSING=1` asks to skip such tests on purpose, and then it says so on a
+/// SKIP line. No test skips silently. Where a tmpfs can stand in (holes, user xattrs,
+/// btime, the filesystem uuid ioctl), [`testenv::rerun_on_tmpfs`] runs the test there.
+#[doc(hidden)]
+pub mod testenv {
+    use std::{io::Write as _, path::Path, process::Command};
+
+    /// Set (to anything but "" or "0") to skip, with a SKIP line, the tests this machine
+    /// cannot run.
+    pub const ALLOW_MISSING_ENV: &str = "GUNGNIR_ALLOW_MISSING";
+    /// Set in a test's rerun on tmpfs (see [`rerun_on_tmpfs`]).
+    pub const ON_TMPFS_ENV: &str = "GUNGNIR_TEST_ON_TMPFS";
+
+    /// A line straight to stderr: the test harness swallows `eprintln!` of a passing test,
+    /// and a skip must always show.
+    pub fn say(line: &str) {
+        let _ = writeln!(std::io::stderr().lock(), "{line}");
+    }
+
+    fn allowed(v: Option<&std::ffi::OsStr>) -> bool {
+        v.is_some_and(|v| !v.is_empty() && v != "0")
+    }
+
+    /// The test `test` cannot run: this machine has no `what`. Panics (fails the test)
+    /// unless [`ALLOW_MISSING_ENV`] is set; then prints a SKIP line and returns.
+    ///
+    /// # Panics
+    /// As described.
+    pub fn missing(test: &str, what: &str) {
+        match decide(test, what, std::env::var_os(ALLOW_MISSING_ENV).as_deref()) {
+            Ok(()) => say(&format!(
+                "SKIP ({ALLOW_MISSING_ENV}=1): no {what} here: {test} did not run"
+            )),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`missing`]'s rule with the variable's value given (prints nothing): `Ok` if the
+    /// skip is allowed, else `Err` with the reason.
+    ///
+    /// # Errors
+    /// Not allowed.
+    pub fn decide(test: &str, what: &str, allow: Option<&std::ffi::OsStr>) -> Result<(), String> {
+        if allowed(allow) {
+            Ok(())
+        } else {
+            Err(format!(
+                "no {what} here, so {test} cannot run; set {ALLOW_MISSING_ENV}=1 to skip such \
+                 tests on purpose"
+            ))
+        }
+    }
+
+    /// True in a rerun made by [`rerun_on_tmpfs`].
+    #[must_use]
+    pub fn on_tmpfs() -> bool {
+        allowed(std::env::var_os(ON_TMPFS_ENV).as_deref())
+    }
+
+    /// Run test `test` of this test binary again in a user+mount namespace with a private
+    /// tmpfs mounted over `base` (where its scratch directories live), for a feature the
+    /// filesystem here lacks (`what`). `Ok` if it passed there (its SKIP lines are passed
+    /// on); `Err` with its output if it failed. Without user namespaces: [`missing`].
+    ///
+    /// # Errors
+    /// The rerun failed, or could not be started.
+    pub fn rerun_on_tmpfs(test: &str, base: &Path, what: &str) -> Result<(), String> {
+        if on_tmpfs() {
+            return Err(format!("{test}: even a tmpfs here has no {what}"));
+        }
+        let usable = Command::new("unshare")
+            .args(["-rm", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            missing(
+                test,
+                &format!("{what}, and no user namespace to mount a tmpfs with it"),
+            );
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
+        let out = Command::new("unshare")
+            .args([
+                "-rm",
+                "sh",
+                "-c",
+                "mount -t tmpfs -o mode=0700 gungnir-test \"$0\" && exec \"$@\"",
+            ])
+            .arg(base)
+            .arg(&exe)
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(ON_TMPFS_ENV, "1")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        text.lines().filter(|l| l.starts_with("SKIP")).for_each(say);
+        if !out.status.success() || !text.contains("test result: ok. 1 passed") {
+            return Err(format!(
+                "{test} failed in its rerun on tmpfs (no {what} here) ({}):\n{text}",
+                out.status
+            ));
+        }
+        say(&format!(
+            "note: this filesystem lacks {what}: {test} ran on a tmpfs instead"
+        ));
+        Ok(())
+    }
+
+    /// `<repo>/.build/tmp`, where every test keeps its scratch directories.
+    ///
+    /// # Panics
+    /// `<repo>/.build` cannot be resolved.
+    #[must_use]
+    pub fn scratch_base() -> std::path::PathBuf {
+        std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))
+            .unwrap_or_else(|e| panic!("<repo>/.build: {e}"))
+            .join("tmp")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::OsStr;
+
+        /// A missing feature fails a test unless a skip is asked for.
+        #[test]
+        fn a_missing_feature_fails_unless_a_skip_is_asked_for() {
+            for (allow, skips) in [
+                (None, false),
+                (Some(OsStr::new("")), false),
+                (Some(OsStr::new("0")), false),
+                (Some(OsStr::new("1")), true),
+            ] {
+                let got = super::decide("rule test", "widget", allow);
+                if skips {
+                    assert_eq!(got, Ok(()), "{allow:?}");
+                } else {
+                    assert!(
+                        got.as_ref().is_err_and(|e| e.contains("no widget here")
+                            && e.contains(super::ALLOW_MISSING_ENV)),
+                        "{allow:?}: {got:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Scratch directories for tests, under `<repo>/.build/tmp` (AGENTS.md §3: never /tmp).
 #[cfg(test)]
 pub(crate) mod testdir {

@@ -382,7 +382,7 @@ fn a_deep_subvolume_trash_is_listed_and_emptied() -> R {
     trash_dir(&d)?;
     let vol = d.join("vol");
     if create_subvolume(&vol).is_err() {
-        eprintln!("skipped: no btrfs here");
+        gungnird::testenv::missing("a_deep_subvolume_trash_is_listed_and_emptied", "btrfs");
         return Ok(());
     }
     fs::create_dir_all(vol.join("a/b/c"))?;
@@ -418,7 +418,7 @@ fn a_mounted_snapshot_is_a_backup() -> R {
     trash_dir(&d)?;
     let live = d.join("live");
     if create_subvolume(&live).is_err() {
-        eprintln!("skipped: no btrfs here");
+        gungnird::testenv::missing("a_mounted_snapshot_is_a_backup", "btrfs");
         return Ok(());
     }
     // SAFETY: plain getter.
@@ -432,7 +432,10 @@ fn a_mounted_snapshot_is_a_backup() -> R {
     )?;
     let snap = d.join("snap");
     if create_snapshot(&live, &snap).is_err() {
-        eprintln!("skipped: no snapshot allowed here");
+        gungnird::testenv::missing(
+            "a_mounted_snapshot_is_a_backup",
+            "permission to snapshot a btrfs subvolume",
+        );
         return Ok(());
     }
     let mut dm = start(
@@ -774,17 +777,30 @@ fn mount_namespace(test: &str) -> R<bool> {
         .status()
         .is_ok_and(|s| s.success());
     if !usable {
-        eprintln!("note: no user+mount namespace here: {test} skipped");
+        gungnird::testenv::missing(test, "user+mount namespace");
         return Ok(false);
     }
-    let st = Command::new("unshare")
+    let out = Command::new("unshare")
         .arg("-rm")
         .arg(std::env::current_exe()?)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(INNER, "1")
-        .status()?;
-    if !st.success() {
-        return Err(format!("{test} failed in its mount namespace ({st})").into());
+        .output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The inner run's own SKIP lines must show.
+    text.lines()
+        .filter(|l| l.starts_with("SKIP"))
+        .for_each(gungnird::testenv::say);
+    if !out.status.success() {
+        return Err(format!(
+            "{test} failed in its mount namespace ({}):\n{text}",
+            out.status
+        )
+        .into());
     }
     Ok(false)
 }
@@ -964,8 +980,18 @@ fn a_dead_fuse_mount_does_not_make_the_trash_listing_incomplete() -> R {
     let t0 = Instant::now();
     while !sock.exists() {
         if let Some(st) = child.try_wait()? {
-            eprintln!("note: no user+mount namespace with FUSE here ({st}); skipped");
-            return Ok(());
+            // Exit 9 is the setup script's own failure (no user namespace, no /dev/fuse,
+            // no FUSE mount): this machine cannot run the test. Anything else is gungnird
+            // ending early, which used to be passed off as a skip too.
+            let log = fs::read_to_string(d.join("log")).unwrap_or_default();
+            if st.code() == Some(9) {
+                gungnird::testenv::missing(
+                    "a_dead_fuse_mount_does_not_make_the_trash_listing_incomplete",
+                    &format!("user+mount namespace with FUSE ({st}; {log})"),
+                );
+                return Ok(());
+            }
+            return Err(format!("gungnird ended before serving ({st}):\n{log}").into());
         }
         if t0.elapsed() > Duration::from_secs(10) {
             let _ = child.kill();

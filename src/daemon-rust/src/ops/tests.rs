@@ -425,7 +425,13 @@ fn large_sparse_file_stays_sparse_and_equal() -> R {
                     md.blocks() * 512
                 );
             } else {
-                eprintln!("note: this filesystem does not keep holes; sparseness unchecked");
+                // This filesystem keeps no holes: the whole test runs on a tmpfs instead.
+                crate::testenv::rerun_on_tmpfs(
+                    "ops::tests::large_sparse_file_stays_sparse_and_equal",
+                    &crate::testenv::scratch_base(),
+                    "sparse-file holes",
+                )?;
+                return Ok(());
             }
         }
     }
@@ -535,7 +541,12 @@ fn all_metadata_copies_xattrs_best_effort() -> R {
             )
         };
         if r != 0 {
-            eprintln!("note: no user xattrs on this filesystem; xattr copy unchecked");
+            // No user xattrs on this filesystem: the whole test runs on a tmpfs instead.
+            crate::testenv::rerun_on_tmpfs(
+                "ops::tests::all_metadata_copies_xattrs_best_effort",
+                &crate::testenv::scratch_base(),
+                "user xattrs",
+            )?;
             return Ok(());
         }
         for (flags, want) in [(FLAG_ALL_METADATA, true), (0, false)] {
@@ -1083,7 +1094,10 @@ fn uring_waits_stop_on_cancel_even_if_the_kernel_does_not_answer() -> R {
             .map_err(OpError::from)?;
         assert_eq!(u.read(&never, fd.as_raw_fd(), 16, 0), Ok(5));
     } else {
-        eprintln!("note: the kernel did not cancel the read; the engine was abandoned (by design)");
+        // Not a skip: the other allowed outcome, and checked (`healthy()` is false).
+        crate::testenv::say(
+            "note: the kernel did not cancel the read; the engine was abandoned (by design)",
+        );
     }
     drop(wr);
     Ok(())
@@ -1105,14 +1119,9 @@ fn in_mount_namespace(test: &str) -> R<bool> {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
-    // Straight to stderr, not eprintln!: the harness swallows that for passing tests.
-    let say = |line: &str| {
-        let _ = writeln!(std::io::stderr().lock(), "{line}");
-    };
+    let say = crate::testenv::say;
     if !usable {
-        say(&format!(
-            "SKIP: no user+mount namespace here: {test} did not run"
-        ));
+        crate::testenv::missing(test, "user+mount namespace");
         return Ok(false);
     }
     let out = std::process::Command::new("unshare")

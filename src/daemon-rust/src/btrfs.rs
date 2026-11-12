@@ -342,7 +342,7 @@ mod tests {
         let t = TestDir::new("btrfs").unwrap();
         let root = t.join("root");
         if create_subvolume(&root).is_err() {
-            eprintln!("skipped: no btrfs here");
+            crate::testenv::missing("btrfs::tests::subvolumes_are_found_at_any_depth", "btrfs");
             return;
         }
         fs::create_dir_all(root.join("plain/deep")).unwrap();
@@ -377,13 +377,16 @@ mod tests {
         let t = TestDir::new("btrfs-snap").unwrap();
         let root = t.join("root");
         if create_subvolume(&root).is_err() {
-            eprintln!("skipped: no btrfs here");
+            crate::testenv::missing("btrfs::tests::a_writable_snapshot_is_left_out", "btrfs");
             return;
         }
         let a = root.join("a");
         create_subvolume(&a).unwrap();
         if create_snapshot(&a, &root.join("snap")).is_err() {
-            eprintln!("skipped: no snapshot allowed here");
+            crate::testenv::missing(
+                "btrfs::tests::a_writable_snapshot_is_left_out",
+                "permission to snapshot a btrfs subvolume",
+            );
             return;
         }
         assert!(is_snapshot(&root.join("snap")));
@@ -409,7 +412,7 @@ mod tests {
         let t = TestDir::new("btrfs-many").unwrap();
         let root = t.join("root");
         if create_subvolume(&root).is_err() {
-            eprintln!("skipped: no btrfs here");
+            crate::testenv::missing("btrfs::tests::every_page_of_children_is_read", "btrfs");
             return;
         }
         let names: Vec<_> = (0..300).map(|n| root.join(format!("s{n}"))).collect();
@@ -431,7 +434,10 @@ mod tests {
         let t = TestDir::new("btrfs-skip").unwrap();
         let root = t.join("root");
         if create_subvolume(&root).is_err() {
-            eprintln!("skipped: no btrfs here");
+            crate::testenv::missing(
+                "btrfs::tests::a_skipped_subvolume_is_no_complete_answer",
+                "btrfs",
+            );
             return;
         }
         let a = root.join("a");

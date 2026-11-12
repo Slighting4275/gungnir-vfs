@@ -383,12 +383,22 @@ fn real_ioctls_where_supported() -> Result<()> {
             assert_eq!(id.fs_uuid, u);
             assert_eq!(id.fs_uuid_source, UuidSource::Ioctl);
         }
-        None => eprintln!("skipped: FS_IOC_GETFSUUID unsupported on this filesystem"),
+        None => {
+            // No uuid ioctl on this filesystem: the whole test runs on a tmpfs instead.
+            crate::testenv::rerun_on_tmpfs(
+                "fsid::tests::real_ioctls_where_supported",
+                &crate::testenv::scratch_base(),
+                "FS_IOC_GETFSUUID",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            return Ok(());
+        }
     }
     let generation = ioctl_generation(file.as_fd())?;
     assert_eq!(id.generation, generation);
     if generation == 0 {
-        eprintln!("note: FS_IOC_GETVERSION unsupported (or 0) on this filesystem");
+        // Not a skip: generation 0 is what such a filesystem reports, and is checked.
+        crate::testenv::say("note: FS_IOC_GETVERSION unsupported (or 0) on this filesystem");
     }
     // The O_PATH reopen path gives the same generation as a plain fd.
     let opath = open_raw(libc::AT_FDCWD, &cpath(&f)?, libc::O_PATH | libc::O_NOFOLLOW)?;
@@ -433,7 +443,8 @@ fn procfs_gets_a_synthetic_id_from_mountinfo() -> Result<()> {
     let b = sys()?;
     let id = b.identify_path(Path::new("/proc/self/mountinfo"))?;
     if id.fs_uuid_source != UuidSource::Synthetic {
-        eprintln!("skipped: procfs reported a uuid ({:?})", id.fs_uuid_source);
+        // A kernel that gives procfs a uuid: no skip, the id must then be stable.
+        assert_eq!(b.identify_path(Path::new("/proc/self/mountinfo"))?, id);
         return Ok(());
     }
     let c = MountCache::open()?;
@@ -449,21 +460,36 @@ fn procfs_gets_a_synthetic_id_from_mountinfo() -> Result<()> {
 
 #[test]
 fn tmpfs_uses_ioctl_or_a_boot_scoped_synthetic_id() -> Result<()> {
-    // Read-only: identifies the existing /dev/shm directory, creates nothing there.
-    let shm = Path::new("/dev/shm");
+    // Read-only: identifies the existing /dev/shm directory, creates nothing there. Where
+    // /dev/shm is missing or no tmpfs, the test runs again on a tmpfs of its own.
+    let base = crate::testenv::scratch_base();
+    let shm = if crate::testenv::on_tmpfs() {
+        base.as_path()
+    } else {
+        Path::new("/dev/shm")
+    };
     let b = sys()?;
-    let Ok(fd) = open_raw(
+    let fd = open_raw(
         libc::AT_FDCWD,
         &cpath(shm)?,
         libc::O_PATH | libc::O_NOFOLLOW,
-    ) else {
-        eprintln!("skipped: no /dev/shm");
-        return Ok(());
+    );
+    let is_tmpfs = match &fd {
+        Ok(fd) => fstatfs_type(fd.as_fd())? == magic::TMPFS,
+        Err(_) => false,
     };
-    if fstatfs_type(fd.as_fd())? != magic::TMPFS {
-        eprintln!("skipped: /dev/shm is not tmpfs");
-        return Ok(());
-    }
+    let fd = match fd {
+        Ok(fd) if is_tmpfs => fd,
+        _ => {
+            crate::testenv::rerun_on_tmpfs(
+                "fsid::tests::tmpfs_uses_ioctl_or_a_boot_scoped_synthetic_id",
+                &base,
+                "tmpfs at /dev/shm",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            return Ok(());
+        }
+    };
     let id = b.identify_fd(fd.as_fd())?;
     match id.fs_uuid_source {
         UuidSource::Synthetic => {
@@ -479,7 +505,12 @@ fn tmpfs_uses_ioctl_or_a_boot_scoped_synthetic_id() -> Result<()> {
                 synth_id(magic::TMPFS, &m.mount_point, &m.source, &boot)
             );
         }
-        other => eprintln!("note: tmpfs fs_uuid came from {other:?} on this kernel"),
+        // A kernel whose tmpfs has a uuid: it must be the ioctl's.
+        UuidSource::Ioctl => {
+            let dir = fs::File::open(shm)?;
+            assert_eq!(ioctl_fsuuid(dir.as_fd())?, Some(id.fs_uuid.clone()));
+        }
+        UuidSource::ByUuid => panic!("a tmpfs has no /dev/disk/by-uuid entry: {id:?}"),
     }
     assert_eq!(b.identify_fd(fd.as_fd())?, id);
     Ok(())
@@ -679,7 +710,32 @@ fn ioctl_and_by_uuid_agree_where_both_exist() -> Result<()> {
     let disk = by_uuid(Path::new("/dev/disk/by-uuid"), m.major, m.minor, &m.source);
     match (ioctl_fsuuid(dir.as_fd())?, disk) {
         (Some(a), Some(b)) => assert_eq!(a, b),
-        (a, b) => eprintln!("skipped: ioctl {a:?}, by-uuid {b:?} (need both)"),
+        // The ioctl but no by-uuid entry (a tmpfs): the kernel's real uuid, put in a
+        // by-uuid fixture (pointing at /dev/null, 1:3), must come back from step 2 as is.
+        (Some(a), None) => {
+            assert!(
+                a.len() == 36
+                    && a.bytes()
+                        .enumerate()
+                        .all(|(i, c)| if [8, 13, 18, 23].contains(&i) {
+                            c == b'-'
+                        } else {
+                            c.is_ascii_hexdigit() && !c.is_ascii_uppercase()
+                        }),
+                "the ioctl's uuid is not in by-uuid's form: {a}"
+            );
+            let fixture = t.join("by-uuid");
+            fs::create_dir(&fixture)?;
+            std::os::unix::fs::symlink("/dev/null", fixture.join(&a))?;
+            assert_eq!(by_uuid(&fixture, 1, 3, b"").as_deref(), Some(a.as_str()));
+        }
+        // No uuid ioctl here (btrfs): the whole test runs on a tmpfs instead.
+        (None, _) => crate::testenv::rerun_on_tmpfs(
+            "fsid::tests::ioctl_and_by_uuid_agree_where_both_exist",
+            &crate::testenv::scratch_base(),
+            "FS_IOC_GETFSUUID",
+        )
+        .unwrap_or_else(|e| panic!("{e}")),
     }
     Ok(())
 }
@@ -701,7 +757,10 @@ fn unreadable_file_or_dir_never_gets_a_different_key() -> Result<()> {
     // chmod changes ctime, and AGENTS.md forbids keys that change with it. Before the
     // fix an unreadable file silently got generation 0 (ext4: a different key).
     if euid_is_root() {
-        eprintln!("skipped: root reads everything");
+        crate::testenv::missing(
+            "fsid::tests::unreadable_file_or_dir_never_gets_a_different_key",
+            "non-root user (root reads a file of mode 000)",
+        );
         return Ok(());
     }
     let t = TestDir::new("fsid-unreadable")?;
@@ -735,14 +794,32 @@ fn unreadable_file_or_dir_never_gets_a_different_key() -> Result<()> {
 #[test]
 fn unreadable_file_without_generations_keeps_generation_0() -> Result<()> {
     // procfs has no FS_IOC_GETVERSION: an unreadable proc file keeps the readable key.
-    let p = Path::new("/proc/1/environ");
-    if !p.exists() || euid_is_root() || fs::File::open(p).is_ok() {
-        eprintln!(
-            "skipped: {} is not present or is readable here",
-            p.display()
+    // /proc/1/environ alone made the test skip under hidepid=invisible (no /proc/1 at
+    // all); root-only files outside the pid directories are never hidden.
+    if euid_is_root() {
+        crate::testenv::missing(
+            "fsid::tests::unreadable_file_without_generations_keeps_generation_0",
+            "non-root user (root reads every proc file)",
         );
         return Ok(());
     }
+    let candidates = [
+        "/proc/kcore",
+        "/proc/kmsg",
+        "/proc/sysrq-trigger",
+        "/proc/1/environ",
+    ];
+    let Some(p) = candidates
+        .iter()
+        .map(Path::new)
+        .find(|p| fs::symlink_metadata(p).is_ok() && fs::File::open(p).is_err())
+    else {
+        crate::testenv::missing(
+            "fsid::tests::unreadable_file_without_generations_keeps_generation_0",
+            &format!("unreadable procfs file (tried {candidates:?})"),
+        );
+        return Ok(());
+    };
     let id = sys()?.identify_path(p)?;
     assert_eq!(id.generation, 0);
     Ok(())

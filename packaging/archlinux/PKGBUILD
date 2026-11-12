@@ -24,10 +24,11 @@ build() {
 
 check() {
     cd "$srcdir/$pkgname-$pkgver"
-    # gungnird runs without io_uring (thread engine), so a build machine without it (an
-    # old kernel, a container) must still build the package: its io_uring tests are then
-    # skipped, each with a SKIP line. Where io_uring works, every test runs.
-    GUNGNIR_ALLOW_NO_URING=1 cargo test --release
+    # gungnird runs without io_uring (thread engine) and on any filesystem, so a build
+    # machine without io_uring, btrfs, user namespaces or FUSE (an old kernel, ext4, a
+    # container) must still build the package: the tests it cannot run are then skipped,
+    # each with a SKIP line saying so. Where a feature is there, its tests run.
+    GUNGNIR_ALLOW_NO_URING=1 GUNGNIR_ALLOW_MISSING=1 cargo test --release
     ./zb test --summary all
 }
 
