@@ -1204,7 +1204,7 @@ fn sweep_temp_ledger_with(
     at: &mut dyn FnMut(SweepPoint),
 ) -> std::io::Result<usize> {
     use std::{collections::BTreeMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, rc::Rc};
-    let text = match std::fs::read(ledger) {
+    let text = match read_ledger(ledger) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
@@ -1301,10 +1301,7 @@ fn sweep_temp_ledger_with(
             }
         }
     }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(ledger)?
-        .set_len(0)?;
+    open_ledger(ledger, true)?.set_len(0)?;
     Ok(removed)
 }
 
@@ -1369,6 +1366,35 @@ fn first_op_id() -> u64 {
         .max(1)
 }
 
+/// Open a ledger file (`append`: to add to it, created 0600 if missing) without blocking
+/// and without following a link; anything but a regular file is `EINVAL`. A FIFO under a
+/// ledger's name blocked the start in `open(2)`, before serving or handling a signal.
+///
+/// # Errors
+/// The open error, or `EINVAL`.
+pub fn open_ledger(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(!append)
+        .append(append)
+        .create(append)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(f)
+}
+
+/// [`open_ledger`] for reading, the whole file (`NotFound` if there is none).
+fn read_ledger(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut text = Vec::new();
+    open_ledger(path, false)?.read_to_end(&mut text)?;
+    Ok(text)
+}
+
 /// Run the sweep of [`sweep_temp_ledger`] without making startup wait for it: a temp file
 /// can be on a mount that stayed hung, and a daemon that never starts helps nobody. The
 /// ledger moves aside at once, so new ops start a fresh one; what a crashed sweep left
@@ -1377,16 +1403,12 @@ fn first_op_id() -> u64 {
 /// # Errors
 /// The ledger cannot be moved aside, or no thread can be started.
 pub fn detach_temp_sweep(ledger: &std::path::Path) -> std::io::Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    use std::io::Write;
     let aside = ledger.with_extension("sweep");
     for from in [ledger.to_path_buf(), ledger.with_extension("kept")] {
-        match std::fs::read(&from) {
+        match read_ledger(&from) {
             Ok(text) => {
-                let mut f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .mode(0o600)
-                    .open(&aside)?;
+                let mut f = open_ledger(&aside, true)?;
                 // On a line of its own: what is already there may end in a torn write.
                 f.write_all(b"\n")?;
                 f.write_all(&text)?;

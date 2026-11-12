@@ -264,6 +264,147 @@ fn prepare_files(path: &Path) -> Result<()> {
 /// I/O errors creating the directory or file, [`Error::InsecureDbDir`], SQLite errors,
 /// or [`Error::WalUnavailable`] if SQLite does not switch to WAL.
 pub fn open_db(path: &Path, busy_timeout: Duration) -> Result<Connection> {
+    // A file that does not even start like a database is set aside before SQLite opens
+    // it: closing a failed connection deletes its `-wal`, which may hold the latest data.
+    if path.as_os_str() != ":memory:" && has_foreign_header(path)? {
+        let aside = set_aside(path)?;
+        eprintln!(
+            "gungnird: metadata db {} is not a SQLite database; kept as {} and starting with an empty one",
+            path.display(),
+            aside.display()
+        );
+    }
+    match open_db_once(path, busy_timeout) {
+        // A file SQLite cannot read as a database (a zeroed header after a power loss, a
+        // stray write) failed every start, so the whole daemon stayed down. Its bytes are
+        // kept beside it, never deleted, and the store starts empty. The caller holds the
+        // store lock, so no other daemon is using the file.
+        Err(Error::Sqlite(e)) if is_damaged(&e) && path.as_os_str() != ":memory:" => {
+            let aside = set_aside(path)?;
+            eprintln!(
+                "gungnird: metadata db {} is damaged ({e}); kept as {} and starting with an empty one",
+                path.display(),
+                aside.display()
+            );
+            open_db_once(path, busy_timeout)
+        }
+        r => r,
+    }
+}
+
+/// A non-empty regular file whose first 16 bytes are not SQLite's header.
+fn has_foreign_header(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if !f.metadata()?.is_file() {
+        return Ok(false); // left to prepare_files, which refuses it
+    }
+    let mut head = Vec::with_capacity(16);
+    f.take(16).read_to_end(&mut head)?;
+    Ok(!head.is_empty() && head.as_slice() != b"SQLite format 3\0")
+}
+
+fn is_damaged(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)
+    )
+}
+
+/// Rename `db` and its `-wal`/`-shm` to `<db>.corrupt-<secs>[-n]` (never over anything).
+fn set_aside(db: &Path) -> Result<PathBuf> {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for n in 0..1000u32 {
+        let mut aside = db.as_os_str().to_os_string();
+        aside.push(format!(".corrupt-{secs}"));
+        if n > 0 {
+            aside.push(format!("-{n}"));
+        }
+        let aside = PathBuf::from(aside);
+        match rename_noreplace(db, &aside) {
+            Ok(()) => {
+                // Private like the store (the directory already is).
+                make_private(&aside)?;
+                for sfx in ["-wal", "-shm"] {
+                    let (mut from, mut to) = (
+                        db.as_os_str().to_os_string(),
+                        aside.as_os_str().to_os_string(),
+                    );
+                    from.push(sfx);
+                    to.push(sfx);
+                    match rename_noreplace(Path::new(&from), Path::new(&to)) {
+                        Ok(()) => make_private(Path::new(&to))?,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                return Ok(aside);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::EEXIST).into())
+}
+
+/// chmod 0600 through a descriptor of the file itself (a link is left alone).
+fn make_private(p: &Path) -> Result<()> {
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(p);
+    match f {
+        Ok(f) if f.metadata()?.is_file() => f.set_permissions(fs::Permissions::from_mode(0o600))?,
+        Ok(_) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    };
+    let (f, t) = (c(from)?, c(to)?);
+    // SAFETY: two valid NUL-terminated paths.
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() != Some(libc::EINVAL) {
+        return Err(e);
+    }
+    // A filesystem without RENAME_NOREPLACE: look first (the store lock is held).
+    match fs::symlink_metadata(to) {
+        Ok(_) => Err(std::io::Error::from_raw_os_error(libc::EEXIST)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::rename(from, to),
+        Err(e) => Err(e),
+    }
+}
+
+fn open_db_once(path: &Path, busy_timeout: Duration) -> Result<Connection> {
     prepare_files(path)?;
     let conn = Connection::open(path)?;
     harden(&conn)?;

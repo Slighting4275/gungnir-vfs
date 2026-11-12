@@ -967,3 +967,110 @@ fn a_planted_trigger_never_fires() -> Result<()> {
     assert_eq!(fired, 0, "a planted trigger ran inside the daemon");
     Ok(())
 }
+
+/// The siblings of `db` whose names start with `<db name>.corrupt-`.
+fn quarantined(db: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.corrupt-",
+        db.file_name().and_then(OsStr::to_str).unwrap_or("")
+    );
+    let mut out: Vec<PathBuf> = db
+        .parent()
+        .and_then(|d| fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_damaged_database_is_kept_aside_and_a_fresh_one_opens() -> Result<()> {
+    // A database whose header is gone (zeroed pages after a power loss, a stray write)
+    // made every start fail with "file is not a database": the whole daemon stayed down.
+    for (name, junk) in [
+        (
+            "garbage",
+            (0..8192u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect::<Vec<u8>>(),
+        ),
+        ("zeroed", vec![0u8; 8192]),
+    ] {
+        let t = TestStore::new(&format!("damaged-{name}"))?;
+        prepare_dir(&t.path)?;
+        fs::write(&t.path, &junk)?;
+        let mut wal = t.path.as_os_str().to_os_string();
+        wal.push("-wal");
+        fs::write(&wal, b"old wal")?;
+        let mut s = t.open()?;
+        let a = id(7);
+        s.set(&a, "k", &enc(&Value::String("v".into())), None)?;
+        assert!(s.get(&a, "k")?.is_some(), "{name}: the fresh store works");
+        let aside = quarantined(&t.path);
+        let main: Vec<&PathBuf> = aside
+            .iter()
+            .filter(|p| !p.to_string_lossy().ends_with("-wal"))
+            .collect();
+        assert_eq!(main.len(), 1, "{name}: {aside:?}");
+        assert_eq!(
+            fs::read(main[0])?,
+            junk,
+            "{name}: the damaged bytes are kept, untouched"
+        );
+        let mut old_wal = main[0].as_os_str().to_os_string();
+        old_wal.push("-wal");
+        assert_eq!(
+            fs::read(&old_wal)?,
+            b"old wal",
+            "{name}: its journal went with it"
+        );
+        let md = fs::metadata(main[0])?;
+        assert_eq!(md.mode() & 0o777, 0o600, "{name}: still private");
+        drop(s);
+        // A healthy database is never moved.
+        let mut s = t.open()?;
+        assert_eq!(quarantined(&t.path).len(), aside.len(), "{name}");
+        assert!(s.get(&a, "k")?.is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_file_that_cannot_be_opened_is_not_moved_aside() -> Result<()> {
+    // Only a database SQLite reads as damaged is set aside; another failure stays an error.
+    let t = TestStore::new("unreadable-dir")?;
+    prepare_dir(&t.path)?;
+    fs::create_dir(&t.path)?;
+    assert!(t.open().is_err());
+    assert!(quarantined(&t.path).is_empty());
+    assert!(t.path.is_dir());
+    Ok(())
+}
+
+#[test]
+fn a_database_with_a_broken_schema_page_is_kept_aside() -> Result<()> {
+    // The header is intact, the schema page is not: "database disk image is malformed".
+    let t = TestStore::new("malformed")?;
+    drop(t.open()?);
+    let mut bytes = fs::read(&t.path)?;
+    for (i, b) in bytes.iter_mut().enumerate().take(4096).skip(100) {
+        *b = (i as u8).wrapping_mul(37);
+    }
+    fs::write(&t.path, &bytes)?;
+    let mut s = t.open()?;
+    s.set(&id(9), "k", &enc(&Value::String("v".into())), None)?;
+    let aside = quarantined(&t.path);
+    let main: Vec<&PathBuf> = aside
+        .iter()
+        .filter(|p| {
+            !p.to_string_lossy().ends_with("-wal") && !p.to_string_lossy().ends_with("-shm")
+        })
+        .collect();
+    assert_eq!(main.len(), 1, "{aside:?}");
+    assert_eq!(fs::read(main[0])?, bytes);
+    Ok(())
+}

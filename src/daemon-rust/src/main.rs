@@ -1,7 +1,4 @@
-use std::{
-    env, ffi::OsString, os::unix::fs::OpenOptionsExt, path::PathBuf, process::ExitCode, sync::Arc,
-    time::Duration,
-};
+use std::{env, ffi::OsString, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
 use gungnird::{
     Error, Result,
@@ -350,22 +347,12 @@ fn serve_daemon(
     if let Err(e) = ops::detach_temp_sweep(&ledger_path) {
         eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display());
     }
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(&ledger_path)
-    {
+    match ops::open_ledger(&ledger_path, true) {
         Ok(f) => ops_for_ledger.set_temp_ledger(f),
         Err(e) => eprintln!("gungnird: temp ledger {}: {e}", ledger_path.display()),
     }
     let kept_path = ledger_path.with_extension("kept");
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(&kept_path)
-    {
+    match ops::open_ledger(&kept_path, true) {
         Ok(f) => ops_for_ledger.set_kept_ledger(f),
         Err(e) => eprintln!("gungnird: temp ledger {}: {e}", kept_path.display()),
     }
