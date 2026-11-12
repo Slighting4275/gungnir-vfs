@@ -1176,15 +1176,20 @@ impl Mount {
 impl Mount {
     /// A fresh tmpfs at `dst` (a second filesystem).
     fn tmpfs(dst: &Path) -> R<Self> {
+        Self::tmpfs_with(dst, None)
+    }
+
+    /// A tmpfs with mount options (e.g. `size=2m`: a disk that fills up).
+    fn tmpfs_with(dst: &Path, opts: Option<&CStr>) -> R<Self> {
         let d = CString::new(dst.as_os_str().as_bytes())?;
-        // SAFETY: valid NUL-terminated strings.
+        // SAFETY: valid NUL-terminated strings; the options string outlives the call.
         let r = unsafe {
             libc::mount(
                 c"tmpfs".as_ptr(),
                 d.as_ptr(),
                 c"tmpfs".as_ptr(),
                 0,
-                std::ptr::null(),
+                opts.map_or(std::ptr::null(), |o| o.as_ptr().cast()),
             )
         };
         if r != 0 {
@@ -1199,6 +1204,81 @@ impl Drop for Mount {
         // SAFETY: valid path.
         unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
     }
+}
+
+/// A disk that fills up mid-copy (a 2 MiB tmpfs, a 6 MiB file): copy and cross-device
+/// move fail with ENOSPC, leave no partial destination and no temp file, and the move
+/// keeps its source (copy + unlink must not unlink after a failed copy). What fits still
+/// copies afterwards.
+#[test]
+fn a_full_disk_fails_cleanly_and_never_loses_the_source() -> R {
+    const TEST: &str = "ops::tests::a_full_disk_fails_cleanly_and_never_loses_the_source";
+    if !in_mount_namespace(TEST)? {
+        return Ok(());
+    }
+    let t = TestDir::new("op-full")?;
+    let mnt = t.join("small");
+    fs::create_dir(&mnt)?;
+    let _small = Mount::tmpfs_with(&mnt, Some(c"size=2m"))?;
+    let temps = || -> R<Vec<String>> {
+        Ok(fs::read_dir(&mnt)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".gungnir-"))
+            .collect())
+    };
+    for engine in engines() {
+        let ops = start(engine, test_cfg())?;
+        let data = pattern(6 << 20, 5);
+        let src = t.join(&format!("big-{engine:?}"));
+        fs::write(&src, &data)?;
+        let dest = mnt.join("copy");
+        let (d, _) = run(&ops, req(OpKind::Copy, 0, &src, Some(&dest)))?;
+        assert_eq!(
+            os(&d),
+            Some(libc::ENOSPC),
+            "{engine:?} copy: {:?}",
+            d.result
+        );
+        assert!(
+            fs::symlink_metadata(&dest).is_err(),
+            "{engine:?}: a partial copy is left"
+        );
+        assert_eq!(
+            temps()?,
+            Vec::<String>::new(),
+            "{engine:?}: temp left after copy"
+        );
+        let moved = mnt.join("moved");
+        let (d, _) = run(&ops, req(OpKind::Move, 0, &src, Some(&moved)))?;
+        assert_eq!(
+            os(&d),
+            Some(libc::ENOSPC),
+            "{engine:?} move: {:?}",
+            d.result
+        );
+        assert!(
+            fs::symlink_metadata(&moved).is_err(),
+            "{engine:?}: a partial move is left"
+        );
+        assert_eq!(
+            fs::read(&src)?,
+            data,
+            "{engine:?}: the move lost or changed its source"
+        );
+        assert_eq!(
+            temps()?,
+            Vec::<String>::new(),
+            "{engine:?}: temp left after move"
+        );
+        // The space is free again: what fits copies.
+        let small = t.join(&format!("small-{engine:?}"));
+        fs::write(&small, pattern(512 << 10, 6))?;
+        let (d, _) = run(&ops, req(OpKind::Copy, 0, &small, Some(&mnt.join("fits"))))?;
+        assert_eq!(d.result, Ok(()), "{engine:?}");
+        fs::remove_file(mnt.join("fits"))?;
+    }
+    Ok(())
 }
 
 /// A bind mount of a directory of the SAME filesystem has the tree's `st_dev`, so an

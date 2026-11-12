@@ -16,3 +16,11 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 # treat <dir> as a mount whose health probes never return. Off in normal builds; the
 # Zig integration test builds gungnird with it.
 test-hooks = []
+
+# Test-only helper for the cross-user tests (tests/lifecycle.rs); built only with the
+# test-hooks feature, never shipped.
+[[bin]]
+name = "gungnir-peer-probe"
+path = "tests/bin/peer_probe.rs"
+required-features = ["test-hooks"]
+test = false

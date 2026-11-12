@@ -890,3 +890,79 @@ fn a_damaged_database_does_not_stop_the_daemon() -> R {
     assert_eq!(fs::read(kept[0].path())?, junk);
     Ok(())
 }
+
+/// PEN-1: the daemon's own peer check (`SO_PEERCRED`) refuses another user, even where
+/// the socket's mode would let them in (a socket unit with a loose `SocketMode`, adopted
+/// through socket activation as systemd would hand it over). A second user is a real
+/// other uid (a subordinate uid in a user namespace); the probe is a test-only binary.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn another_user_is_refused_even_through_an_open_socket() -> R {
+    const TEST: &str = "another_user_is_refused_even_through_an_open_socket";
+    let dir = Dir::new("peer")?;
+    let shared = dir.0.join("shared");
+    fs::create_dir(&shared)?;
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777))?;
+    let sock_path = shared.join("s.sock");
+    let listener = UnixListener::bind(&sock_path)?;
+    fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o777))?;
+    let probe = shared.join("probe");
+    fs::copy(env!("CARGO_BIN_EXE_gungnir-peer-probe"), &probe)?;
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))?;
+    let raw_fd = listener.as_raw_fd();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+    cmd.arg("--seccomp")
+        .arg("-d")
+        .arg(dir.0.join("meta.db"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.0.join("log"))?);
+    // SAFETY: async-signal-safe calls only, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(3, libc::F_GETFD);
+            libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            let pid = libc::getpid().to_string();
+            let c_pid = CString::new(pid).map_err(|e| std::io::Error::other(e.to_string()))?;
+            libc::setenv(c"LISTEN_FDS".as_ptr(), c"1".as_ptr(), 1);
+            libc::setenv(c"LISTEN_PID".as_ptr(), c_pid.as_ptr(), 1);
+            Ok(())
+        });
+    }
+    let _daemon = Reap(cmd.spawn()?);
+    let log = || fs::read_to_string(dir.0.join("log")).unwrap_or_default();
+    // Control: our own user gets the hello reply through the same socket.
+    assert!(answers(&sock_path, b"own"), "{}", log());
+    let own = Command::new(&probe).arg(&sock_path).output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&own.stdout).trim(),
+        "REPLY",
+        "{}",
+        log()
+    );
+    // Another user connects (the socket lets them) and is hung up on, no reply.
+    let Some(out) = gungnird::testenv::as_other_user(
+        TEST,
+        &shared,
+        &[
+            std::ffi::OsStr::new("./probe"),
+            std::ffi::OsStr::new("s.sock"),
+        ],
+    )?
+    else {
+        return Ok(());
+    };
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.starts_with("CLOSED"),
+        "another user got: {said} {}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        log()
+    );
+    // ... and the daemon goes on serving its own user.
+    assert!(answers(&sock_path, b"still"), "{}", log());
+    Ok(())
+}

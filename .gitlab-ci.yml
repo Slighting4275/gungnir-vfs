@@ -100,6 +100,9 @@ default:
 .as-tester: &as-tester
   - |
     id tester >/dev/null 2>&1 || useradd -m -U tester
+    # A subordinate uid range, so the cross-user tests can run a second user (a SKIP line
+    # in the log where the container cannot map one).
+    grep -q '^tester:' /etc/subuid 2>/dev/null || usermod --add-subuids 200000-265535 --add-subgids 200000-265535 tester || echo "no subordinate ids for tester"
     chown -R tester:tester "$CI_PROJECT_DIR"
 
 # Every job normally finishes in under 4 minutes, so a stalled runner or a hung step

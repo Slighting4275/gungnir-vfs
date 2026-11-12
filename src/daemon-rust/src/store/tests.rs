@@ -1074,3 +1074,55 @@ fn a_database_with_a_broken_schema_page_is_kept_aside() -> Result<()> {
     assert_eq!(fs::read(main[0])?, bytes);
     Ok(())
 }
+
+/// A disk that fills up (a 4 MiB tmpfs): a write that does not fit fails as a database
+/// error, never a panic; what was stored stays readable; once space is free again writes
+/// work; and the database reopens intact (SQLite's integrity_check).
+#[test]
+fn a_full_disk_fails_writes_cleanly_and_keeps_what_was_there() -> Result<()> {
+    const TEST: &str = "store::tests::a_full_disk_fails_writes_cleanly_and_keeps_what_was_there";
+    if !crate::testenv::on_tmpfs() {
+        crate::testenv::rerun_on_small_tmpfs(TEST, &crate::testenv::scratch_base(), "4m")
+            .unwrap_or_else(|e| panic!("{e}"));
+        return Ok(());
+    }
+    let t = TestStore::new("full")?;
+    let ballast = t.dir.join("ballast");
+    fs::write(&ballast, vec![0u8; 512 << 10])?;
+    let mut s = t.open()?;
+    let keep = id(1);
+    s.set(&keep, "k", &enc(&Value::String("kept".into())), None)?;
+    let big = enc(&Value::String("x".repeat(3000)));
+    let mut failure = None;
+    for i in 2..100_000u64 {
+        if let Err(e) = s.set(&id(i), "k", &big, None) {
+            failure = Some((i, e));
+            break;
+        }
+    }
+    let (filled_at, e) = failure.unwrap_or_else(|| panic!("the 4 MiB disk never filled"));
+    assert_eq!(e, MdError::Db, "after {filled_at} rows");
+    assert_eq!(
+        s.get(&keep, "k")?.map(|b| Value::decode(&b)),
+        Some(Ok(Value::String("kept".into())))
+    );
+    fs::remove_file(&ballast)?;
+    s.set(&id(filled_at), "k", &big, None)
+        .unwrap_or_else(|e| panic!("still failing once space was free: {e:?}"));
+    drop(s);
+    let s = t.open()?;
+    let ok: String = s
+        .conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    assert_eq!(ok, "ok");
+    let mut s = s;
+    assert!(
+        s.get(&keep, "k")?.is_some(),
+        "the row written before the disk filled is gone"
+    );
+    assert!(
+        s.get(&id(filled_at), "k")?.is_some(),
+        "the row written after is gone"
+    );
+    Ok(())
+}

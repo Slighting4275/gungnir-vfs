@@ -1026,3 +1026,188 @@ fn a_dead_fuse_mount_does_not_make_the_trash_listing_incomplete() -> R {
     );
     Ok(())
 }
+
+/// PEN-2: on a shared volume, another user plants trash directories under our names
+/// (`.Trash-<our uid>` and `.Trash/<our uid>`, theirs, with items whose `Path=` names a
+/// file of ours). None of it is our data: it is not listed, cannot be restored (which
+/// would put their content at our path) or deleted through us. A second user is a real
+/// other uid (a subordinate uid in a user namespace).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn another_users_trash_under_our_name_is_never_ours() -> R {
+    const TEST: &str = "another_users_trash_under_our_name_is_never_ours";
+    let d = Dir::new("foreign")?;
+    trash_dir(&d)?;
+    let vol = d.join("vol");
+    fs::create_dir(&vol)?;
+    fs::set_permissions(&vol, fs::Permissions::from_mode(0o1777))?;
+    // SAFETY: plain getter.
+    let me = unsafe { libc::geteuid() };
+    let plant = format!(
+        "umask 022; for t in .Trash-{me} .Trash/{me}; do mkdir -p \"$t/files\" \"$t/info\" || exit 1; \
+         echo planted > \"$t/files/report\"; \
+         printf '[Trash Info]\\nPath=report\\nDeletionDate=2026-11-12T10:00:00\\n' > \"$t/info/report.trashinfo\"; \
+         done; chmod 1777 .Trash"
+    );
+    let Some(out) = gungnird::testenv::as_other_user(
+        TEST,
+        &vol,
+        &[
+            std::ffi::OsStr::new("sh"),
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new(&plant),
+        ],
+    )?
+    else {
+        return Ok(());
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    use std::os::unix::fs::MetadataExt;
+    let foreign = fs::metadata(vol.join(format!(".Trash-{me}")))?.uid();
+    assert_ne!(foreign, me, "the planted trash must belong to another user");
+    let mut dm = start(
+        &d,
+        false,
+        &[(gungnird::vfssvc::TEST_TOP_ENV, vol.to_str().ok_or("path")?)],
+    )?;
+    let rows = list(&mut dm.c, SCHEME_TRASH)?;
+    assert!(
+        rows.is_empty(),
+        "another user's trash was listed as ours: {rows:?}"
+    );
+    for t in [format!(".Trash-{me}"), format!(".Trash/{me}")] {
+        let name = format!("{}-report", hexed(vol.join(&t).as_os_str().as_bytes()));
+        assert_ne!(
+            restore(&mut dm.c, name.as_bytes(), b"")?,
+            ST_OK,
+            "{t}: restored"
+        );
+        assert_ne!(
+            delete(&mut dm.c, SCHEME_TRASH, name.as_bytes())?,
+            ST_OK,
+            "{t}: deleted"
+        );
+        assert!(
+            vol.join(&t).join("files/report").exists(),
+            "{t}: their item was touched"
+        );
+    }
+    assert!(
+        !vol.join("report").exists(),
+        "their content was restored at our path"
+    );
+    let (st, _) = call(&mut dm.c, MSG_TRASH_EMPTY, &[])?;
+    assert_eq!(st, ST_OK);
+    for t in [format!(".Trash-{me}"), format!(".Trash/{me}")] {
+        assert!(
+            vol.join(&t).join("files/report").exists(),
+            "{t}: emptied with ours"
+        );
+    }
+    drop(dm);
+    // Control: the same layout made by us on another volume is ours, listed and deletable
+    // by the same kind of name, so the refusals above are the ownership check at work.
+    let own = d.join("own-vol");
+    let ot = own.join(format!(".Trash-{me}"));
+    fs::create_dir_all(ot.join("files"))?;
+    fs::create_dir_all(ot.join("info"))?;
+    fs::write(ot.join("files/report"), b"ours")?;
+    fs::write(
+        ot.join("info/report.trashinfo"),
+        "[Trash Info]\nPath=report\nDeletionDate=2026-11-12T10:00:00\n",
+    )?;
+    let mut dm = start(
+        &d,
+        false,
+        &[(gungnird::vfssvc::TEST_TOP_ENV, own.to_str().ok_or("path")?)],
+    )?;
+    assert_eq!(
+        list(&mut dm.c, SCHEME_TRASH)?.len(),
+        1,
+        "control: ours is listed"
+    );
+    let name = format!("{}-report", hexed(ot.as_os_str().as_bytes()));
+    assert_eq!(
+        delete(&mut dm.c, SCHEME_TRASH, name.as_bytes())?,
+        ST_OK,
+        "control"
+    );
+    assert!(!ot.join("files/report").exists(), "control: deleted");
+    Ok(())
+}
+
+/// PEN-3: invalid input at the real boundary. Random payloads of every request kind but
+/// the destructive ones that need no payload to act (empty) and file ops (a random path
+/// could name something real), sent to a live sandboxed daemon: it never dies or panics,
+/// still answers, and a trashed item next to it is untouched.
+#[test]
+fn random_requests_over_the_socket_change_nothing_and_never_kill_the_daemon() -> R {
+    let d = Dir::new("rand")?;
+    let t = trash_dir(&d)?;
+    trashed(&t, "canary", &d.join("canary"))?;
+    let mut dm = start(&d, false, &[])?;
+    let kinds: [u32; 18] = [
+        0, 1, 2, 16, 17, 18, 19, 20, 21, 22, 23, 24, 40, 41, 42, 45, 46, 47,
+    ];
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let (mut sent, mut answered) = (0u32, 0u32);
+    for i in 0..6000u32 {
+        let kind = if i % 50 == 49 {
+            999
+        } else {
+            kinds[(next() % kinds.len() as u64) as usize]
+        };
+        let len = match next() % 4 {
+            0 => (next() % 4) as usize,
+            1 => (next() % 32) as usize,
+            2 => (next() % 300) as usize,
+            _ => 2 + (next() % 64) as usize,
+        };
+        let mut p: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        // Half of them look like the real thing: a plausible scheme and len16 prefix.
+        if i % 2 == 0 && p.len() >= 3 {
+            p[0] %= 3;
+            let n = (p.len() - 3) as u16;
+            p[1..3].copy_from_slice(&n.to_le_bytes());
+        }
+        let seq = dm.c.send(kind, &p)?;
+        sent += 1;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(300) {
+            match dm.c.recv(Duration::from_millis(300)) {
+                Ok(m) if m.seq == seq => {
+                    answered += 1;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let mut c = Client::connect(&d.join("s.sock"), Duration::from_secs(5))?;
+    assert_eq!(c.ping(b"alive")?, b"alive", "the daemon stopped answering");
+    assert!(dm.child.try_wait()?.is_none(), "the daemon died");
+    let log = fs::read_to_string(d.join("log"))?;
+    assert!(!log.contains("panicked"), "{log}");
+    assert_eq!(
+        fs::read(t.join("files/canary"))?,
+        b"payload",
+        "the canary changed"
+    );
+    assert!(
+        t.join("info/canary.trashinfo").exists(),
+        "the canary's info went"
+    );
+    assert!(answered > sent / 2, "only {answered} of {sent} answered");
+    Ok(())
+}

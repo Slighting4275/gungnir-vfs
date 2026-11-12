@@ -102,17 +102,50 @@ pub mod testenv {
         if on_tmpfs() {
             return Err(format!("{test}: even a tmpfs here has no {what}"));
         }
+        if rerun_with_tmpfs(
+            test,
+            base,
+            &format!("{what}, and no user namespace to mount a tmpfs with it"),
+            "",
+        )? {
+            say(&format!(
+                "note: this filesystem lacks {what}: {test} ran on a tmpfs instead"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run test `test` again (as [`rerun_on_tmpfs`]) on a tmpfs of at most `size` (as
+    /// `mount -o size=`), for a test of a disk that fills up. `Ok` if it passed there.
+    /// The caller runs its checks when [`on_tmpfs`] is true and calls this otherwise.
+    ///
+    /// # Errors
+    /// The rerun failed, or could not be started.
+    pub fn rerun_on_small_tmpfs(test: &str, base: &Path, size: &str) -> Result<(), String> {
+        rerun_with_tmpfs(
+            test,
+            base,
+            "user namespace to mount a small tmpfs (a disk that fills up)",
+            &format!(",size={size}"),
+        )
+        .map(drop)
+    }
+
+    /// The rerun itself; `Ok(false)` where no namespace can be made (after [`missing`]).
+    fn rerun_with_tmpfs(
+        test: &str,
+        base: &Path,
+        missing_what: &str,
+        opts: &str,
+    ) -> Result<bool, String> {
         let usable = Command::new("unshare")
             .args(["-rm", "true"])
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
         if !usable {
-            missing(
-                test,
-                &format!("{what}, and no user namespace to mount a tmpfs with it"),
-            );
-            return Ok(());
+            missing(test, missing_what);
+            return Ok(false);
         }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
@@ -121,9 +154,10 @@ pub mod testenv {
                 "-rm",
                 "sh",
                 "-c",
-                "mount -t tmpfs -o mode=0700 gungnir-test \"$0\" && exec \"$@\"",
+                "mount -t tmpfs -o \"mode=0700$1\" gungnir-test \"$0\" && shift && exec \"$@\"",
             ])
             .arg(base)
+            .arg(opts)
             .arg(&exe)
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(ON_TMPFS_ENV, "1")
@@ -137,14 +171,54 @@ pub mod testenv {
         text.lines().filter(|l| l.starts_with("SKIP")).for_each(say);
         if !out.status.success() || !text.contains("test result: ok. 1 passed") {
             return Err(format!(
-                "{test} failed in its rerun on tmpfs (no {what} here) ({}):\n{text}",
+                "{test} failed in its rerun on a tmpfs ({}):\n{text}",
                 out.status
             ));
         }
-        say(&format!(
-            "note: this filesystem lacks {what}: {test} ran on a tmpfs instead"
-        ));
-        Ok(())
+        Ok(true)
+    }
+
+    /// Run `cmd` (program, then arguments) as a second, unprivileged user in directory
+    /// `cwd`, for the cross-user tests: a user namespace maps a subordinate uid
+    /// (`newuidmap`, `/etc/subuid`), so the process really runs as another uid than
+    /// ours; the directory is entered before the switch, so its ancestors need not be
+    /// open to that user. `Ok(None)` (after [`missing`]) where no second user can be made.
+    ///
+    /// # Errors
+    /// The command could not be started.
+    pub fn as_other_user(
+        test: &str,
+        cwd: &Path,
+        cmd: &[&std::ffi::OsStr],
+    ) -> Result<Option<std::process::Output>, String> {
+        let usable = Command::new("unshare")
+            .args(["--user", "--map-auto", "--map-root-user", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            missing(
+                test,
+                "second user (a subordinate uid range: newuidmap and an /etc/subuid entry)",
+            );
+            return Ok(None);
+        }
+        Command::new("unshare")
+            .args([
+                "--user",
+                "--map-auto",
+                "--map-root-user",
+                "sh",
+                "-c",
+                "cd \"$1\" && shift && exec setpriv --reuid=1000 --regid=1000 --clear-groups \"$@\"",
+                "sh",
+            ])
+            .arg(cwd)
+            .args(cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     /// `<repo>/.build/tmp`, where every test keeps its scratch directories.
