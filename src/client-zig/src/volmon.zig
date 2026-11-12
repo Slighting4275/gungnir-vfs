@@ -386,9 +386,14 @@ fn monitorGetMountForMountPath(mount_path_c: [*c]const u8, cancellable: [*c]c.GC
 }
 
 fn parseMounts() !*c.GList {
+    return parseMountsAt("/proc/self/mountinfo");
+}
+
+/// [`parseMounts`] on the mountinfo text in the file `path`.
+fn parseMountsAt(path: [*:0]const u8) !*c.GList {
     var raw_content: [*c]u8 = null;
     var length: c.gsize = 0;
-    if (c.g_file_get_contents("/proc/self/mountinfo", &raw_content, &length, null) == 0) {
+    if (c.g_file_get_contents(path, &raw_content, &length, null) == 0) {
         return error.CannotOpenMountinfo;
     }
     defer c.g_free(raw_content);
@@ -412,8 +417,12 @@ fn attachVolume(gmount: *GungnirMount) void {
 /// One GungnirMount (with its volume) per accepted mount point of `content`. A mount
 /// point mounted over again appears once, as its topmost (last) mount.
 fn mountsFrom(content: []const u8) !*c.GList {
+    return mountsFromFor(content, processUser());
+}
+
+/// [`mountsFrom`] with the display rule evaluated for `user`.
+fn mountsFromFor(content: []const u8, user: mountfilter.User) !*c.GList {
     var list: ?*c.GList = null;
-    const user = processUser();
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |line| {
         var line_buf: mountfilter.LineBuf = .{};
@@ -785,25 +794,21 @@ test "unescape handles octal sequences" {
 
 test "mountsFrom lists only what the display rule keeps, each mount point once" {
     ensureRegisteredForTest();
-    const user = processUser();
-    // The fixture writes the home directory into mountinfo unescaped.
-    if (user.home.len < 2 or std.mem.indexOfAny(u8, user.home, " \t\n\\") != null or std.mem.indexOf(u8, user.home, "/.") != null)
-        return error.SkipZigTest;
-    var path_buf: [1100]u8 = undefined;
-    const own = std.fmt.bufPrint(&path_buf, "{s}/own-store", .{user.home}) catch return error.SkipZigTest;
-    var info_buf: [4096]u8 = undefined;
-    const info = std.fmt.bufPrint(&info_buf,
+    // A fixed user, so the fixture never depends on the real home directory's spelling.
+    const user: mountfilter.User = .{ .name = "user", .home = "/home/user", .is_root = false };
+    const own = "/home/user/own-store";
+    const info =
         \\1 0 0:1 / / rw - btrfs /dev/sda2 rw
         \\2 1 0:2 / /proc rw - proc proc rw
         \\3 1 0:3 / /media rw - tmpfs tmpfs rw
         \\4 3 0:4 / /media/stick rw - ramfs none2 rw
         \\5 3 0:5 / /media/stick rw - vfat /dev/sdb1 rw
-        \\6 1 0:6 / {s} rw - ramfs none3 rw
+        \\6 1 0:6 / /home/user/own-store rw - ramfs none3 rw
         \\7 1 0:7 /sub /media/bind rw - ext4 /dev/sdc1 rw
         \\8 1 0:8 / /cursor/stores rw - fuse.agent-store agent rw
         \\
-    , .{own}) catch return error.SkipZigTest;
-    const list = try mountsFrom(info);
+    ;
+    const list = try mountsFromFor(info, user);
     defer c.g_list_free_full(list, @ptrCast(&c.g_object_unref));
     try std.testing.expectEqual(@as(c.guint, 2), c.g_list_length(list));
     const first: *GungnirMount = @ptrCast(@alignCast(list.*.data));
@@ -868,22 +873,64 @@ test "a mount and its volume point at each other and are freed together (DIB-F01
     try std.testing.expect(vol_gone == null);
 }
 
-test "parseMounts extracts live mounts from mountinfo" {
+test "parseMounts reads a mountinfo file and lists its mounts" {
     ensureRegisteredForTest();
-    const mounts = parseMounts() catch |err| {
-        // If /proc/self/mountinfo is inaccessible in restricted sandbox, skip gracefully.
-        // A machine may also have no storage the display rule keeps (F01b: GLib hides
-        // /, /home and /boot); the fixtures above cover the rule itself.
-        if (err == error.CannotOpenMountinfo or err == error.NoMounts) return error.SkipZigTest;
-        return err;
-    };
+    // A fixture file, so the test never depends on what this machine has mounted (a
+    // machine whose only storage is /, /home and /boot has nothing the rule keeps).
+    // Under ~/.cache/gungnir, where test files belong (AGENTS.md).
+    const user = processUser();
+    var dir_buf: [1100]u8 = undefined;
+    const dir = try std.mem.printSentinel(&dir_buf, "{s}/.cache/gungnir", .{user.home}, 0);
+    _ = std.os.linux.mkdir(dir, 0o700);
+    var path_buf: [1200]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "{s}/zig-unit-mountinfo-{d}", .{ dir, std.os.linux.getpid() }, 0);
+    const text = "22 1 0:21 / /media/disk rw - ext4 /dev/sda1 rw\n" ++
+        "23 1 0:22 / /proc rw - proc proc rw\n" ++
+        "24 1 0:23 / /media/usb rw - vfat /dev/sdb1 rw\n";
+    try std.testing.expect(c.g_file_set_contents(path, text, text.len, null) != 0);
+    defer _ = std.os.linux.unlink(path);
+    const mounts = try parseMountsAt(path);
     defer c.g_list_free_full(mounts, @ptrCast(&c.g_object_unref));
-    try std.testing.expect(mounts.*.data != null);
+    try std.testing.expectEqual(@as(c.guint, 2), c.g_list_length(mounts));
     const first_mount: *c.GMount = @ptrCast(@alignCast(mounts.*.data));
     const name = c.g_mount_get_name(first_mount);
     defer if (name != null) c.g_free(name);
     try std.testing.expect(name != null);
+    try std.testing.expectEqualStrings("disk", std.mem.span(name));
     const root = c.g_mount_get_root(first_mount);
     defer if (root != null) c.g_object_unref(root);
     try std.testing.expect(root != null);
+    const root_path = c.g_file_get_path(root);
+    defer c.g_free(root_path);
+    try std.testing.expectEqualStrings("/media/disk", std.mem.span(root_path));
+    // A file that cannot be read is its own error, not an empty list.
+    try std.testing.expectError(error.CannotOpenMountinfo, parseMountsAt("/nonexistent/gungnir-mountinfo"));
+    // A file with nothing the rule keeps is NoMounts.
+    const none = "23 1 0:22 / /proc rw - proc proc rw\n";
+    try std.testing.expect(c.g_file_set_contents(path, none, none.len, null) != 0);
+    try std.testing.expectError(error.NoMounts, parseMountsAt(path));
+}
+
+test "parseMounts on the live mountinfo agrees with mountsFrom on the same text" {
+    ensureRegisteredForTest();
+    // This machine's mounts, whatever they are: the live read must work and give what
+    // the rule (covered by the fixtures) gives for the same text, NoMounts included.
+    var raw: [*c]u8 = null;
+    var length: c.gsize = 0;
+    try std.testing.expect(c.g_file_get_contents("/proc/self/mountinfo", &raw, &length, null) != 0);
+    defer c.g_free(raw);
+    const want: ?c.guint = if (mountsFrom(raw[0..length])) |l| blk: {
+        defer c.g_list_free_full(l, @ptrCast(&c.g_object_unref));
+        break :blk c.g_list_length(l);
+    } else |err| blk: {
+        try std.testing.expectEqual(error.NoMounts, err);
+        break :blk null;
+    };
+    if (parseMounts()) |l| {
+        defer c.g_list_free_full(l, @ptrCast(&c.g_object_unref));
+        try std.testing.expectEqual(want, c.g_list_length(l));
+    } else |err| {
+        try std.testing.expectEqual(error.NoMounts, err);
+        try std.testing.expectEqual(@as(?c.guint, null), want);
+    }
 }
