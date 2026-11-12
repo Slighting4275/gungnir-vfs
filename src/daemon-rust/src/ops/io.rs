@@ -806,10 +806,6 @@ mod tests {
     /// leaked for good: 1 MiB buffer, ring fd and mappings per stuck request).
     #[test]
     fn abandoned_rings_are_freed_once_the_kernel_completes_their_request() -> io::Result<()> {
-        if std::env::var_os("GUNGNIR_NO_URING").is_some_and(|v| v != "0") {
-            eprintln!("note: io_uring disabled: skipped");
-            return Ok(());
-        }
         if !uring_for_tests_env("abandoned ring test") {
             return Ok(());
         }

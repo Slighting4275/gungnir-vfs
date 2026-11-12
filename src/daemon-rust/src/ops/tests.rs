@@ -1,8 +1,9 @@
 //! Unit tests of the file-op engines and scheduler. Every behavioural test runs on both
 //! engines: the thread pool always, io_uring when it passes its probe (skipped, with a
-//! note, where it does not: old kernels, seccomp, containers) and `GUNGNIR_NO_URING` is
-//! not set (CI runs the suite once more with it set, to force the fallback). With
-//! `GUNGNIR_REQUIRE_URING` set (the CI io_uring job), an unavailable io_uring fails them.
+//! note, where it does not: old kernels, seccomp, containers). `GUNGNIR_NO_URING` only
+//! changes which engine the daemon picks ([`choose_engine`]); these tests name their
+//! engine, so they run both whatever it says. With `GUNGNIR_REQUIRE_URING` set (the CI
+//! io_uring job), an unavailable io_uring fails them.
 
 use std::{
     ffi::CString,
@@ -24,11 +25,6 @@ type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn engines() -> Vec<EngineKind> {
     let mut v = vec![EngineKind::Threads];
-    let forced = std::env::var_os(NO_URING_ENV).is_some_and(|x| !x.is_empty() && x != "0");
-    if forced {
-        eprintln!("note: {NO_URING_ENV} set: io_uring engine tests skipped");
-        return v;
-    }
     if io::uring_for_tests_env("its engine tests") {
         v.push(EngineKind::Uring);
     }
