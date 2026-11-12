@@ -1687,3 +1687,50 @@ fn the_sweep_removes_only_the_ops_temp_files() -> R {
     assert_eq!(fs::metadata(&ledger)?.len(), 0, "the ledger is emptied");
     Ok(())
 }
+
+/// F6: a delete-tree deeper than TREE_OPEN_MAX closes its shallow levels and reopens them
+/// by name on the way back. A level swapped for a symlink to another tree meanwhile is
+/// never followed: the op fails and the other tree is untouched, on both engines.
+#[test]
+fn a_reopened_level_swapped_for_a_symlink_is_never_followed() -> R {
+    for engine in engines() {
+        let t = TestDir::new("op-deltree-swap")?;
+        let root = t.join("root");
+        let mut p = root.join("l1");
+        for i in 1..=12 {
+            fs::create_dir_all(&p)?;
+            fs::write(p.join(format!("f{i}")), b"x")?;
+            p.push(format!("l{}", i + 1));
+        }
+        let outside = t.join("outside");
+        fs::create_dir_all(outside.join("l2"))?;
+        fs::write(outside.join("keep"), b"user data")?;
+        fs::write(outside.join("l2/keep2"), b"user data")?;
+        let mut cfg = test_cfg();
+        cfg.slow = Duration::from_millis(40);
+        let ops = start(engine, cfg)?;
+        let swapper = {
+            let (l1, moved, outside) = (root.join("l1"), root.join("l1.moved"), outside.clone());
+            thread::spawn(move || {
+                // The walk has gone deep by now; l1 is closed or about to be.
+                thread::sleep(Duration::from_millis(900));
+                fs::rename(&l1, moved).expect("move l1 aside");
+                std::os::unix::fs::symlink(outside, l1).expect("symlink l1");
+            })
+        };
+        let (d, _) = run(&ops, req(OpKind::DeleteTree, 0, &root, None))?;
+        let _ = swapper.join();
+        assert!(
+            d.result.is_err(),
+            "{engine:?}: the swapped tree was deleted: {:?}",
+            d.result
+        );
+        assert_eq!(fs::read(outside.join("keep"))?, b"user data", "{engine:?}");
+        assert_eq!(
+            fs::read(outside.join("l2/keep2"))?,
+            b"user data",
+            "{engine:?}"
+        );
+    }
+    Ok(())
+}

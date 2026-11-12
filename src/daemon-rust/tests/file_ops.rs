@@ -481,3 +481,58 @@ fn cancel_disconnect_and_hung_mount_gate_over_the_socket() -> R {
     }
     Ok(())
 }
+
+/// F6 / F-003: delete-tree held one open directory per level, so a deep tree used one file
+/// descriptor per level and a low RLIMIT_NOFILE (or a few deep deletes at once) ran the
+/// daemon out of them (EMFILE). Under a soft limit of 64, a 200-deep tree with a file at
+/// every level is deleted whole.
+#[test]
+fn a_deep_tree_is_deleted_under_a_low_descriptor_limit() -> R {
+    for no_uring in [true, false] {
+        let dir = Dir::new(&format!("deeptree-{no_uring}"))?;
+        let sock = dir.join("gungnird.sock");
+        let log = fs::File::create(dir.join("gungnird.log"))?;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "ulimit -Sn 64 && exec \"$0\" \"$@\""])
+            .arg(env!("CARGO_BIN_EXE_gungnird"))
+            .arg(dir.join("data/metadata.db"))
+            .env("GUNGNIR_SOCKET", &sock)
+            .env("HOME", &dir.0)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_RUNTIME_DIR", &dir.0)
+            .env(ops::NO_URING_ENV, if no_uring { "1" } else { "0" })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log);
+        let mut d = Daemon {
+            child: cmd.spawn()?,
+            sock: sock.clone(),
+        };
+        let t0 = Instant::now();
+        while UnixStream::connect(&sock).is_err() {
+            if let Some(st) = d.child.try_wait()? {
+                return Err(format!("gungnird exited early: {st}").into());
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                return Err("gungnird did not start listening".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut c = d.client()?;
+        let root = dir.join("tree");
+        let mut p = root.clone();
+        for i in 0..200 {
+            p.push("d");
+            fs::create_dir_all(&p)?;
+            fs::write(p.join(format!("f{i}")), b"x")?;
+        }
+        let (done, _) = run(&mut c, &req(OpKind::DeleteTree, 0, &root, None))?;
+        let text = fs::read_to_string(dir.join("gungnird.log"))?;
+        assert_eq!(done.result, Ok(()), "no_uring {no_uring}\n{text}");
+        assert!(!root.exists(), "no_uring {no_uring}: the tree is gone");
+        assert_eq!(done.progress.files_done, 200 + 200 + 1);
+        drop(c);
+        drop(d);
+    }
+    Ok(())
+}

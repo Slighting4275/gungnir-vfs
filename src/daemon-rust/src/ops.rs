@@ -1665,6 +1665,19 @@ fn ts(t: &libc::statx_timestamp) -> libc::timespec {
     }
 }
 
+/// Most directories a delete-tree holds open at once (F6, F-003): the deepest ones.
+const TREE_OPEN_MAX: usize = 8;
+
+/// One directory of a delete-tree's walk: its stream (`None` while closed to save
+/// descriptors), its name in its parent, the log length when it was entered, and its
+/// identity, to recognise it when it is reopened.
+struct Level {
+    stream: Option<DirStream>,
+    name: CString,
+    mark: usize,
+    id: libc::statx,
+}
+
 /// Closes a `DIR*` stream (and its fd) on drop.
 struct DirStream(*mut libc::DIR);
 
@@ -2395,9 +2408,16 @@ impl Exec<'_> {
             return Err(OpError::Os(libc::EXDEV));
         }
         let mut cur: Vec<u8> = path.to_vec();
-        // (stream, its name in the parent, log length when it was entered)
-        let mut stack: Vec<(DirStream, CString, usize)> =
-            vec![(DirStream::open(fd)?, CString::default(), 0)];
+        // One level per directory being emptied, the root first. Only the deepest
+        // TREE_OPEN_MAX are held open (F6, F-003): a 200-deep tree held 200 descriptors,
+        // and a low RLIMIT_NOFILE or a few deep deletes at once ran out (EMFILE). A closed
+        // level is reopened by name from the nearest open one when the walk comes back.
+        let mut stack: Vec<Level> = vec![Level {
+            stream: Some(DirStream::open(fd)?),
+            name: CString::default(),
+            mark: 0,
+            id: base,
+        }];
         let note = |log: &mut Vec<(Vec<u8>, bool)>, cur: &[u8], name: &CStr, tree: bool| {
             if log.len() < DELETED_LOG_MAX {
                 log.push(([cur, b"/", name.to_bytes()].concat(), tree));
@@ -2405,25 +2425,30 @@ impl Exec<'_> {
         };
         loop {
             self.slow()?;
-            let Some((top, _, _)) = stack.last_mut() else {
+            let Some(depth) = stack.len().checked_sub(1) else {
                 return Ok(());
             };
-            let top_fd = top.fd();
-            match top.next()? {
+            let top_fd = self.level_fd(&mut stack, depth)?;
+            let next = match stack.get_mut(depth).and_then(|l| l.stream.as_mut()) {
+                Some(st) => st.next()?,
+                None => return Err(OpError::Os(libc::EBADF)),
+            };
+            match next {
                 None => {
-                    let Some((_, name, mark)) = stack.pop() else {
+                    let Some(done) = stack.pop() else {
                         return Ok(());
                     };
-                    let Some((parent, _, _)) = stack.last() else {
+                    let Some(parent) = stack.len().checked_sub(1) else {
                         return Ok(()); // the root itself: removed by the caller
                     };
+                    let parent_fd = self.level_fd(&mut stack, parent)?;
                     self.io
-                        .unlink(self.op, parent.fd(), &name, libc::AT_REMOVEDIR)?;
+                        .unlink(self.op, parent_fd, &done.name, libc::AT_REMOVEDIR)?;
                     self.op.add_file();
                     // Its whole subtree is gone: one entry instead of its contents.
-                    cur.truncate(cur.len() - name.to_bytes().len() - 1);
-                    log.truncate(mark);
-                    note(log, &cur, &name, true);
+                    cur.truncate(cur.len() - done.name.to_bytes().len() - 1);
+                    log.truncate(done.mark);
+                    note(log, &cur, &done.name, true);
                 }
                 Some((name, ty)) => {
                     let is_dir = match ty {
@@ -2458,13 +2483,80 @@ impl Exec<'_> {
                     if other_mount(&base, &s) {
                         return Err(OpError::Os(libc::EXDEV)); // a mount point inside the tree
                     }
+                    // Room for the new level: close the shallowest open one but the root.
+                    if stack.iter().filter(|l| l.stream.is_some()).count() >= TREE_OPEN_MAX
+                        && let Some(l) = stack.iter_mut().skip(1).find(|l| l.stream.is_some())
+                    {
+                        l.stream = None;
+                    }
                     let mark = log.len();
                     cur.push(b'/');
                     cur.extend_from_slice(name.to_bytes());
-                    stack.push((DirStream::open(fd)?, name, mark));
+                    stack.push(Level {
+                        stream: Some(DirStream::open(fd)?),
+                        name,
+                        mark,
+                        id: s,
+                    });
                 }
             }
         }
+    }
+
+    /// The descriptor of `stack[i]`, reopening it if it was closed to save descriptors:
+    /// by name, level by level from the nearest open ancestor, never through a symlink,
+    /// and only if each directory is still the one that was entered (else `EBUSY`, as
+    /// for a root replaced mid-way). Its listing starts again; everything already
+    /// handled in it has been deleted.
+    fn level_fd(&mut self, stack: &mut [Level], i: usize) -> Step<RawFd> {
+        if let Some(fd) = stack
+            .get(i)
+            .and_then(|l| l.stream.as_ref())
+            .map(DirStream::fd)
+        {
+            return Ok(fd);
+        }
+        let Some(j) = (0..i)
+            .rev()
+            .find(|&k| stack.get(k).is_some_and(|l| l.stream.is_some()))
+        else {
+            return Err(StepError::Os(libc::EBADF));
+        };
+        let Some(start) = stack
+            .get(j)
+            .and_then(|l| l.stream.as_ref())
+            .map(DirStream::fd)
+        else {
+            return Err(StepError::Os(libc::EBADF));
+        };
+        let mut held: Option<OwnedFd> = None;
+        for k in j + 1..=i {
+            let Some(level) = stack.get(k) else {
+                return Err(StepError::Os(libc::EBADF));
+            };
+            let from = held.as_ref().map_or(start, AsRawFd::as_raw_fd);
+            let fd = self.io.open(
+                self.op,
+                from,
+                &level.name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                0,
+            )?;
+            let s = self
+                .io
+                .statx(self.op, fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+            if !same_file(&s, &level.id) {
+                return Err(StepError::Os(libc::EBUSY)); // replaced since it was entered
+            }
+            held = Some(fd);
+        }
+        let fd = held.ok_or(StepError::Os(libc::EBADF))?;
+        let stream = DirStream::open(fd)?;
+        let raw = stream.fd();
+        if let Some(l) = stack.get_mut(i) {
+            l.stream = Some(stream);
+        }
+        Ok(raw)
     }
 
     fn fsync(&mut self) -> OpResult {
