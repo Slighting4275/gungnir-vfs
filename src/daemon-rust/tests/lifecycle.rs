@@ -777,3 +777,45 @@ fn idle_timeout_counts_from_last_disconnect() -> R {
     );
     Ok(())
 }
+
+/// F08 (BC-HC001-F02): a daemon that bound its own socket still owns it after a live
+/// upgrade. The re-execed image adopts the listener through the socket-activation
+/// protocol, and took it for systemd's, so it left the socket file behind on exit.
+#[test]
+fn an_upgraded_daemon_removes_the_socket_it_bound() -> R {
+    let dir = Dir::new("upgrade-cleanup")?;
+    let sock = dir.0.join("u.sock");
+    let db = dir.0.join("meta.db");
+    let log = dir.0.join("gungnird.log");
+    let mut child = spawn_listening(&sock, &db, &log, false, &[])?;
+    for round in 1..=2 {
+        // SAFETY: a signal to our own child.
+        unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+        let t0 = Instant::now();
+        while fs::read_to_string(&log)?
+            .matches("live upgrade: re-execing")
+            .count()
+            < round
+        {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "re-exec {round} not logged"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            answers(&sock, b"after-upgrade"),
+            "round {round}: not serving"
+        );
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait()?;
+    let text = fs::read_to_string(&log)?;
+    assert!(status.success(), "{status}\n{text}");
+    assert!(
+        !sock.exists(),
+        "the upgraded daemon left its socket behind\n{text}"
+    );
+    Ok(())
+}

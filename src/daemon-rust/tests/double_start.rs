@@ -212,3 +212,42 @@ fn manual_owner_exit_removes_its_own_socket() -> R {
     assert!(!sock.exists(), "the daemon's own socket is removed on exit");
     Ok(())
 }
+
+/// F08 control: a socket-activated daemon that live-upgrades still never removes the
+/// supervisor's socket, before or after the upgrade.
+#[test]
+fn an_upgraded_activated_daemon_keeps_the_supervisor_socket() -> R {
+    let d = Dir::new("act-upgrade")?;
+    let sock = d.join("s.sock");
+    let listener = UnixListener::bind(&sock)?;
+    let mut daemon = activated(&d, &listener)?;
+    let t0 = Instant::now();
+    while UnixStream::connect(&sock).is_err() || !d.join("data/m.db.lock").exists() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "not serving");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: signals to our own child.
+    unsafe { libc::kill(daemon.0.id().cast_signed(), libc::SIGHUP) };
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        daemon.0.try_wait()?.is_none(),
+        "the upgrade killed the daemon"
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(daemon.0.id().cast_signed(), libc::SIGTERM) };
+    let t1 = Instant::now();
+    while daemon.0.try_wait()?.is_none() {
+        assert!(t1.elapsed() < Duration::from_secs(10), "did not stop");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut err = String::new();
+    if let Some(mut e) = daemon.0.stderr.take() {
+        e.read_to_string(&mut err)?;
+    }
+    assert!(
+        err.contains("live upgrade: re-execing"),
+        "no upgrade happened\n{err}"
+    );
+    assert!(sock.exists(), "the supervisor's socket was removed\n{err}");
+    Ok(())
+}

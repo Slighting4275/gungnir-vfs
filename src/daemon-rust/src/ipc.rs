@@ -733,6 +733,21 @@ fn socket_is_live(path: &Path) -> Result<bool> {
 pub const UPGRADE_SOCKET_LOCK_ENV: &str = "GUNGNIR_UPGRADE_SOCKET_LOCK_FD";
 /// See [`UPGRADE_SOCKET_LOCK_ENV`]: the store lock (`<db>.lock`).
 pub const UPGRADE_STORE_LOCK_ENV: &str = "GUNGNIR_UPGRADE_STORE_LOCK_FD";
+/// Set by a live upgrade of a daemon that bound its socket itself: `<dev>:<ino>` of that
+/// socket file. The new image adopts the listener through the activation protocol, but
+/// the socket is still its own to remove on exit (F08), not a supervisor's.
+pub const UPGRADE_BOUND_SOCKET_ENV: &str = "GUNGNIR_UPGRADE_BOUND_SOCKET";
+
+/// The bound socket identity a live upgrade left in [`UPGRADE_BOUND_SOCKET_ENV`],
+/// removing the variable. Call only while the process is single-threaded (start-up).
+fn take_upgrade_bound() -> Option<(u64, u64)> {
+    let v = env::var_os(UPGRADE_BOUND_SOCKET_ENV)?;
+    // SAFETY: start-up, before any thread exists; nothing reads the environment
+    // concurrently.
+    unsafe { env::remove_var(UPGRADE_BOUND_SOCKET_ENV) };
+    let (dev, ino) = v.to_str()?.split_once(':')?;
+    Some((dev.parse().ok()?, ino.parse().ok()?))
+}
 
 /// The fd number a live upgrade left in `var`, removing the variable. Call only while the
 /// process is single-threaded (start-up).
@@ -947,12 +962,14 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     let socket = unsafe { UnixListener::from_raw_fd(raw_fd) };
     socket.set_nonblocking(true)?;
 
+    // A live upgrade of a daemon that bound this socket itself: still its own (F08).
+    let bound = path.as_ref().and(take_upgrade_bound());
     Ok(Some(Listener {
         socket,
         path,
-        socket_activated: true,
+        socket_activated: bound.is_none(),
         _lock: lock,
-        bound: None,
+        bound,
     }))
 }
 
@@ -1052,6 +1069,7 @@ pub fn perform_live_upgrade(listener: &Listener, store_lock: Option<RawFd>) -> R
                     | "LISTEN_FDNAMES"
                     | UPGRADE_SOCKET_LOCK_ENV
                     | UPGRADE_STORE_LOCK_ENV
+                    | UPGRADE_BOUND_SOCKET_ENV
             )
         ) {
             continue;
@@ -1067,6 +1085,11 @@ pub fn perform_live_upgrade(listener: &Listener, store_lock: Option<RawFd>) -> R
     )?);
     for (k, fd) in &locks {
         envs.push(cstring(format!("{k}={fd}").as_bytes())?);
+    }
+    if let (false, Some((dev, ino))) = (listener.socket_activated, listener.bound) {
+        envs.push(cstring(
+            format!("{UPGRADE_BOUND_SOCKET_ENV}={dev}:{ino}").as_bytes(),
+        )?);
     }
     let mut envp: Vec<*const libc::c_char> = envs.iter().map(|s| s.as_ptr()).collect();
     envp.push(ptr::null());
