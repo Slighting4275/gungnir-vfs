@@ -1699,7 +1699,12 @@ mod tests {
     /// A heap-backed `Shm` for Miri, which cannot model memfd or mmap. The mapping is
     /// never unmapped (`ManuallyDrop`); the caller frees the heap block with `free_heap`.
     fn heap_shm() -> (*mut [AtomicU64; SHM_SIZE / 8], mem::ManuallyDrop<Shm>) {
-        let raw = Box::into_raw(Box::new(std::array::from_fn(|_| AtomicU64::new(0))));
+        // Allocated zeroed in one step, never built element by element: Miri tracks each
+        // of the 33280 atomics separately, and `array::from_fn` plus the move into the Box
+        // took longer than any Miri run allowed (the ring test never started).
+        // SAFETY: all-zero bytes are a valid `AtomicU64` (it has the layout of `u64`).
+        let raw =
+            Box::into_raw(unsafe { Box::<[AtomicU64; SHM_SIZE / 8]>::new_zeroed().assume_init() });
         let shm = Shm {
             // Box::into_raw never returns null.
             ptr: unsafe { NonNull::new_unchecked(raw.cast::<u8>()) },
@@ -1719,7 +1724,7 @@ mod tests {
         let start = u32::MAX - 5;
         shm.word(RING_C2D.head).store(start, Ordering::Relaxed);
         shm.word(RING_C2D.tail).store(start, Ordering::Relaxed);
-        let n: u64 = if cfg!(miri) { 150 } else { 20_000 };
+        let n: u64 = if cfg!(miri) { 1_000 } else { 20_000 };
         let r = thread::scope(|sc| -> Result<()> {
             let producer = sc.spawn(|| -> Result<()> {
                 let mut i = 0;
