@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# Select one package source for the whole GitHub run. Only an unavailable
+# Select one package source for the whole CI run. Only an unavailable
 # archive index triggers the fallback. Package and test failures still fail CI.
 set -eu
 
 snapshot=$1
-case "$2" in
+mode=$2
+if [ -z "$snapshot" ]; then mode=live; fi
+case "$mode" in
 live) snapshot= ;;
 archive) ;;
 auto)
+    command -v curl >/dev/null || { echo 'curl is required to probe the Arch Linux Archive' >&2; exit 1; }
     for repo in core extra; do
         url="https://archive.archlinux.org/repos/$snapshot/$repo/os/x86_64/$repo.db"
         if ! curl --fail --silent --show-error --location --head \
             --connect-timeout 5 --max-time 12 --retry 1 --retry-max-time 24 "$url" >/dev/null; then
-            echo '::warning::Arch Linux Archive is unavailable. This run uses live Arch mirrors.'
+            echo 'Arch Linux Archive is unavailable. This run uses live Arch mirrors.' >&2
             snapshot=
             break
         fi
     done
     ;;
-*) echo "unknown mirror mode: $2" >&2; exit 2 ;;
+*) echo "unknown mirror mode: $mode" >&2; exit 2 ;;
 esac
 
 if [ -n "$snapshot" ]; then
-    echo "Package source: Arch Linux Archive ($snapshot)" >>"$GITHUB_STEP_SUMMARY"
+    echo "Package source: Arch Linux Archive ($snapshot)" >&2
 else
-    echo 'Package source: live Arch mirrors' >>"$GITHUB_STEP_SUMMARY"
+    echo 'Package source: live Arch mirrors' >&2
 fi
-printf 'snapshot=%s\n' "$snapshot" >>"$GITHUB_OUTPUT"
+printf '%s\n' "$snapshot"

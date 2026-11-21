@@ -74,7 +74,10 @@ jobs:
         if: steps.provider.outputs.provider == 'github'
         env:
           MIRROR_MODE: ${{ inputs.mirrors || 'auto' }}
-        run: tools/ci-archive "$ARCH_SNAPSHOT_PINNED" "$MIRROR_MODE"
+        run: |
+          snapshot=$(tools/ci-archive "$ARCH_SNAPSHOT_PINNED" "$MIRROR_MODE")
+          printf 'snapshot=%s\n' "$snapshot" >>"$GITHUB_OUTPUT"
+          printf 'Package source: %s\n' "${snapshot:-live Arch mirrors}" >>"$GITHUB_STEP_SUMMARY"
 
   rust-lint:
     needs: route

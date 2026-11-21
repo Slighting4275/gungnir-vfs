@@ -3,10 +3,13 @@ spec:
     arch_snapshot:
       description: >-
         The Arch Linux Archive day pacman installs from (YYYY/MM/DD, the same day as the
-        pinned image below). Empty: the live mirrors, for when the archive is down; such a
-        run gets today's packages instead of the pinned ones.
+        pinned image below). An empty day explicitly selects the live mirrors.
       default: "2026/11/08"
       regex: '^(\d{4}/\d{2}/\d{2})?$'
+    arch_mirrors:
+      description: Auto uses live mirrors if the archive is unavailable. Archive requires the pinned source.
+      options: [auto, archive]
+      default: auto
 ---
 # GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
 # Each job runs one `./check` subcommand (the gates of AGENTS.md §4 live there, once);
@@ -19,10 +22,9 @@ spec:
 # arch_snapshot above), so every run gets the same packages. To move forward, bump both
 # together: the input's default and the image (tags: hub.docker.com/_/archlinux; take
 # the digest from the registry, `docker-content-digest` of the tag's index manifest).
-# The archive down: run a pipeline by hand (Build > Pipelines > New pipeline) with the
-# input arch_snapshot empty, to use the live mirrors instead. Pipeline variables cannot
-# be set by hand in this project, so this is an input. The day and the image must match
-# .github/workflows/ci.yml (./check rules fails otherwise).
+# The prepare job selects one package source for the entire pipeline and logs when
+# an archive outage requires using today's packages from the live mirrors.
+# The day and the image must match .github/workflows/ci.yml (./check rules verifies this).
 #
 # Zig is the current master tarball from ziglang.org, signature-verified (tools/ci-setup).
 
@@ -38,12 +40,14 @@ workflow:
     - if: $CI_COMMIT_TAG
 
 stages:
+  - prepare
   - lint
   - build
   - test
 
 variables:
   ARCH_SNAPSHOT: "$[[ inputs.arch_snapshot ]]"
+  ARCH_MIRROR_MODE: "$[[ inputs.arch_mirrors ]]"
   CARGO_HOME: "$CI_PROJECT_DIR/.build/cargo-home"
   CARGO_TERM_COLOR: "never"
   ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.build/zig-global-cache"
@@ -90,11 +94,22 @@ default:
 
 # Every job normally finishes in under 4 minutes, so a stalled runner or a hung step
 # fails at 20 minutes instead of the project's (by default 1 hour). Test jobs: 25.
+ci:packages:
+  stage: prepare
+  timeout: 3 minutes
+  script:
+    - mkdir -p .build
+    - tools/ci-archive "$ARCH_SNAPSHOT" "$ARCH_MIRROR_MODE" >.build/ci-archive
+  artifacts:
+    paths: [.build/ci-archive]
+    expire_in: 1 day
+
 .rust:
   timeout: 20 minutes
   cache:
     - *cargo-cache
   before_script:
+    - read -r ARCH_SNAPSHOT <.build/ci-archive
     - tools/ci-setup rust
 
 .zig:
@@ -103,6 +118,7 @@ default:
     - *cargo-cache
     - *zig-cache
   before_script:
+    - read -r ARCH_SNAPSHOT <.build/ci-archive
     - tools/ci-setup zig
     - export PATH="$CI_PROJECT_DIR/.build/zig-dl/zig:$PATH"
     - zig version
@@ -112,6 +128,7 @@ default:
 rust:lint:
   stage: lint
   extends: .rust
+  needs: ["ci:packages"]
   # Every job calls one ./check subcommand: the commands themselves live only there.
   script:
     - ./check rust-static
@@ -119,6 +136,7 @@ rust:lint:
 zig:lint:
   stage: lint
   extends: .zig
+  needs: ["ci:packages"]
   cache:
     - *cargo-cache
     - <<: *zig-cache
@@ -131,7 +149,7 @@ zig:lint:
 rust:build:
   stage: build
   extends: .rust
-  needs: ["rust:lint"]
+  needs: ["ci:packages", "rust:lint"]
   cache:
     - <<: *cargo-cache
       policy: pull-push
@@ -146,7 +164,7 @@ rust:build:
 zig:build:
   stage: build
   extends: .zig
-  needs: ["zig:lint"]
+  needs: ["ci:packages", "zig:lint"]
   script:
     # Builds the module: three GIO exports only, no test hook, indexed by gio-querymodules.
     - ./check zig-artifacts
@@ -161,7 +179,7 @@ rust:test:
   stage: test
   extends: .rust
   timeout: 25 minutes
-  needs: ["rust:build"]
+  needs: ["ci:packages", "rust:build"]
   variables:
     # What this container cannot have (btrfs) is skipped, each test on a SKIP line in the
     # log; everything else must run (gungnird::testenv). The io_uring engine tests must
@@ -180,7 +198,7 @@ rust:test-hooks:
   stage: test
   extends: .rust
   timeout: 25 minutes
-  needs: ["rust:build"]
+  needs: ["ci:packages", "rust:build"]
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
@@ -201,7 +219,7 @@ rust:test-no-uring:
   stage: test
   extends: .rust
   timeout: 25 minutes
-  needs: ["rust:build"]
+  needs: ["ci:packages", "rust:build"]
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
@@ -213,7 +231,7 @@ zig:test:
   extends: .zig
   # rust:build's gungnird artifact + the cargo cache keep the itest's cargo build incremental.
   timeout: 25 minutes
-  needs: ["zig:build", "rust:build"]
+  needs: ["ci:packages", "zig:build", "rust:build"]
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
@@ -229,7 +247,7 @@ rust:perf:
   stage: test
   extends: .rust
   timeout: 25 minutes
-  needs: ["rust:build"]
+  needs: ["ci:packages", "rust:build"]
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"
     # An API-started pipeline asks for it by name (PR-F014); plain API pipelines do not.
