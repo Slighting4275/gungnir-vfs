@@ -14,7 +14,7 @@ use std::{
 use crate::{
     fsid::{Backend, Resolver, Target},
     health::{EVENT_RESERVE, Monitor},
-    ipc::{Handler, Msg, Port, Session},
+    ipc::{self, Msg, Port, Service, Session},
     md::Ident,
     ops::{
         Done, Gate, MSG_OP_CANCEL, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, MetaHooks, OpCtl,
@@ -182,43 +182,44 @@ impl Sink for PortSink {
     }
 }
 
-/// Serves the file-op requests and hands everything else to `inner`.
-pub struct OpsHandler {
-    inner: Arc<dyn Handler>,
+/// Serves the file-op requests (start, cancel); its drain is the engine's.
+pub struct OpsService {
     ops: Arc<Ops>,
 }
 
-impl OpsHandler {
-    pub fn new(inner: Arc<dyn Handler>, ops: Arc<Ops>) -> Self {
-        Self { inner, ops }
+impl OpsService {
+    #[must_use]
+    pub fn new(ops: Arc<Ops>) -> Self {
+        Self { ops }
     }
 }
 
-impl Handler for OpsHandler {
+impl Service for OpsService {
+    fn kinds(&self) -> &'static [u32] {
+        &[MSG_OP_START, MSG_OP_CANCEL]
+    }
+
     fn session(&self) -> Box<dyn Session> {
         Box::new(OpsSession {
-            inner: self.inner.session(),
             ops: Arc::clone(&self.ops),
             active: Vec::new(),
         })
     }
 
     fn is_busy(&self) -> bool {
-        self.ops.is_busy() || self.inner.is_busy()
+        self.ops.is_busy()
     }
 
     fn begin_drain(&self) {
         self.ops.begin_drain();
-        self.inner.begin_drain();
     }
 
     fn cancel_all(&self) -> usize {
-        self.ops.cancel_all() + self.inner.cancel_all()
+        self.ops.cancel_all()
     }
 }
 
 struct OpsSession {
-    inner: Box<dyn Session>,
     ops: Arc<Ops>,
     active: Vec<Arc<OpCtl>>,
 }
@@ -278,7 +279,7 @@ impl Session for OpsSession {
         match msg.kind {
             MSG_OP_START => self.start(port, msg),
             MSG_OP_CANCEL => self.cancel(port, msg),
-            _ => self.inner.request(port, msg),
+            _ => ipc::unsupported(port, msg),
         }
     }
 }

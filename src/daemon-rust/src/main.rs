@@ -3,10 +3,10 @@ use std::{env, ffi::OsString, path::PathBuf, process::ExitCode, sync::Arc, time:
 use gungnird::{
     Error, Result,
     fsid::{Resolver, ResolverConfig, SysBackend},
-    health::{self, FakeHung, Gated, HealthConfig, HealthHandler, Monitor, StatfsProber},
+    health::{self, FakeHung, Gated, HealthConfig, HealthService, Monitor, StatfsProber},
     ipc, mdsvc,
     ops::{self, Ops, OpsConfig},
-    opsvc::{DbMeta, MonitorGate, OpsHandler},
+    opsvc::{DbMeta, MonitorGate, OpsService},
     seccomp::{self, SeccompMode},
     store::{self, DbConfig, Store, StoreConfig},
     vfssvc,
@@ -319,12 +319,17 @@ fn serve_daemon(
     }
 
     // 5. Wire handlers
-    let md: Arc<dyn ipc::Handler> = Arc::new(mdsvc::Service::new(resolver, db.clone()));
-    let health: Arc<dyn ipc::Handler> = Arc::new(HealthHandler::new(md, monitor));
     let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::from_env());
     let ops_for_ledger = Arc::clone(&ops);
-    let handler: Arc<dyn ipc::Handler> = Arc::new(OpsHandler::new(health, ops));
-    let handler: Arc<dyn ipc::Handler> = Arc::new(vfssvc::VfsHandler::new(handler, vfs));
+    let services: Vec<Arc<dyn ipc::Service>> = vec![
+        Arc::new(vfssvc::VfsService::new(vfs)),
+        Arc::new(OpsService::new(ops)),
+        Arc::new(HealthService::new(monitor)),
+        Arc::new(mdsvc::MdService::new(resolver, db.clone())),
+    ];
+    let handler: Arc<dyn ipc::Handler> = Arc::new(ipc::Router::new(services).map_err(|kind| {
+        std::io::Error::other(format!("two services answer message kind {kind}"))
+    })?);
 
     // Milestone 12: Apply Seccomp BPF Sandbox
     if seccomp_mode != SeccompMode::Disabled {

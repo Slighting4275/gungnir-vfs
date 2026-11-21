@@ -37,7 +37,7 @@ use std::{
 use crate::{
     btrfs,
     fsid::{self, MountEntry},
-    ipc::{Handler, Msg, PAYLOAD_MAX, Port, Session},
+    ipc::{self, Msg, PAYLOAD_MAX, Port, Service, Session},
     ops::{
         Anchor, Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink,
     },
@@ -253,6 +253,8 @@ pub struct Svc {
     /// Every running job: when it started, and whether it has ended.
     jobs: Mutex<Vec<(Instant, Arc<AtomicBool>)>>,
     draining: AtomicBool,
+    /// Every request under way stops (the drain's cancel).
+    stopping: AtomicBool,
 }
 
 /// Filesystems that never hold a volume trash.
@@ -391,6 +393,7 @@ impl Svc {
             in_flight: AtomicUsize::new(0),
             jobs: Mutex::new(Vec::new()),
             draining: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -694,6 +697,12 @@ impl Svc {
             .fold(1, |h, d| trash::fnv(h, &trash::stamp(d).to_le_bytes()))
     }
 
+    /// Nobody wants this request finished any more: its connection went, or the daemon
+    /// is draining and asked every request to stop.
+    fn stopped(&self, ctx: &Ctx) -> bool {
+        ctx.gone.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst)
+    }
+
     /// Run one op to its end, within the deadline, telling the client it is alive.
     fn run(&self, req: OpRequest, ctx: &Ctx) -> Result<(), Failure> {
         let w = Arc::new(Wait::default());
@@ -705,7 +714,7 @@ impl Svc {
             if let Some(r) = w.until(end.min(now + GONE_CHECK)) {
                 return r.map_err(Failure::from);
             }
-            if ctx.gone.load(Ordering::SeqCst) || Instant::now() >= end {
+            if self.stopped(ctx) || Instant::now() >= end {
                 break;
             }
             if ctx.last_beat_due() {
@@ -787,7 +796,7 @@ impl Svc {
             };
             for item in items {
                 // Nobody is there any more: the op in flight stopped, and so does this.
-                if ctx.gone.load(Ordering::SeqCst) {
+                if self.stopped(ctx) {
                     first = Some(Failure::st(ST_CANCELLED));
                     break 'dirs;
                 }
@@ -1007,22 +1016,33 @@ impl Svc {
     }
 }
 
-/// Serves the kinds above and hands everything else to `inner`.
-pub struct VfsHandler {
-    inner: Arc<dyn Handler>,
+/// Serves the trash and recent kinds above.
+pub struct VfsService {
     svc: Arc<Svc>,
 }
 
-impl VfsHandler {
-    pub fn new(inner: Arc<dyn Handler>, svc: Arc<Svc>) -> Self {
-        Self { inner, svc }
+impl VfsService {
+    #[must_use]
+    pub fn new(svc: Arc<Svc>) -> Self {
+        Self { svc }
     }
 }
 
-impl Handler for VfsHandler {
+impl Service for VfsService {
+    fn kinds(&self) -> &'static [u32] {
+        &[
+            MSG_VFS_LIST,
+            MSG_VFS_DELETE,
+            MSG_VFS_RESTORE,
+            MSG_TRASH_EMPTY,
+            MSG_VFS_STAT,
+            MSG_VFS_CHILDREN,
+            MSG_VFS_STAMP,
+        ]
+    }
+
     fn session(&self) -> Box<dyn Session> {
         Box::new(VfsSession {
-            inner: self.inner.session(),
             svc: Arc::clone(&self.svc),
             snapshot: Arc::new(Mutex::new((Vec::new(), false))),
             gone: Arc::new(AtomicBool::new(false)),
@@ -1030,21 +1050,23 @@ impl Handler for VfsHandler {
     }
 
     fn is_busy(&self) -> bool {
-        self.svc.in_flight.load(Ordering::SeqCst) > 0 || self.inner.is_busy()
+        self.svc.in_flight.load(Ordering::SeqCst) > 0
     }
 
     fn begin_drain(&self) {
         self.svc.draining.store(true, Ordering::SeqCst);
-        self.inner.begin_drain();
     }
 
+    /// Stop every request under way: an op in progress is cancelled (its own engine
+    /// cancel), and an empty stops before its next item. Each answers `busy` once
+    /// draining, so the client tries again with the next daemon.
     fn cancel_all(&self) -> usize {
-        self.inner.cancel_all()
+        self.svc.stopping.store(true, Ordering::SeqCst);
+        self.svc.in_flight.load(Ordering::SeqCst)
     }
 }
 
 struct VfsSession {
-    inner: Box<dyn Session>,
     svc: Arc<Svc>,
     snapshot: Arc<Mutex<(Vec<Item>, bool)>>,
     gone: Arc<AtomicBool>,
@@ -1242,7 +1264,7 @@ impl Session for VfsSession {
                     (ST_OK, svc.stamp(scheme).to_le_bytes().to_vec())
                 });
             }
-            _ => self.inner.request(port, msg),
+            _ => ipc::unsupported(port, msg),
         }
     }
 }
@@ -1548,6 +1570,44 @@ mod tests {
             found.dirs
         );
         assert!(found.complete);
+    }
+
+    /// The drain's cancel stops an empty before its next item, and the client hears
+    /// `busy` (try again), never a silent cancel.
+    #[test]
+    fn cancel_all_stops_an_empty() {
+        let t = Dir::new("cancel-empty");
+        let home = t.0.join("home");
+        let s = svc(&home, Fixture(Some(Vec::new())));
+        let trash = s.home.clone().expect("home trash");
+        fs::create_dir_all(trash.files()).unwrap();
+        fs::create_dir_all(trash.info()).unwrap();
+        for e in ["a", "b"] {
+            fs::write(trash.files().join(e), b"x").unwrap();
+            fs::write(
+                trash.info().join(format!("{e}.trashinfo")),
+                format!("[Trash Info]\nPath=/x/{e}\nDeletionDate=2026-10-31T10:00:00\n"),
+            )
+            .unwrap();
+        }
+        let service = VfsService::new(Arc::clone(&s));
+        service.begin_drain();
+        service.cancel_all();
+        let (shm, _fd) = crate::ipc::Shm::create().expect("shm");
+        let ctx = Ctx {
+            port: Arc::new(crate::ipc::Port::for_test(shm)),
+            seq: 1,
+            last_beat: Mutex::new(Instant::now()),
+            gone: Arc::new(AtomicBool::new(false)),
+        };
+        let (st, _) = s.empty(&ctx);
+        assert_eq!(st, ST_CANCELLED);
+        assert_eq!(reply_status(st, true), ST_BUSY);
+        assert!(
+            trash.files().join("a").exists(),
+            "nothing deleted after the cancel"
+        );
+        assert!(trash.files().join("b").exists());
     }
 
     /// A table that cannot be read gives a listing that says it may not be everything.

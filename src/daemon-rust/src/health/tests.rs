@@ -687,8 +687,13 @@ fn over_a_socket_subscribers_get_events_and_hung_paths_fail_fast() -> crate::Res
         Store::open(&dir.join("db/metadata.db"), StoreConfig::default())?,
         DbConfig::default(),
     )?;
-    let mdh: Arc<dyn Handler> = Arc::new(mdsvc::Service::new(Arc::clone(&resolver), db));
-    let handler: Arc<dyn Handler> = Arc::new(HealthHandler::new(mdh, Arc::clone(&m)));
+    let handler: Arc<dyn ipc::Handler> = Arc::new(
+        ipc::Router::new(vec![
+            Arc::new(HealthService::new(Arc::clone(&m))),
+            Arc::new(mdsvc::MdService::new(Arc::clone(&resolver), db)),
+        ])
+        .map_err(|k| io::Error::other(format!("kind {k} twice")))?,
+    );
     let sock = dir.join("s.sock");
     let listener = ipc::bind(&sock)?;
     thread::spawn(move || {
@@ -764,8 +769,10 @@ fn an_idle_subscriber_never_loses_its_connection_to_events() -> crate::Result<()
         Source::Fixed(vec![ent(1, "/", "ext4")]),
         Vec::new(),
     )?;
-    let handler: Arc<dyn Handler> =
-        Arc::new(HealthHandler::new(Arc::new(ipc::NoService), Arc::clone(&m)));
+    let handler: Arc<dyn ipc::Handler> = Arc::new(
+        ipc::Router::new(vec![Arc::new(HealthService::new(Arc::clone(&m)))])
+            .map_err(|k| io::Error::other(format!("kind {k} twice")))?,
+    );
     let sock = dir.join("s.sock");
     let listener = ipc::bind(&sock)?;
     thread::spawn(move || {

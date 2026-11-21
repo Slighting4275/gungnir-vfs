@@ -10,9 +10,12 @@ use std::{
 
 use crate::{
     fsid::{Backend, FsidError, Resolver, Target},
-    ipc::{Handler, Msg, Port, Session},
+    ipc::{Msg, Port, Service, Session},
     md::{Ident, MdError, Request, put_ident},
-    proto::{MSG_REPLY, ST_OK, reply_payload},
+    proto::{
+        MSG_MD_GET, MSG_MD_IDENTIFY, MSG_MD_LIST, MSG_MD_MOVED, MSG_MD_REMOVED, MSG_MD_SET,
+        MSG_MD_UNSET, MSG_REPLY, ST_OK, reply_payload,
+    },
     store::{DbHandle, DbReq, Job},
 };
 
@@ -20,19 +23,31 @@ use crate::{
 /// set can record the file's last known path. Cleared when full: it is only a hint.
 pub const HINT_CACHE: usize = 256;
 
-pub struct Service<B: Backend> {
+pub struct MdService<B: Backend> {
     resolver: Arc<Resolver<B>>,
     db: DbHandle,
 }
 
-impl<B: Backend> Service<B> {
+impl<B: Backend> MdService<B> {
     #[must_use]
     pub fn new(resolver: Arc<Resolver<B>>, db: DbHandle) -> Self {
         Self { resolver, db }
     }
 }
 
-impl<B: Backend> Handler for Service<B> {
+impl<B: Backend> Service for MdService<B> {
+    fn kinds(&self) -> &'static [u32] {
+        &[
+            MSG_MD_IDENTIFY,
+            MSG_MD_GET,
+            MSG_MD_SET,
+            MSG_MD_UNSET,
+            MSG_MD_LIST,
+            MSG_MD_REMOVED,
+            MSG_MD_MOVED,
+        ]
+    }
+
     fn session(&self) -> Box<dyn Session> {
         Box::new(MdSession {
             resolver: Arc::clone(&self.resolver),

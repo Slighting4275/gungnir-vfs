@@ -61,7 +61,7 @@ use std::{
 
 use crate::{
     fsid::{self, Backend, FileIdentity, FsidError, MountEntry, MountHint, Resolver, Target},
-    ipc::{Handler, MAX_INFLIGHT, Msg, PAYLOAD_MAX, Port, Session},
+    ipc::{self, MAX_INFLIGHT, Msg, PAYLOAD_MAX, Port, Service, Session},
     proto::{MSG_REPLY, ST_BAD_REQUEST, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, reply_payload},
 };
 
@@ -1153,41 +1153,32 @@ impl<B: Backend> Backend for Gated<B> {
     }
 }
 
-/// Serves the health requests and hands everything else to `inner`.
-pub struct HealthHandler {
-    inner: Arc<dyn Handler>,
+/// Serves the health requests (query, subscribe). Nothing in the background to drain:
+/// subscriptions end with their connection.
+pub struct HealthService {
     monitor: Arc<Monitor>,
 }
 
-impl HealthHandler {
-    pub fn new(inner: Arc<dyn Handler>, monitor: Arc<Monitor>) -> Self {
-        Self { inner, monitor }
+impl HealthService {
+    #[must_use]
+    pub fn new(monitor: Arc<Monitor>) -> Self {
+        Self { monitor }
     }
 }
 
-impl Handler for HealthHandler {
+impl Service for HealthService {
+    fn kinds(&self) -> &'static [u32] {
+        &[MSG_HEALTH_QUERY, MSG_HEALTH_SUBSCRIBE]
+    }
+
     fn session(&self) -> Box<dyn Session> {
         Box::new(HealthSession {
-            inner: self.inner.session(),
             monitor: Arc::clone(&self.monitor),
         })
-    }
-
-    fn is_busy(&self) -> bool {
-        self.inner.is_busy()
-    }
-
-    fn begin_drain(&self) {
-        self.inner.begin_drain();
-    }
-
-    fn cancel_all(&self) -> usize {
-        self.inner.cancel_all()
     }
 }
 
 struct HealthSession {
-    inner: Box<dyn Session>,
     monitor: Arc<Monitor>,
 }
 
@@ -1254,7 +1245,7 @@ impl Session for HealthSession {
             MSG_HEALTH_SUBSCRIBE => {
                 port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
             }
-            _ => self.inner.request(port, msg),
+            _ => ipc::unsupported(port, msg),
         }
     }
 }

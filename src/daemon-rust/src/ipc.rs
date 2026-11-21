@@ -4,6 +4,7 @@
 //! v2 (milestone 5) widened the slots to carry metadata requests (`md.rs`).
 
 use std::{
+    collections::HashMap,
     env,
     ffi::{CString, OsStr, OsString},
     fs,
@@ -442,6 +443,12 @@ pub struct Port {
 pub const MAX_INFLIGHT: usize = SLOT_COUNT as usize / 2;
 
 impl Port {
+    /// A port over `shm` with no connection behind it, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(shm: Shm) -> Self {
+        Self::new(shm)
+    }
+
     fn new(shm: Shm) -> Self {
         Self {
             shm,
@@ -535,24 +542,121 @@ pub trait Handler: Send + Sync + 'static {
     }
 }
 
-/// Answers every request with [`crate::md::ST_UNSUPPORTED`] (pings still work).
+/// Answer `msg` with [`crate::proto::ST_UNSUPPORTED`]: no service here speaks its kind.
+pub fn unsupported(port: &Arc<Port>, msg: &Msg) {
+    port.reply(
+        crate::proto::MSG_REPLY,
+        msg.seq,
+        &crate::proto::reply_payload(crate::proto::ST_UNSUPPORTED, &[]),
+    );
+}
+
+/// Answers every request with [`crate::proto::ST_UNSUPPORTED`] (pings still work).
 pub struct NoService;
 
 struct NoSession;
 
 impl Session for NoSession {
     fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
-        port.reply(
-            crate::proto::MSG_REPLY,
-            msg.seq,
-            &crate::proto::reply_payload(crate::proto::ST_UNSUPPORTED, &[]),
-        );
+        unsupported(port, msg);
     }
 }
 
 impl Handler for NoService {
     fn session(&self) -> Box<dyn Session> {
         Box::new(NoSession)
+    }
+}
+
+/// One service on the ring: the kinds it answers, a session per connection, and its share
+/// of the drain. Services are combined by a [`Router`]; none knows about the others.
+pub trait Service: Send + Sync + 'static {
+    /// The request kinds this service answers. No two services of a router share one.
+    fn kinds(&self) -> &'static [u32];
+
+    fn session(&self) -> Box<dyn Session>;
+
+    /// Whether this service has work under way.
+    fn is_busy(&self) -> bool {
+        false
+    }
+
+    /// Refuse new work from now on (the drain before an exit, BC-A2-F03a).
+    fn begin_drain(&self) {}
+
+    /// Cancel this service's work; how many operations were asked to stop (BC-A2-F03b).
+    fn cancel_all(&self) -> usize {
+        0
+    }
+}
+
+/// The daemon's [`Handler`]: one table from request kind to service, and the drain
+/// across all of them. A kind no service answers gets `unsupported`.
+pub struct Router {
+    services: Vec<Arc<dyn Service>>,
+    /// Kind -> index into `services`.
+    route: Arc<HashMap<u32, usize>>,
+}
+
+impl Router {
+    /// A router over `services`, in order: sessions are made and dropped in that order.
+    ///
+    /// # Errors
+    /// A kind two services both claim, or one of the transport's own (ping, pong).
+    pub fn new(services: Vec<Arc<dyn Service>>) -> std::result::Result<Self, u32> {
+        let mut route = HashMap::new();
+        for (i, s) in services.iter().enumerate() {
+            for &k in s.kinds() {
+                if k == MSG_PING || k == MSG_PONG || route.insert(k, i).is_some() {
+                    return Err(k);
+                }
+            }
+        }
+        Ok(Self {
+            services,
+            route: Arc::new(route),
+        })
+    }
+}
+
+impl Handler for Router {
+    fn session(&self) -> Box<dyn Session> {
+        Box::new(RouterSession {
+            sessions: self.services.iter().map(|s| s.session()).collect(),
+            route: Arc::clone(&self.route),
+        })
+    }
+
+    fn is_busy(&self) -> bool {
+        self.services.iter().any(|s| s.is_busy())
+    }
+
+    fn begin_drain(&self) {
+        for s in &self.services {
+            s.begin_drain();
+        }
+    }
+
+    fn cancel_all(&self) -> usize {
+        self.services.iter().map(|s| s.cancel_all()).sum()
+    }
+}
+
+struct RouterSession {
+    sessions: Vec<Box<dyn Session>>,
+    route: Arc<HashMap<u32, usize>>,
+}
+
+impl Session for RouterSession {
+    fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
+        match self
+            .route
+            .get(&msg.kind)
+            .and_then(|&i| self.sessions.get_mut(i))
+        {
+            Some(s) => s.request(port, msg),
+            None => unsupported(port, msg),
+        }
     }
 }
 
@@ -2080,5 +2184,109 @@ mod tests {
         assert!(matches!(recv_with_fd(&b), Err(Error::Protocol(_))));
         assert_eq!(fds_open_on(&target_path)?, 2, "a received fd leaked");
         Ok(())
+    }
+
+    /// A service that answers its kinds with its tag and counts the drain calls.
+    struct Tagged {
+        kinds: &'static [u32],
+        tag: u8,
+        busy: AtomicBool,
+        drained: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl Tagged {
+        fn new(kinds: &'static [u32], tag: u8) -> Arc<Self> {
+            Arc::new(Self {
+                kinds,
+                tag,
+                busy: AtomicBool::new(false),
+                drained: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    struct TaggedSession(u8);
+
+    impl Session for TaggedSession {
+        fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
+            port.reply(crate::proto::MSG_REPLY, msg.seq, &[0, 0, 0, 0, self.0]);
+        }
+    }
+
+    impl Service for Tagged {
+        fn kinds(&self) -> &'static [u32] {
+            self.kinds
+        }
+        fn session(&self) -> Box<dyn Session> {
+            Box::new(TaggedSession(self.tag))
+        }
+        fn is_busy(&self) -> bool {
+            self.busy.load(Ordering::SeqCst)
+        }
+        fn begin_drain(&self) {
+            self.drained.fetch_add(1, Ordering::SeqCst);
+        }
+        fn cancel_all(&self) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            usize::from(self.tag)
+        }
+    }
+
+    fn ask(router: &Router, kind: u32) -> Result<Vec<u8>> {
+        let (shm, _fd) = Shm::create()?;
+        let port = Arc::new(Port::new(shm));
+        let mut msg = Msg {
+            kind,
+            seq: 7,
+            len: 0,
+            buf: [0; PAYLOAD_MAX],
+        };
+        msg.len = 0;
+        router.session().request(&port, &msg);
+        let reply = port.shm.pop(RING_D2C)?.ok_or(Error::Protocol("no reply"))?;
+        assert_eq!(reply.seq, 7);
+        Ok(reply.payload().to_vec())
+    }
+
+    #[test]
+    fn the_router_sends_each_kind_to_its_service() -> Result<()> {
+        let (a, b) = (Tagged::new(&[16, 17], 1), Tagged::new(&[40], 2));
+        let router = Router::new(vec![a, b]).map_err(|_| Error::Protocol("dup"))?;
+        assert_eq!(ask(&router, 17)?, [0, 0, 0, 0, 1]);
+        assert_eq!(ask(&router, 40)?, [0, 0, 0, 0, 2]);
+        let unsupported = crate::proto::ST_UNSUPPORTED.to_le_bytes();
+        assert_eq!(ask(&router, 99)?, unsupported, "no service: unsupported");
+        Ok(())
+    }
+
+    #[test]
+    fn two_services_never_share_a_kind() {
+        let r = Router::new(vec![Tagged::new(&[16], 1), Tagged::new(&[17, 16], 2)]);
+        assert_eq!(r.err(), Some(16));
+        let r = Router::new(vec![Tagged::new(&[MSG_PING], 1)]);
+        assert_eq!(
+            r.err(),
+            Some(MSG_PING),
+            "the transport's own kinds are not a service's"
+        );
+    }
+
+    /// The drain reaches every service, whichever answers which kinds.
+    #[test]
+    fn the_drain_reaches_every_service() {
+        let (a, b) = (Tagged::new(&[16], 1), Tagged::new(&[40], 2));
+        let router = Router::new(vec![a.clone(), b.clone()]).ok();
+        let router = router.expect("router");
+        assert!(!router.is_busy());
+        b.busy.store(true, Ordering::SeqCst);
+        assert!(router.is_busy(), "busy if any service is");
+        router.begin_drain();
+        assert_eq!(router.cancel_all(), 3, "every service's count");
+        for s in [&a, &b] {
+            assert_eq!(s.drained.load(Ordering::SeqCst), 1);
+            assert_eq!(s.cancelled.load(Ordering::SeqCst), 1);
+        }
     }
 }
