@@ -49,18 +49,14 @@ pub mod testenv {
     /// Set in a test's rerun on tmpfs (see [`rerun_on_tmpfs`]).
     pub const ON_TMPFS_ENV: &str = "GUNGNIR_TEST_ON_TMPFS";
 
-    /// Every path below `dir`, relative and sorted, SQLite's `-wal`/`-shm` journals left
-    /// out (they come and go with any open): what a start left behind, for tests to
-    /// compare.
+    /// Every path below `dir`, relative and sorted: exactly what a start left behind, for
+    /// tests to compare (a refused start must leave nothing, journals included).
     #[must_use]
     pub fn tree(dir: &Path) -> Vec<String> {
         fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
             for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
                 let p = e.path();
-                let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
-                if !rel.ends_with("-wal") && !rel.ends_with("-shm") {
-                    out.push(rel);
-                }
+                out.push(p.strip_prefix(base).unwrap_or(&p).display().to_string());
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
                     walk(base, &p, out);
                 }
@@ -69,6 +65,15 @@ pub mod testenv {
         let mut v = Vec::new();
         walk(dir, dir, &mut v);
         v.sort();
+        v
+    }
+
+    /// [`tree`] without SQLite's `-wal`/`-shm` journals, which come and go with any open of
+    /// a store: for comparing a store that serving opened, before and after.
+    #[must_use]
+    pub fn tree_but_journals(dir: &Path) -> Vec<String> {
+        let mut v = tree(dir);
+        v.retain(|p| !p.ends_with("-wal") && !p.ends_with("-shm"));
         v
     }
 

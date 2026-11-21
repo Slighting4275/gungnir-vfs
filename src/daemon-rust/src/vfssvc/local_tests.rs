@@ -46,8 +46,10 @@ fn local(d: &TestDir, engine: EngineKind, top: Option<&Path>) -> R<Local> {
     let svc = Svc::new(
         Arc::new(ops),
         SvcConfig {
-            xdg_data: Some(d.join("data").into_os_string()),
-            home: Some(d.path().as_os_str().to_owned()),
+            dirs: HomeDirs {
+                xdg_data: Some(d.join("data").into_os_string()),
+                home: Some(d.path().as_os_str().to_owned()),
+            },
             // SAFETY: plain getter.
             uid: unsafe { libc::geteuid() },
             extra_tops: top.map(Path::to_path_buf).into_iter().collect(),

@@ -74,7 +74,10 @@ impl Hooks {
         #[cfg(not(feature = "test-hooks"))]
         {
             for name in ALL {
-                if get(name).is_some() {
+                // Not NO_HOST_SUBVOLS_ENV: .cargo/config.toml sets it for every daemon
+                // cargo starts, and a release build ignoring it is what it wants; saying
+                // so on every `cargo run` would be noise.
+                if name != NO_HOST_SUBVOLS_ENV && get(name).is_some() {
                     eprintln!("gungnird: {name} ignored (built without the test-hooks feature)");
                 }
             }

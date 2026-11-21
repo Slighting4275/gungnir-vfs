@@ -32,6 +32,14 @@ cd "$root" || exit 1
 mkdir -p .build/check
 failed=0
 
+# In CI the io_uring engine tests must run, never skip (D-061): REQUIRE overrides any
+# GUNGNIR_ALLOW_NO_URING that reaches a job. Elsewhere a machine without io_uring already
+# fails those tests unless GUNGNIR_ALLOW_NO_URING=1 asks to skip them on purpose
+# (ops::io::uring_for_tests), so nothing needs setting there.
+if [ -n "$CI" ]; then
+    export GUNGNIR_REQUIRE_URING=1
+fi
+
 gate() { # gate <name> <command...>: run quietly, keep the log, report one line
     local name=$1 log=".build/check/${1//[^a-zA-Z0-9]/-}.log"
     shift
@@ -147,11 +155,6 @@ zig_artifacts() {
 }
 
 tests() { # tests [default|hooks|no-uring]...
-    # The io_uring engine tests must run, never skip (AGENTS.md §4), unless the machine
-    # lacks io_uring and GUNGNIR_ALLOW_NO_URING=1 asks to skip them on purpose.
-    if [ -z "$GUNGNIR_ALLOW_NO_URING" ] || [ "$GUNGNIR_ALLOW_NO_URING" = 0 ]; then
-        export GUNGNIR_REQUIRE_URING="${GUNGNIR_REQUIRE_URING:-1}"
-    fi
     local which
     for which in "${@:-default hooks no-uring}"; do
         for w in $which; do

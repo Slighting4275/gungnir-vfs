@@ -185,12 +185,19 @@ impl Wait {
     }
 }
 
-/// Everything the service takes from its surroundings, read once.
-pub struct SvcConfig {
+/// The user's directories the trash and recent services work in, as the daemon's caller
+/// read them from the environment.
+#[derive(Debug, Clone, Default)]
+pub struct HomeDirs {
     /// `$XDG_DATA_HOME`, where the home trash and the recent list live.
     pub xdg_data: Option<std::ffi::OsString>,
     /// `$HOME`, whose subvolumes hold trash as well.
     pub home: Option<std::ffi::OsString>,
+}
+
+/// Everything the service takes from its surroundings, read once.
+pub struct SvcConfig {
+    pub dirs: HomeDirs,
     /// Whose trash directories these are.
     pub uid: u32,
     /// Volumes beyond the mount table.
@@ -201,20 +208,15 @@ pub struct SvcConfig {
 }
 
 impl SvcConfig {
-    /// The daemon's: the `$XDG_DATA_HOME` and `$HOME` its caller read, its euid, procfs,
-    /// and what the test hooks ask for (one more volume, [`TEST_TOP_ENV`]; the host's
-    /// btrfs subvolumes left out, [`crate::hooks::NO_HOST_SUBVOLS_ENV`]). With no hook
-    /// set, a `test-hooks` build behaves as a release build. Reads no environment.
+    /// The daemon's: the [`HomeDirs`] its caller read, its euid, procfs, and what the test
+    /// hooks ask for (one more volume, [`TEST_TOP_ENV`]; the host's btrfs subvolumes left
+    /// out, [`crate::hooks::NO_HOST_SUBVOLS_ENV`]). With no hook set, a `test-hooks` build
+    /// behaves as a release build. Reads no environment.
     #[must_use]
-    pub fn daemon(
-        hooks: &crate::hooks::Hooks,
-        xdg_data: Option<std::ffi::OsString>,
-        home: Option<std::ffi::OsString>,
-    ) -> Self {
+    pub fn daemon(hooks: &crate::hooks::Hooks, dirs: HomeDirs) -> Self {
         let extra_tops = hooks.trash_top.iter().cloned().collect();
         Self {
-            xdg_data,
-            home,
+            dirs,
             // SAFETY: plain getter.
             uid: unsafe { libc::geteuid() },
             extra_tops,
@@ -293,14 +295,14 @@ impl Svc {
     /// A service over `ops`, as `cfg` says.
     #[must_use]
     pub fn new(ops: Arc<Ops>, cfg: SvcConfig) -> Arc<Self> {
-        let trash_home = trash::home_dir(cfg.xdg_data.as_deref(), cfg.home.as_deref());
+        let trash_home = trash::home_dir(cfg.dirs.xdg_data.as_deref(), cfg.dirs.home.as_deref());
         let xbel = trash_home
             .as_ref()
             .map(|d| d.top.join("recently-used.xbel"));
         Arc::new(Self {
             ops,
             home: trash_home,
-            home_root: cfg.home.map(PathBuf::from),
+            home_root: cfg.dirs.home.map(PathBuf::from),
             subvols: Arc::default(),
             host_subvols: cfg.host_subvols,
             xbel,
@@ -1344,8 +1346,10 @@ mod tests {
         Svc::new(
             Arc::new(ops),
             SvcConfig {
-                xdg_data: Some(home.join("data").into_os_string()),
-                home: Some(home.as_os_str().to_owned()),
+                dirs: HomeDirs {
+                    xdg_data: Some(home.join("data").into_os_string()),
+                    home: Some(home.as_os_str().to_owned()),
+                },
                 uid: me(),
                 extra_tops: Vec::new(),
                 host_subvols: false,

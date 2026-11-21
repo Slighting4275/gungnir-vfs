@@ -8,6 +8,15 @@
 //! - live in-place upgrade re-exec handover without dropped connections
 //! - WAL checkpointing & state persistence
 //! - CLI options (`--help`, `--version`, `--socket`, `--db`, `--idle-timeout`)
+//!
+//! Why these run the real binary: what they test only a process has. Signals arrive at a
+//! process (`signalfd`, SIGTERM/SIGHUP); a live upgrade is an `execve` of it; socket
+//! activation needs `LISTEN_PID` to be its own pid; the CLI is its `argv`; another user
+//! is another uid on its socket; and the seccomp filter, once installed, is the whole
+//! process's. The idle-shutdown tests and the activation-mismatch test run `ipc::serve`
+//! in this test process already. What a start does with its store runs in process in
+//! `daemon::tests`; the ledger-FIFO and damaged-database cases are there too, and stay
+//! here as well for the real filter and the log.
 
 use std::{
     env,
@@ -27,7 +36,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "test-hooks")]
 use std::os::unix::fs::PermissionsExt;
 
 use gungnird::{
@@ -837,5 +845,78 @@ fn another_user_is_refused_even_through_an_open_socket() -> R {
     );
     // ... and the daemon goes on serving its own user.
     assert!(answers(&sock_path, b"still"), "{}", log());
+    Ok(())
+}
+/// SIGTERM `child` and expect a clean exit within 5 s.
+fn terminates(child: &mut Reap) -> R<bool> {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
+}
+
+/// A FIFO under a temp ledger's name blocked the start in `open(2)` before serving and
+/// before signals were handled: the daemon never answered and only SIGKILL ended it. The
+/// real binary, under the real seccomp filter, with the refusal logged; the in-process
+/// twin (daemon::tests) guards the same with a deadline in a fraction of the time.
+#[test]
+fn a_fifo_in_place_of_a_temp_ledger_never_blocks_the_start() -> R {
+    for name in ["ops-pending", "ops-pending.kept"] {
+        let dir = Dir::new("ledger-fifo")?;
+        let (sock, db, log) = (
+            dir.0.join("s.sock"),
+            dir.0.join("meta.db"),
+            dir.0.join("log"),
+        );
+        let fifo = CString::new(dir.0.join(name).into_os_string().into_encoded_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut child = spawn_listening(&sock, &db, &log, true, &[])?;
+        assert!(answers(&sock, b"ledger"), "{name}: never answered");
+        assert!(terminates(&mut child)?, "{name}: no clean exit on SIGTERM");
+        let text = fs::read_to_string(&log)?;
+        assert!(
+            text.contains("temp ledger"),
+            "{name}: the refusal is logged: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// A damaged database failed every start ("file is not a database"); it is now kept
+/// aside and the daemon serves on an empty store. The real binary under the real seccomp
+/// filter; the in-process twin is in daemon::tests.
+#[test]
+fn a_damaged_database_does_not_stop_the_daemon() -> R {
+    let dir = Dir::new("damaged-db")?;
+    let (sock, db, log) = (
+        dir.0.join("s.sock"),
+        dir.0.join("meta.db"),
+        dir.0.join("log"),
+    );
+    let junk: Vec<u8> = (0..8192u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    fs::write(&db, &junk)?;
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600))?;
+    let mut child = spawn_listening(&sock, &db, &log, true, &[])?;
+    assert!(answers(&sock, b"damaged"), "{}", fs::read_to_string(&log)?);
+    assert!(terminates(&mut child)?);
+    let kept: Vec<_> = fs::read_dir(&dir.0)?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("meta.db.corrupt-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(fs::read(kept[0].path())?, junk);
     Ok(())
 }

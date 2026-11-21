@@ -1,6 +1,10 @@
 //! BC-CM-D02: a live upgrade (SIGHUP, an `execve` of the same process) never lets go of
 //! the socket's instance lock or the store lock. A contender trying to take either lock
 //! throughout 50 contended re-execs never gets it, and the daemon serves after each one.
+//!
+//! Why the real binary: the locks must survive real `execve`s of the daemon, fd numbers
+//! and all. The handover's environment and its undo after a failed exec are tested in
+//! process too (`ipc::tests::a_failed_live_upgrade_hands_over_then_undoes_everything`).
 
 use std::{
     fs,

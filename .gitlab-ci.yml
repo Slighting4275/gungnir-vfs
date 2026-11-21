@@ -255,7 +255,7 @@ rust:test:
   variables:
     # What this container cannot have (btrfs) is skipped, each test on a SKIP line in the
     # log; everything else must run (gungnird::testenv). The io_uring engine tests must
-    # run, never skip: ./check requires io_uring by default (D-061).
+    # run, never skip: ./check requires io_uring whenever CI is set (D-061).
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester

@@ -1,6 +1,10 @@
 //! BC-HC-F07: no double start. A socket-activated daemon that cannot hold the socket's
 //! instance lock refuses before serving, with no side effects; a daemon removes its
 //! socket on exit only while that path is still the socket it bound.
+//!
+//! Why the real binary: socket activation hands fd 3 over with `LISTEN_PID` set to the
+//! daemon's own pid (here through `sh -c 'LISTEN_PID=$$ exec ...'`), and the exits tested
+//! are the process's own (SIGTERM, a live upgrade's `execve`).
 
 use std::{
     fs,

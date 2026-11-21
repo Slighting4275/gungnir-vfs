@@ -56,9 +56,8 @@ pub struct StartConfig {
     pub no_uring: Option<OsString>,
     /// The store's lock a live upgrade carried ([`ipc::Handoff::store_lock`]).
     pub carried_store_lock: Option<RawFd>,
-    /// `$XDG_DATA_HOME` and `$HOME`: the home trash and the recent list live there.
-    pub xdg_data: Option<OsString>,
-    pub home: Option<OsString>,
+    /// Where the home trash and the recent list live.
+    pub dirs: vfssvc::HomeDirs,
     pub hooks: Hooks,
 }
 
@@ -205,7 +204,7 @@ fn serve(
     // 5. The services and their router.
     let vfs = vfssvc::Svc::new(
         Arc::clone(&ops),
-        vfssvc::SvcConfig::daemon(hooks, cfg.xdg_data.clone(), cfg.home.clone()),
+        vfssvc::SvcConfig::daemon(hooks, cfg.dirs.clone()),
     );
     let ops_for_ledger = Arc::clone(&ops);
     let services: Vec<Arc<dyn ipc::Service>> = vec![
@@ -444,7 +443,7 @@ fn drain(handler: &dyn ipc::Handler, max: Duration) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{testdir::TestDir, testenv::tree};
+    use crate::{testdir::TestDir, testenv::tree_but_journals};
     use std::sync::Mutex;
 
     /// An exec that never replaces the test process.
@@ -557,12 +556,9 @@ mod tests {
         Ok(())
     }
 
-    /// A start that serves until its idle timeout, then stops cleanly.
-    fn served(dir: &TestDir, sock: &str, db: &Path) -> Result<()> {
-        served_at(&dir.join(sock), db)
-    }
-
-    fn served_at(sock: &Path, db: &Path) -> Result<()> {
+    /// A start on `sock` with the store `db` (no sandbox, the thread engine) that serves
+    /// until its 200 ms idle timeout, then stops cleanly: `Ok` means it served.
+    fn serve_until_idle(sock: &Path, db: &Path) -> Result<()> {
         let listener = ipc::bind(sock)?;
         let sandbox = Recording::default();
         let cfg = StartConfig {
@@ -574,20 +570,22 @@ mod tests {
         run(&listener, &cfg, &ports(&sandbox))
     }
 
-    /// [`served_at`] on a thread, within `limit`: a start that blocks fails the test
-    /// instead of hanging it (the stuck thread is left behind).
+    /// [`serve_until_idle`] on a thread, within `limit`: a start that blocks fails the
+    /// test instead of hanging it (the stuck thread is left behind).
     fn served_within(sock: &Path, db: &Path, limit: Duration) -> std::result::Result<(), String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let (sock, db) = (sock.to_path_buf(), db.to_path_buf());
         std::thread::spawn(move || {
-            let _ = tx.send(served_at(&sock, &db).map_err(|e| e.to_string()));
+            let _ = tx.send(serve_until_idle(&sock, &db).map_err(|e| e.to_string()));
         });
         rx.recv_timeout(limit)
             .map_err(|_| format!("the start did not serve and stop within {limit:?}"))?
     }
 
     /// A FIFO under a temp ledger's name blocked the start in `open(2)` before it served:
-    /// the daemon never answered. Now the ledger is refused, logged, and the start goes on.
+    /// the daemon never answered. Now the ledger is refused and the start goes on, within
+    /// a deadline. The real binary's twin in tests/lifecycle.rs also checks the refusal is
+    /// logged, under the real seccomp filter.
     #[test]
     fn a_fifo_in_place_of_a_temp_ledger_never_blocks_the_start() -> Result<()> {
         for name in ["ops-pending", "ops-pending.kept"] {
@@ -607,7 +605,8 @@ mod tests {
     }
 
     /// A damaged database failed every start ("file is not a database"); it is now kept
-    /// aside, byte for byte, and the daemon serves on an empty store.
+    /// aside, byte for byte, and the daemon serves on an empty store. Its twin in
+    /// tests/lifecycle.rs runs the real binary under the real seccomp filter.
     #[test]
     fn a_damaged_database_does_not_stop_the_daemon() -> Result<()> {
         let dir = TestDir::new("daemon-damaged-db")?;
@@ -637,8 +636,8 @@ mod tests {
     fn a_refused_start_on_an_existing_store_keeps_it() -> Result<()> {
         let dir = TestDir::new("daemon-existing")?;
         let db = dir.join("data/metadata.db");
-        served(&dir, "a.sock", &db)?;
-        let before = tree(dir.path());
+        serve_until_idle(&dir.join("a.sock"), &db)?;
+        let before = tree_but_journals(dir.path());
         assert!(before.iter().any(|p| p == "data/metadata.db"), "{before:?}");
         let sock = dir.join("b.sock");
         let listener = ipc::bind(&sock)?;
@@ -656,7 +655,7 @@ mod tests {
         assert!(run(&listener, &cfg, &ports(&sandbox)).is_err());
         assert!(!sock.exists(), "no socket left");
         drop(listener);
-        let mut after = tree(dir.path());
+        let mut after = tree_but_journals(dir.path());
         // The refused start's socket lock file stays, like after any stop.
         after.retain(|p| p != "b.sock.lock");
         assert_eq!(after, before, "the store is as it was");
@@ -670,7 +669,7 @@ mod tests {
     fn a_held_store_is_refused_untouched_then_taken_once_free() -> Result<()> {
         let dir = TestDir::new("daemon-held")?;
         let db = dir.join("data/metadata.db");
-        served(&dir, "a.sock", &db)?;
+        serve_until_idle(&dir.join("a.sock"), &db)?;
         // The first daemon, as far as the store can tell: its lock held, its ledger
         // naming a temp file of an op still running.
         let held = store::lock_store(&db, None)?;
@@ -688,7 +687,9 @@ mod tests {
         std::fs::write(&ledger, format!("S 00000000000000f2 {hex}\n"))?;
 
         let sock = dir.join("b.sock");
-        let err = served(&dir, "b.sock", &db).err().map(|e| e.to_string());
+        let err = serve_until_idle(&dir.join("b.sock"), &db)
+            .err()
+            .map(|e| e.to_string());
         let err = err.unwrap_or_default();
         assert!(err.contains("already using the store"), "refused: {err}");
         assert!(ledger.exists(), "the first daemon's ledger stays");
@@ -697,6 +698,6 @@ mod tests {
         assert!(!sock.exists(), "the refused start left a socket");
 
         drop(held);
-        served(&dir, "c.sock", &db)
+        serve_until_idle(&dir.join("c.sock"), &db)
     }
 }
