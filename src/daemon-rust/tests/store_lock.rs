@@ -5,42 +5,14 @@
 
 use std::{
     fs,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    os::unix::net::UnixStream,
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-storelock-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, p: &str) -> PathBuf {
-        self.0.join(p)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped as Running};
 
 /// A daemon on `sock` with the store at `<d>/data/gungnir/m.db`.
 fn daemon(d: &Dir, sock: &str) -> Command {
@@ -59,28 +31,15 @@ fn daemon(d: &Dir, sock: &str) -> Command {
     cmd
 }
 
-/// Kills the child on drop, so a failed assertion never leaves a daemon running.
-struct Running(Child);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn start_serving(d: &Dir, sock: &str) -> R<Running> {
     let mut child = Running(daemon(d, sock).stderr(Stdio::null()).spawn()?);
-    let t0 = Instant::now();
-    while UnixStream::connect(d.join(sock)).is_err() {
-        if let Some(st) = child.0.try_wait()? {
-            return Err(format!("the daemon exited before serving: {st}").into());
-        }
-        if t0.elapsed() > Duration::from_secs(10) {
-            return Err("the daemon did not start serving within 10 s".into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    // No log: stderr is not kept, so the path is never there.
+    drop(common::ready(
+        &mut child,
+        &d.join(sock),
+        &d.join("no-log"),
+        Duration::from_secs(10),
+    )?);
     Ok(child)
 }
 

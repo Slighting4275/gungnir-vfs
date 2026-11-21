@@ -5,15 +5,12 @@
 use std::{
     fs,
     io::Read,
-    os::{
-        fd::AsRawFd,
-        unix::{fs::PermissionsExt, net::UnixStream},
-    },
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    os::{fd::AsRawFd, unix::net::UnixStream},
+    path::Path,
+    process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -21,44 +18,8 @@ use std::{
 
 use gungnird::md::Client;
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-d02-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, p: &str) -> PathBuf {
-        self.0.join(p)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Kills the child on drop, so a failed assertion never leaves a daemon running.
-struct Running(Child);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+mod common;
+use common::{Dir, R, Reaped as Running};
 
 /// Ping `sock` until it answers or 5 s pass.
 fn answers(sock: &Path) -> bool {

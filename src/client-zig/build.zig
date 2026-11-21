@@ -71,17 +71,35 @@ pub fn build(b: *std.Build) void {
     // volmon-installed: the module in a dir indexed by gio-querymodules, as installed: 0
     // Gungnir mounts with no env or GIO_USE_VFS only, one per mount point with
     // GIO_USE_VOLUME_MONITOR=gungnir (BC-HC-F01 v2, D-051).
-    const daemon_modes = [_][]const u8{ "daemon", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris", "trash-metadata" };
-    for ([_][]const u8{ "opt-in", "no-opt-in", "daemon", "hung", "metadata", "gio-metadata", "gio-cli", "daemon-stopped", "ui-thread", "hung-mount", "file-ops", "vfs-uris", "volmon", "volmon-off", "volmon-installed", "volmon-signals", "trash-metadata" }) |mode| {
+    // Every mode once: its name and whether it starts the test-hooks gungnird.
+    const Mode = struct { name: []const u8, daemon: bool = false };
+    const modes = [_]Mode{
+        .{ .name = "opt-in" },
+        .{ .name = "no-opt-in" },
+        .{ .name = "daemon", .daemon = true },
+        .{ .name = "hung" },
+        .{ .name = "metadata", .daemon = true },
+        .{ .name = "gio-metadata", .daemon = true },
+        .{ .name = "gio-cli", .daemon = true },
+        .{ .name = "daemon-stopped", .daemon = true },
+        .{ .name = "ui-thread", .daemon = true },
+        .{ .name = "hung-mount", .daemon = true },
+        .{ .name = "file-ops", .daemon = true },
+        .{ .name = "vfs-uris", .daemon = true },
+        .{ .name = "volmon" },
+        .{ .name = "volmon-off" },
+        .{ .name = "volmon-installed" },
+        .{ .name = "volmon-signals" },
+        .{ .name = "trash-metadata", .daemon = true },
+    };
+    for (modes) |m| {
+        const mode = m.name;
         const run = b.addRunArtifact(itest_exe);
         run.setName(b.fmt("itest {s}", .{mode}));
         run.addDirectoryArg(module_dir.getDirectory());
         run.addArg(mode);
         if (!std.mem.eql(u8, mode, "no-opt-in")) run.addDirectoryArg2(repo_tmp, .{ .make_absolute = true });
-        const needs_daemon = for (daemon_modes) |d| {
-            if (std.mem.eql(u8, mode, d)) break true;
-        } else false;
-        if (needs_daemon) {
+        if (m.daemon) {
             run.addFileArg2(gungnird_bin, .{ .make_absolute = true });
             run.step.dependOn(&cargo_build.step);
         }

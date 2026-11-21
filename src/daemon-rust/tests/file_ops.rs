@@ -5,12 +5,13 @@
 //! a slowed-down copy mid-way, cancels ops whose client hung up, and refuses ops on a
 //! fake hung mount at once.
 
+#[cfg(feature = "test-hooks")]
+use std::thread;
 use std::{
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    thread,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -24,39 +25,13 @@ use gungnird::{
     proto::MSG_REPLY,
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let mode = fs::symlink_metadata(&base)?.permissions().mode();
-        if mode & 0o022 != 0 {
-            fs::set_permissions(&base, fs::Permissions::from_mode(mode & 0o7755))?;
-        }
-        let p = base.join(format!("fo-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, f: &str) -> PathBuf {
-        self.0.join(f)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped};
 
 struct Daemon {
-    child: Child,
+    /// Held for its drop: the daemon is killed with this.
+    #[allow(dead_code)]
+    child: Reaped,
     sock: PathBuf,
 }
 
@@ -64,47 +39,31 @@ impl Daemon {
     /// gungnird with everything (socket, database, XDG dirs, HOME) inside `dir`.
     fn start(dir: &Dir, no_uring: bool, env: &[(&str, &Path)]) -> R<Self> {
         let sock = dir.join("gungnird.sock");
-        let log = fs::File::create(dir.join(&format!("gungnird-{no_uring}.log")))?;
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+        let log = dir.join(format!("gungnird-{no_uring}.log"));
+        let mut cmd = common::gungnird(dir)?;
         cmd.arg(dir.join("data/metadata.db"))
             .env("GUNGNIR_SOCKET", &sock)
-            .env("HOME", &dir.0)
-            .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_RUNTIME_DIR", &dir.0)
             .env_remove(ops::NO_URING_ENV)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log);
+            .stderr(fs::File::create(&log)?);
         if no_uring {
             cmd.env(ops::NO_URING_ENV, "1");
         }
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn()?;
-        let mut d = Self { child, sock };
-        let t0 = Instant::now();
-        while UnixStream::connect(&d.sock).is_err() {
-            if let Some(st) = d.child.try_wait()? {
-                return Err(format!("gungnird exited early: {st}").into());
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err("gungnird did not start listening".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(d)
+        let mut child = Reaped(cmd.spawn()?);
+        drop(common::ready(
+            &mut child,
+            &sock,
+            &log,
+            Duration::from_secs(10),
+        )?);
+        Ok(Self { child, sock })
     }
 
     fn client(&self) -> R<Client> {
         Ok(Client::connect(&self.sock, Duration::from_secs(5))?)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -302,8 +261,8 @@ fn file_ops_over_the_real_socket_on_both_engines() -> R {
             "a deleted file's metadata is dropped"
         );
         for i in 0..20 {
-            fs::create_dir_all(dir.join(&format!("tree/d{}", i % 4)))?;
-            fs::write(dir.join(&format!("tree/d{}/f{i}", i % 4)), b"x")?;
+            fs::create_dir_all(dir.join(format!("tree/d{}", i % 4)))?;
+            fs::write(dir.join(format!("tree/d{}/f{i}", i % 4)), b"x")?;
         }
         let (done, _) = run(&mut c, &req(OpKind::DeleteTree, 0, &dir.join("tree"), None))?;
         assert_eq!(done.result, Ok(()));
@@ -316,7 +275,7 @@ fn file_ops_over_the_real_socket_on_both_engines() -> R {
         );
         drop(c);
         drop(d);
-        let log = fs::read_to_string(dir.join(&format!("gungnird-{no_uring}.log")))?;
+        let log = fs::read_to_string(dir.join(format!("gungnird-{no_uring}.log")))?;
         let engine = if no_uring { "Threads" } else { "Uring" };
         let uring_ok = no_uring || ops::io::uring_for_tests_env("engine log check");
         if no_uring || uring_ok {
@@ -338,7 +297,7 @@ fn many_ops_on_one_connection_each_get_one_done() -> R {
             OpKind::Copy,
             0,
             &dir.join("s"),
-            Some(&dir.join(&format!("c{i}"))),
+            Some(&dir.join(format!("c{i}"))),
         );
         let mut others = Vec::new();
         let (seq, id) = start_among(&mut c, &r, &mut others)?;
@@ -376,7 +335,7 @@ fn many_ops_on_one_connection_each_get_one_done() -> R {
         }
     }
     for i in 0..8 {
-        assert_eq!(fs::read(dir.join(&format!("c{i}")))?.len(), 1 << 20);
+        assert_eq!(fs::read(dir.join(format!("c{i}")))?.len(), 1 << 20);
     }
     Ok(())
 }
@@ -505,21 +464,17 @@ fn a_deep_tree_is_deleted_under_a_low_descriptor_limit() -> R {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log);
-        let mut d = Daemon {
-            child: cmd.spawn()?,
+        let mut child = Reaped(cmd.spawn()?);
+        let mut c = common::ready(
+            &mut child,
+            &sock,
+            &dir.join("gungnird.log"),
+            Duration::from_secs(10),
+        )?;
+        let d = Daemon {
+            child,
             sock: sock.clone(),
         };
-        let t0 = Instant::now();
-        while UnixStream::connect(&sock).is_err() {
-            if let Some(st) = d.child.try_wait()? {
-                return Err(format!("gungnird exited early: {st}").into());
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err("gungnird did not start listening".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let mut c = d.client()?;
         let root = dir.join("tree");
         let mut p = root.clone();
         for i in 0..200 {

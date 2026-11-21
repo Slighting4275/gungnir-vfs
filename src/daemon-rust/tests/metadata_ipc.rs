@@ -5,11 +5,8 @@
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
-    thread,
+    os::unix::net::UnixStream,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -24,45 +21,14 @@ use gungnird::{
     store::{Store, StoreConfig},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+mod common;
+use common::{Dir, R, Reaped};
 
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        // CI checks out with umask 0000: nobody else may write next to our directories.
-        let md = fs::symlink_metadata(&base)?;
-        if !md.is_dir() {
-            return Err("base is not a directory".into());
-        }
-        if md.permissions().mode() & 0o022 != 0 {
-            fs::set_permissions(
-                &base,
-                fs::Permissions::from_mode(md.permissions().mode() & 0o7755),
-            )?;
-        }
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?; // never adopt an existing directory
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A running daemon, killed on drop.
+/// A running daemon, killed on drop (before its directory goes: fields drop in order).
 struct Daemon {
-    child: Child,
+    /// Held for its drop: the daemon is killed with this.
+    #[allow(dead_code)]
+    child: Reaped,
     sock: PathBuf,
     db: PathBuf,
     dir: Dir,
@@ -71,32 +37,23 @@ struct Daemon {
 impl Daemon {
     fn start(name: &str) -> R<Self> {
         let dir = Dir::new(name)?;
-        let sock = dir.0.join("gungnird.sock");
-        let db = dir.0.join("data/metadata.db");
-        let child = Command::new(env!("CARGO_BIN_EXE_gungnird"))
-            .arg(&db)
-            .env("GUNGNIR_SOCKET", &sock)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut d = Self {
+        let sock = dir.join("gungnird.sock");
+        let db = dir.join("data/metadata.db");
+        let mut cmd = common::gungnird(&dir)?;
+        cmd.arg(&db).env("GUNGNIR_SOCKET", &sock);
+        let mut child = Reaped(cmd.spawn()?);
+        drop(common::ready(
+            &mut child,
+            &sock,
+            &dir.join("log"),
+            Duration::from_secs(10),
+        )?);
+        Ok(Self {
             child,
             sock,
             db,
             dir,
-        };
-        let t0 = Instant::now();
-        while UnixStream::connect(&d.sock).is_err() {
-            if let Some(st) = d.child.try_wait()? {
-                return Err(format!("gungnird exited early: {st}").into());
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err("gungnird did not start listening".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(d)
+        })
     }
 
     fn client(&self) -> R<Client> {
@@ -107,13 +64,6 @@ impl Daemon {
         let p = self.dir.0.join(name);
         fs::write(&p, b"x")?;
         Ok(p)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

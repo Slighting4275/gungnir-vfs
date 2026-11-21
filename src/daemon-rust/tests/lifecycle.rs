@@ -23,10 +23,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -37,40 +34,8 @@ use gungnird::{
     store::{Store, StoreConfig},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let md = fs::symlink_metadata(&base)?;
-        if !md.is_dir() {
-            return Err("base is not a directory".into());
-        }
-        if md.permissions().mode() & 0o022 != 0 {
-            fs::set_permissions(
-                &base,
-                fs::Permissions::from_mode(md.permissions().mode() & 0o7755),
-            )?;
-        }
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-life-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped as Reap};
 
 #[test]
 fn systemd_socket_activation_protocol() -> R {
@@ -315,29 +280,6 @@ fn signal_handling_graceful_shutdown_sigterm() -> R {
     assert!(!sock.exists(), "socket must be unlinked on clean shutdown");
 
     Ok(())
-}
-
-/// A child daemon killed and reaped on drop, so a failed assertion leaves no daemon behind.
-struct Reap(std::process::Child);
-
-impl std::ops::Deref for Reap {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Reap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for Reap {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// Start gungnird (with `--seccomp` if `seccomp`) and wait until it listens; its stderr

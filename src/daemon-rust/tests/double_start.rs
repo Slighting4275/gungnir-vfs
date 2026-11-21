@@ -8,56 +8,18 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::PermissionsExt,
             net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    path::Path,
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-f07-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, p: &str) -> PathBuf {
-        self.0.join(p)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Kills the child on drop, so a failed assertion never leaves a daemon running.
-struct Running(Child);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+mod common;
+use common::{Dir, R, Reaped as Running};
 
 /// The daemon with the store at `<d>/data/m.db`, run through `sh` so the environment
 /// can name its own pid: `LISTEN_PID=$$` before `exec` is the daemon's pid, as systemd

@@ -10,10 +10,9 @@
 
 use std::{
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    process::ExitStatus,
     thread,
     time::{Duration, Instant},
 };
@@ -24,42 +23,12 @@ use gungnird::{
     proto::MSG_REPLY,
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let mode = fs::symlink_metadata(&base)?.permissions().mode();
-        if mode & 0o022 != 0 {
-            fs::set_permissions(&base, fs::Permissions::from_mode(mode & 0o7755))?;
-        }
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-drain-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, f: &str) -> PathBuf {
-        self.0.join(f)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped};
 
 /// The daemon; killed and reaped on drop if still running.
 struct Daemon {
-    child: Child,
+    child: Reaped,
     sock: PathBuf,
     log: PathBuf,
 }
@@ -67,8 +36,8 @@ struct Daemon {
 impl Daemon {
     fn start(d: &Dir, seccomp: bool, env: &[(&str, &str)]) -> R<Self> {
         let sock = d.join("s.sock");
-        let log = d.join("d.log");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+        let log = d.join("log");
+        let mut cmd = common::gungnird(d)?;
         if seccomp {
             cmd.arg("--seccomp=filter");
         }
@@ -76,33 +45,18 @@ impl Daemon {
             .arg(&sock)
             .arg("-d")
             .arg(d.join("data/m.db"))
-            .env("HOME", &d.0)
-            .env("XDG_DATA_HOME", d.join("data"))
             .env("XDG_RUNTIME_DIR", &d.0)
-            .env_remove("GUNGNIR_SECCOMP")
-            .envs(env.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&log)?);
-        let mut me = Self {
-            child: cmd.spawn()?,
-            sock,
-            log,
-        };
-        let t0 = Instant::now();
-        while UnixStream::connect(&me.sock).is_err() {
-            if let Some(st) = me.child.try_wait()? {
-                return Err(format!("gungnird exited early: {st}\n{}", me.text()).into());
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err("gungnird did not start listening".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+            .envs(env.iter().copied());
+        let mut child = Reaped(cmd.spawn()?);
         // The socket is bound before the start-up work (the sweep among it): a handshake
         // is answered only once the daemon serves.
-        drop(Client::connect(&me.sock, Duration::from_secs(10))?);
-        Ok(me)
+        drop(common::ready(
+            &mut child,
+            &sock,
+            &log,
+            Duration::from_secs(10),
+        )?);
+        Ok(Self { child, sock, log })
     }
 
     fn text(&self) -> String {
@@ -125,13 +79,6 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(5));
         }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

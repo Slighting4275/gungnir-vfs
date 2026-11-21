@@ -7,42 +7,17 @@
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+mod common;
+use common::{Dir, R};
 
-/// A private (0700) directory under <repo>/.build/tmp, removed on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let mode = fs::symlink_metadata(&base)?.permissions().mode();
-        if mode & 0o022 != 0 {
-            fs::set_permissions(&base, fs::Permissions::from_mode(mode & 0o7755))?;
-        }
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let p = base.join(format!("it-refuse-{name}-{}-{n}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
+/// No `common::gungnird` here: its log file would show in the trees these tests compare,
+/// and they read stderr themselves.
 fn daemon(d: &Dir, env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
     cmd.arg("--seccomp=filter")

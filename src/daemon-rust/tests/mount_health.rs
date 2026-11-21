@@ -4,9 +4,8 @@
 
 use std::{
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -19,68 +18,31 @@ use gungnird::{
     md::{self, Client, ClientError, MdError},
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(name: &str) -> R<Self> {
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.build"))?
-            .join("tmp");
-        fs::create_dir_all(&base)?;
-        let mode = fs::symlink_metadata(&base)?.permissions().mode();
-        if mode & 0o022 != 0 {
-            fs::set_permissions(&base, fs::Permissions::from_mode(mode & 0o7755))?;
-        }
-        let p = base.join(format!("mh-{name}-{}", std::process::id()));
-        fs::create_dir(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped};
 
 struct Daemon {
-    child: Child,
+    /// Held for its drop: the daemon is killed with this.
+    #[allow(dead_code)]
+    child: Reaped,
     sock: PathBuf,
 }
 
 impl Daemon {
     fn start(dir: &Dir, fake_hung: &Path) -> R<Self> {
-        let sock = dir.0.join("gungnird.sock");
-        let log = fs::File::create(dir.0.join("gungnird.log"))?;
-        let child = Command::new(env!("CARGO_BIN_EXE_gungnird"))
-            .arg(dir.0.join("data/metadata.db"))
+        let sock = dir.join("gungnird.sock");
+        let mut cmd = common::gungnird(dir)?;
+        cmd.arg(dir.join("data/metadata.db"))
             .env("GUNGNIR_SOCKET", &sock)
-            .env(FAKE_HUNG_ENV, fake_hung)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()?;
-        let mut d = Self { child, sock };
-        let t0 = Instant::now();
-        while UnixStream::connect(&d.sock).is_err() {
-            if let Some(st) = d.child.try_wait()? {
-                return Err(format!("gungnird exited early: {st}").into());
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err("gungnird did not start listening".into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(d)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+            .env(FAKE_HUNG_ENV, fake_hung);
+        let mut child = Reaped(cmd.spawn()?);
+        drop(common::ready(
+            &mut child,
+            &sock,
+            &dir.join("log"),
+            Duration::from_secs(10),
+        )?);
+        Ok(Self { child, sock })
     }
 }
 
@@ -160,7 +122,7 @@ fn health_queries_and_events_over_the_real_socket() -> R {
         assert_eq!(st, Health::Healthy);
         assert_ne!(mp, fake.as_os_str().as_bytes());
         assert!(c.identify(&f).is_ok());
-        let log = fs::read_to_string(dir.0.join("gungnird.log"))?;
+        let log = fs::read_to_string(dir.join("log"))?;
         assert!(log.contains("ignored"), "log: {log}");
     }
     drop(c);

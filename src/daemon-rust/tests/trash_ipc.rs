@@ -1,13 +1,14 @@
 //! `trash://` and `recent://` through a real, sandboxed gungnird, on both engines
 //! (milestone 9): the promises of `trash.rs` as a client sees them.
 
+#[cfg(feature = "test-hooks")]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     ffi::CString,
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -22,73 +23,26 @@ use gungnird::{
     },
 };
 
-type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-static N: AtomicU32 = AtomicU32::new(0);
-
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(tag: &str) -> R<Self> {
-        let base = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?
-            .join(".build/tmp");
-        fs::create_dir_all(&base)?;
-        let n = N.fetch_add(1, Ordering::SeqCst);
-        let p = base.join(format!("it-trash-{tag}-{}-{n}", std::process::id()));
-        fs::create_dir_all(&p)?;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(p))
-    }
-
-    fn join(&self, f: &str) -> PathBuf {
-        self.0.join(f)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::{Dir, R, Reaped};
 
 struct Daemon {
-    child: Child,
+    child: Reaped,
     c: Client,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn start(d: &Dir, no_uring: bool, env: &[(&str, &str)]) -> R<Daemon> {
     let sock = d.join("s.sock");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+    let mut cmd = common::gungnird(d)?;
     cmd.arg("--seccomp")
         .arg("-s")
         .arg(&sock)
         .arg("-d")
         .arg(d.join("data/gungnir/metadata.db"))
-        .env("HOME", &d.0)
-        .env("XDG_DATA_HOME", d.join("data"))
         .env(ops::NO_URING_ENV, if no_uring { "1" } else { "0" })
-        .env_remove("GUNGNIR_SECCOMP")
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(d.join("log"))?);
-    let child = cmd.spawn()?;
-    let t0 = Instant::now();
-    while !sock.exists() {
-        if t0.elapsed() > Duration::from_secs(10) {
-            return Err("gungnird did not start".into());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    thread::sleep(Duration::from_millis(30));
-    let c = Client::connect(&sock, Duration::from_secs(5))?;
+        .envs(env.iter().copied());
+    let mut child = Reaped(cmd.spawn()?);
+    let c = common::ready(&mut child, &sock, &d.join("log"), Duration::from_secs(10))?;
     Ok(Daemon { child, c })
 }
 
