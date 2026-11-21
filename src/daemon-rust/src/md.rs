@@ -38,29 +38,15 @@ use crate::{
     ipc::{self, Frame, PAYLOAD_MAX, RING_C2D, RING_D2C, Shm},
 };
 
-pub const MSG_MD_IDENTIFY: u32 = 16;
-pub const MSG_MD_GET: u32 = 17;
-pub const MSG_MD_SET: u32 = 18;
-pub const MSG_MD_UNSET: u32 = 19;
-pub const MSG_MD_LIST: u32 = 20;
-pub const MSG_MD_REMOVED: u32 = 21;
-pub const MSG_MD_MOVED: u32 = 22;
-pub const MSG_MD_REPLY: u32 = 32;
-
-pub const ST_OK: u32 = 0;
-pub const ST_NOT_FOUND: u32 = 1;
-pub const ST_BUSY: u32 = 2;
-pub const ST_TIMEOUT: u32 = 3;
-pub const ST_SUSPECT_MOUNT: u32 = 4;
-pub const ST_NO_SUCH_FILE: u32 = 5;
-pub const ST_BAD_REQUEST: u32 = 6;
-pub const ST_KEY_TOO_LONG: u32 = 7;
-pub const ST_VALUE_TOO_LARGE: u32 = 8;
-pub const ST_TOO_MANY_KEYS: u32 = 9;
-pub const ST_BAD_UTF8: u32 = 10;
-pub const ST_IO_ERROR: u32 = 11;
-pub const ST_DB_ERROR: u32 = 12;
-pub const ST_UNSUPPORTED: u32 = 13;
+// The kinds and statuses are the protocol's ([`crate::proto`]); these are the ones
+// metadata uses.
+use crate::proto::MSG_REPLY;
+pub use crate::proto::{
+    MSG_MD_GET, MSG_MD_IDENTIFY, MSG_MD_LIST, MSG_MD_MOVED, MSG_MD_REMOVED, MSG_MD_SET,
+    MSG_MD_UNSET, ST_BAD_REQUEST, ST_BAD_UTF8, ST_BUSY, ST_DB_ERROR, ST_IO_ERROR, ST_KEY_TOO_LONG,
+    ST_NO_SUCH_FILE, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT, ST_TIMEOUT, ST_TOO_MANY_KEYS,
+    ST_UNSUPPORTED, ST_VALUE_TOO_LARGE,
+};
 
 pub const MAX_UUID_LEN: usize = 64;
 pub const MAX_KEY_LEN: usize = 256;
@@ -534,15 +520,6 @@ impl Request {
     }
 }
 
-/// Reply payload: `status u32 | body`.
-#[must_use]
-pub fn reply_payload(status: u32, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&status.to_le_bytes());
-    out.extend_from_slice(body);
-    out
-}
-
 /// List reply body for `keys` (ascending): as many as fit `PAYLOAD_MAX - 4`, `more` set
 /// if some did not.
 #[must_use]
@@ -679,7 +656,7 @@ impl Client {
             if m.seq != seq {
                 continue; // a late reply to an earlier, timed-out request
             }
-            if m.kind != MSG_MD_REPLY {
+            if m.kind != MSG_REPLY {
                 return Err(Error::Protocol("unexpected reply kind").into());
             }
             return reply_result(m.payload());

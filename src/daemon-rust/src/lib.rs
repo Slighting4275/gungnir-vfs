@@ -8,6 +8,7 @@ pub mod md;
 pub mod mdsvc;
 pub mod ops;
 pub mod opsvc;
+pub mod proto;
 pub mod recent;
 pub mod seccomp;
 pub mod store;

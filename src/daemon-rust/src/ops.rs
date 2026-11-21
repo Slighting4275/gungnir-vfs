@@ -60,10 +60,10 @@ use crate::md::{
 };
 use io::{EngineKind, Io, Step, StepError, Stop, SyncIo, UringIo, Watch};
 
-pub const MSG_OP_START: u32 = 25;
-pub const MSG_OP_CANCEL: u32 = 26;
-pub const MSG_OP_PROGRESS: u32 = 34;
-pub const MSG_OP_DONE: u32 = 35;
+pub use crate::proto::{
+    MSG_OP_CANCEL, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, ST_CANCELLED, ST_OS_ERROR,
+    ST_WOULD_RECURSE,
+};
 
 pub const OP_COPY: u8 = 1;
 pub const OP_MOVE: u8 = 2;
@@ -80,11 +80,6 @@ pub const FLAG_NO_FALLBACK_FOR_MOVE: u32 = 16;
 pub const FLAG_TARGET_DEFAULT_PERMS: u32 = 32;
 pub const FLAG_TARGET_DEFAULT_MODIFIED_TIME: u32 = 64;
 const KNOWN_FLAGS: u32 = 127;
-
-/// Done statuses beyond `md`'s.
-pub const ST_CANCELLED: u32 = 14;
-pub const ST_OS_ERROR: u32 = 15;
-pub const ST_WOULD_RECURSE: u32 = 16;
 
 /// The environment variable that forces the thread-pool engine.
 pub const NO_URING_ENV: &str = "GUNGNIR_NO_URING";

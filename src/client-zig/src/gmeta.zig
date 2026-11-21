@@ -21,6 +21,7 @@
 const std = @import("std");
 const c = @import("c");
 const md = @import("md.zig");
+const gioerr = @import("gioerr.zig");
 const link = @import("link.zig");
 const health = @import("health.zig");
 const Allocator = std.mem.Allocator;
@@ -45,20 +46,6 @@ pub fn keyOf(attribute: []const u8) ?[]const u8 {
     const key = attribute[prefix.len..];
     md.validKey(key) catch return null;
     return key;
-}
-
-/// GIOErrorEnum code for a failed metadata operation.
-pub fn ioErrorCode(err: Error) c_int {
-    return switch (err) {
-        error.Unavailable, error.DaemonAbsent, error.NoSocketPath, error.VersionMismatch, error.Rejected, error.ForeignPeer, error.Unsupported => c.G_IO_ERROR_NOT_SUPPORTED,
-        error.Busy, error.RingFull => c.G_IO_ERROR_BUSY,
-        error.Timeout, error.SuspectMount, error.MountHung => c.G_IO_ERROR_TIMED_OUT,
-        error.NoSuchFile => c.G_IO_ERROR_NOT_FOUND,
-        error.PathTooLong => c.G_IO_ERROR_FILENAME_TOO_LONG,
-        error.BadRequest, error.KeyTooLong, error.ValueTooLarge, error.BadUtf8, error.WrongType => c.G_IO_ERROR_INVALID_ARGUMENT,
-        error.TooManyKeys => c.G_IO_ERROR_NO_SPACE,
-        else => c.G_IO_ERROR_FAILED,
-    };
 }
 
 fn reason(err: Error) [*:0]const u8 {
@@ -176,7 +163,7 @@ fn query(gpa: Allocator, path: []const u8, wanted: ?[]const []const u8, b: link.
 // ---- set ----------------------------------------------------------------------
 
 fn setError(err_out: [*c][*c]c.GError, err: Error, attribute: [*c]const u8) void {
-    c.g_set_error(err_out, c.g_io_error_quark(), ioErrorCode(err), "Error setting file metadata %s: %s", attribute, reason(err));
+    c.g_set_error(err_out, c.g_io_error_quark(), gioerr.code(err, 0), "Error setting file metadata %s: %s", attribute, reason(err));
 }
 
 /// Store one metadata attribute of `info`: string, stringv, or unset (type INVALID).
@@ -322,16 +309,17 @@ test "attribute names map to keys" {
     try std.testing.expect(keyOf(long[0 .. long.len - 1]) != null);
 }
 
-test "errors map to the documented GIO codes" {
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(error.Unavailable));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(error.DaemonAbsent));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_BUSY), ioErrorCode(error.Busy));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_BUSY), ioErrorCode(error.RingFull));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), ioErrorCode(error.Timeout));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), ioErrorCode(error.SuspectMount));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_INVALID_ARGUMENT), ioErrorCode(error.WrongType));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NO_SPACE), ioErrorCode(error.TooManyKeys));
-    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_FAILED), ioErrorCode(error.DaemonDb));
+test "metadata errors map to the documented GIO codes" {
+    const code = gioerr.code;
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), code(error.Unavailable, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), code(error.DaemonAbsent, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_BUSY), code(error.Busy, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_BUSY), code(error.RingFull, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), code(error.Timeout, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), code(error.SuspectMount, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_INVALID_ARGUMENT), code(error.WrongType, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_NO_SPACE), code(error.TooManyKeys, 0));
+    try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_FAILED), code(error.DaemonDb, 0));
 }
 
 test "values reach GFileInfo intact and nothing leaks" {

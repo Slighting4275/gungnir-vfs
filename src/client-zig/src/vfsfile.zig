@@ -17,22 +17,18 @@ const health = @import("health.zig");
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
+const proto = @import("proto.zig");
+const gioerr = @import("gioerr.zig");
 
-const msg_list: u32 = 40;
-const msg_delete: u32 = 41;
-const msg_restore: u32 = 42;
-const msg_stat: u32 = 45;
-const msg_children: u32 = 46;
-const msg_stamp: u32 = 47;
+const msg_list = proto.msg_vfs_list;
+const msg_delete = proto.msg_vfs_delete;
+const msg_restore = proto.msg_vfs_restore;
+const msg_stat = proto.msg_vfs_stat;
+const msg_children = proto.msg_vfs_children;
+const msg_stamp = proto.msg_vfs_stamp;
 
-const scheme_trash: u8 = 0;
-const scheme_recent: u8 = 1;
-
-const st_cancelled: u32 = 14;
-const st_os_error: u32 = 15;
-const st_would_recurse: u32 = 16;
-const st_mount_inside: u32 = 17;
-const st_not_empty: u32 = 18;
+const scheme_trash = proto.scheme_trash;
+const scheme_recent = proto.scheme_recent;
 
 const kind_file: u8 = 1;
 const kind_dir: u8 = 2;
@@ -43,7 +39,7 @@ const list_timeout_ms = 5_000;
 /// Longest silence from the daemon. An op under way sends a beat every 5 s, so a big
 /// restore takes what it takes, and only a daemon stuck outside its engine runs this out.
 const op_timeout_ms = 65_000;
-const msg_beat: u32 = 44;
+const msg_beat = proto.msg_vfs_beat;
 /// A list refused because every request slot is taken is tried again this often.
 const busy_retries = 100;
 const busy_wait_us = 20_000;
@@ -203,29 +199,28 @@ fn whileBusy(call: anytype, retries: u32, wait_us: c.gulong) md.Error![]const u8
     }
 }
 
-fn failure(cl: *const md.Client, reply: *ipc.Msg, e: md.Error, err: [*c][*c]c.GError) void {
-    switch (e) {
-        error.Cancelled => setError(err, c.G_IO_ERROR_CANCELLED, "cancelled"),
-        error.Busy => setError(err, c.G_IO_ERROR_BUSY, "gungnird is busy; try again"),
-        error.Timeout => setError(err, c.G_IO_ERROR_TIMED_OUT, "gungnird did not answer in time"),
-        error.SuspectMount => setError(err, c.G_IO_ERROR_TIMED_OUT, "a volume is hung or gone (reported by the gungnird mount health monitor)"),
-        error.NotFound, error.NoSuchFile => setError(err, c.G_IO_ERROR_NOT_FOUND, "no such item"),
-        error.BadRequest => setError(err, c.G_IO_ERROR_INVALID_ARGUMENT, "not a valid item"),
-        error.Unsupported => setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "this gungnird has no trash service"),
-        error.Protocol => switch (cl.last_status) {
-            st_mount_inside => setError(err, c.G_IO_ERROR_BUSY, "contains a mounted filesystem; unmount it and try again"),
-            st_not_empty => setError(err, c.G_IO_ERROR_NOT_EMPTY, "some items remain"),
-            st_cancelled => setError(err, c.G_IO_ERROR_CANCELLED, "cancelled"),
-            st_would_recurse => setError(err, c.G_IO_ERROR_WOULD_RECURSE, "a folder cannot be restored to another filesystem this way"),
-            st_os_error => {
-                const p = reply.payload();
-                const errno: c_int = if (p.len >= 8) std.mem.readInt(i32, p[4..8], .little) else 5;
-                setError(err, @intCast(c.g_io_error_from_errno(errno)), c.g_strerror(errno));
-            },
-            else => setError(err, c.G_IO_ERROR_FAILED, "bad reply from gungnird"),
-        },
-        else => setError(err, c.G_IO_ERROR_NOT_SUPPORTED, "gungnird is not available"),
-    }
+/// Report `e` from a trash or recent call: the code is the shared map's (gioerr.zig), the
+/// words are this service's.
+fn failure(reply: *ipc.Msg, e: md.Error, err: [*c][*c]c.GError) void {
+    const p = reply.payload();
+    const errno: i32 = if (e == error.DaemonOs) proto.osErrno(if (p.len >= 4) p[4..] else p[0..0]) else 0;
+    const code = gioerr.code(e, errno);
+    const text: [*c]const u8 = switch (e) {
+        error.Cancelled => "cancelled",
+        error.Busy => "gungnird is busy; try again",
+        error.Timeout => "gungnird did not answer in time",
+        error.SuspectMount => "a volume is hung or gone (reported by the gungnird mount health monitor)",
+        error.NotFound, error.NoSuchFile => "no such item",
+        error.BadRequest => "not a valid item",
+        error.Unsupported => "this gungnird has no trash service",
+        error.MountInside => "contains a mounted filesystem; unmount it and try again",
+        error.NotEmpty => "some items remain",
+        error.WouldRecurse => "a folder cannot be restored to another filesystem this way",
+        error.DaemonOs => c.g_strerror(errno),
+        error.Protocol, error.DaemonIo, error.DaemonDb => "bad reply from gungnird",
+        else => if (code == c.G_IO_ERROR_NOT_SUPPORTED) "gungnird is not available" else @errorName(e).ptr,
+    };
+    setError(err, code, text);
 }
 
 /// One listed entry, slices of a reply.
@@ -407,7 +402,7 @@ fn fetchFrom(scheme: u8, dir: ?[]const u8, partial: ?*bool, err: [*c][*c]c.GErro
         };
         var reply: ipc.Msg = undefined;
         const body = requestRetry(&link, r0.kind, req[0..r0.len], &reply) catch |e| {
-            failure(&link.client, &reply, e, err);
+            failure(&reply, e, err);
             _ = c.g_ptr_array_free(out, 1);
             return null;
         };
@@ -510,7 +505,7 @@ fn findInfo(self: *GungnirFile, err: [*c][*c]c.GError) ?*c.GFileInfo {
     defer link.close();
     var reply: ipc.Msg = undefined;
     const body = requestRetry(&link, msg_stat, req[0 .. 3 + name.len], &reply) catch |e| {
-        failure(&link.client, &reply, e, err);
+        failure(&reply, e, err);
         return null;
     };
     if (body.len < 7) {
@@ -850,7 +845,7 @@ fn fileDelete(f: ?*c.GFile, cancellable: [*c]c.GCancellable, err: [*c][*c]c.GErr
     watch(&link, cancellable);
     var reply: ipc.Msg = undefined;
     _ = requestRetry(&link, msg_delete, req[0 .. 3 + name.len], &reply) catch |e| {
-        failure(&link.client, &reply, e, err);
+        failure(&reply, e, err);
         return 0;
     };
     return 1;
@@ -906,7 +901,7 @@ fn fileMove(
     var reply: ipc.Msg = undefined;
     _ = requestRetry(&link, msg_restore, req[0 .. at + to.len], &reply) catch |e| {
         var mine: [*c]c.GError = null;
-        failure(&link.client, &reply, e, &mine);
+        failure(&reply, e, &mine);
         if (flags & c.G_FILE_COPY_OVERWRITE != 0 and
             c.g_error_matches(mine, c.g_io_error_quark(), c.G_IO_ERROR_EXISTS) != 0)
         {

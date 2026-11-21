@@ -13,8 +13,9 @@ use std::{
 };
 
 use gungnird::{
-    md::{Client, MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_NOT_FOUND, ST_OK},
+    md::{Client, ST_BAD_REQUEST, ST_BUSY, ST_NOT_FOUND, ST_OK},
     ops,
+    proto::MSG_REPLY,
     vfssvc::{
         MSG_TRASH_EMPTY, MSG_VFS_DELETE, MSG_VFS_LIST, MSG_VFS_RESTORE, SCHEME_RECENT,
         SCHEME_TRASH, ST_MOUNT_INSIDE,
@@ -99,7 +100,7 @@ fn call(c: &mut Client, kind: u32, payload: &[u8]) -> R<(u32, Vec<u8>)> {
             .checked_sub(t0.elapsed())
             .ok_or("no reply in time")?;
         let m = c.recv(left)?;
-        if m.kind == MSG_MD_REPLY && m.seq == seq {
+        if m.kind == MSG_REPLY && m.seq == seq {
             let p = m.payload();
             return Ok((u32::from_le_bytes(p[..4].try_into()?), p[4..].to_vec()));
         }
@@ -885,7 +886,7 @@ fn request_threads_are_bounded() -> R {
     for _ in 0..seqs.len() {
         let m = loop {
             let m = dm.c.recv(Duration::from_secs(20))?;
-            if m.kind == MSG_MD_REPLY {
+            if m.kind == MSG_REPLY {
                 break m;
             }
         };

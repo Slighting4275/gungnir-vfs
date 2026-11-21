@@ -15,12 +15,13 @@ use std::{
 };
 
 use gungnird::{
-    md::{self, Client, MSG_MD_REPLY, ST_BAD_REQUEST, ST_OK, Value},
+    md::{self, Client, ST_BAD_REQUEST, ST_OK, Value},
     ops::{
         self, Done, FLAG_ALL_METADATA, MSG_OP_CANCEL, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START,
         OP_COPY, OP_DELETE, OP_DELETE_TREE, OP_FSYNC, OP_MOVE, OpError, OpKind, OpRequest,
         Progress,
     },
+    proto::MSG_REPLY,
 };
 
 type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -150,7 +151,7 @@ fn start_among(
             .ok_or("no start reply in time")?;
         let m = c.recv(left)?;
         match m.kind {
-            MSG_MD_REPLY if m.seq == seq => break m,
+            MSG_REPLY if m.seq == seq => break m,
             MSG_OP_DONE | MSG_OP_PROGRESS => others.push((m.kind, m.seq, m.payload().to_vec())),
             k => {
                 return Err(
@@ -188,7 +189,7 @@ fn wait_done(c: &mut Client, seq: u64, id: u64, limit: Duration) -> R<(Done, Vec
                 assert_eq!((m.seq, d.id), (seq, id));
                 return Ok((d, progress));
             }
-            md::MSG_MD_REPLY => {} // a cancel's reply
+            MSG_REPLY => {} // a cancel's reply
             k => return Err(format!("unexpected message kind {k}").into()),
         }
     }

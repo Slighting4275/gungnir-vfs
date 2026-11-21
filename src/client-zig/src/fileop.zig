@@ -44,14 +44,16 @@ const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
 const health = @import("health.zig");
+const proto = @import("proto.zig");
+const gioerr = @import("gioerr.zig");
 const linux = std.os.linux;
 
 pub const type_name = "GungnirFileOp";
 
-pub const msg_start: u32 = 25;
-pub const msg_cancel: u32 = 26;
-pub const msg_progress: u32 = 34;
-pub const msg_done: u32 = 35;
+pub const msg_start = proto.msg_op_start;
+pub const msg_cancel = proto.msg_op_cancel;
+pub const msg_progress = proto.msg_op_progress;
+pub const msg_done = proto.msg_op_done;
 
 pub const op_copy: c_int = 1;
 pub const op_move: c_int = 2;
@@ -59,9 +61,9 @@ pub const op_delete: c_int = 3;
 pub const op_delete_tree: c_int = 4;
 pub const op_fsync: c_int = 5;
 
-pub const st_cancelled: u32 = 14;
-pub const st_os_error: u32 = 15;
-pub const st_would_recurse: u32 = 16;
+pub const st_cancelled = proto.st_cancelled;
+pub const st_os_error = proto.st_os_error;
+pub const st_would_recurse = proto.st_would_recurse;
 
 /// GFileCopyFlags the daemon understands (BACKUP excluded).
 const known_flags: c_uint = 1 | 4 | 8 | 16 | 32 | 64;
@@ -130,19 +132,10 @@ pub fn parseDone(p: []const u8) ?Done {
 
 /// The GIOErrorEnum code for a daemon status (and errno), for `op` with `flags`.
 pub fn ioErrorCode(status: u32, errno: i32, op: c_int, flags: c_uint) c_int {
-    return switch (status) {
-        st_os_error => if (op == op_move and errno == @backingInt(linux.E.XDEV) and flags & flag_no_fallback_for_move != 0)
-            c.G_IO_ERROR_NOT_SUPPORTED
-        else
-            @intCast(c.g_io_error_from_errno(errno)),
-        st_cancelled => c.G_IO_ERROR_CANCELLED,
-        md.st_timeout, md.st_suspect_mount => c.G_IO_ERROR_TIMED_OUT,
-        md.st_busy => c.G_IO_ERROR_BUSY,
-        st_would_recurse => c.G_IO_ERROR_WOULD_RECURSE,
-        md.st_unsupported => c.G_IO_ERROR_NOT_SUPPORTED,
-        md.st_bad_request => c.G_IO_ERROR_INVALID_ARGUMENT,
-        else => c.G_IO_ERROR_FAILED,
-    };
+    // g_file_move's own contract: NO_FALLBACK_FOR_MOVE across devices is NOT_SUPPORTED.
+    if (status == st_os_error and op == op_move and errno == @backingInt(linux.E.XDEV) and flags & flag_no_fallback_for_move != 0)
+        return c.G_IO_ERROR_NOT_SUPPORTED;
+    return gioerr.ofStatus(status, errno);
 }
 
 fn statusError(d: Done, op: c_int, flags: c_uint) *c.GError {

@@ -272,6 +272,8 @@ test "priority stays below local (0) and gvfs (10)" {
 }
 
 test {
+    _ = @import("proto.zig");
+    _ = @import("gioerr.zig");
     _ = ipc;
     _ = md;
     _ = link;

@@ -4,26 +4,25 @@
 //! Everything read from the socket or the shared memory is untrusted and validated.
 const std = @import("std");
 const linux = std.os.linux;
+const proto = @import("proto.zig");
 
-/// "GNGR" read as a little-endian u32.
-pub const magic: u32 = 0x5247_4E47;
+pub const magic = proto.magic;
 /// Bumped for every layout change; the daemon refuses another version with a reject
 /// frame (status_bad_version), reported as error.VersionMismatch.
-pub const version: u16 = 2;
-pub const kind_hello: u16 = 1;
-pub const kind_ack: u16 = 2;
-pub const kind_reject: u16 = 3;
-pub const frame_len = 16;
-pub const status_bad_version: u32 = 2;
+pub const version = proto.version;
+pub const kind_hello = proto.kind_hello;
+pub const kind_ack = proto.kind_ack;
+pub const kind_reject = proto.kind_reject;
+pub const frame_len = proto.frame_len;
+pub const status_bad_version = proto.status_bad_version;
 
-pub const slot_count: u32 = 32;
-pub const slot_size: usize = 4096;
-/// kind u32 | len u32 | seq u64.
-pub const slot_header: usize = 16;
-pub const payload_max: usize = slot_size - slot_header;
-pub const shm_size: usize = 4096 + 2 * slot_count * slot_size;
-pub const msg_ping: u32 = 1;
-pub const msg_pong: u32 = 2;
+pub const slot_count = proto.slot_count;
+pub const slot_size = proto.slot_size;
+pub const slot_header = proto.slot_header;
+pub const payload_max = proto.payload_max;
+pub const shm_size = proto.shm_size;
+pub const msg_ping = proto.msg_ping;
+pub const msg_pong = proto.msg_pong;
 
 pub const Ring = struct { head: usize, tail: usize, slots: usize };
 /// Client -> daemon.

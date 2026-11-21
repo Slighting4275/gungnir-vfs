@@ -1,0 +1,85 @@
+# The gungnird wire protocol (v2): the one table both sides are tested against.
+#
+# src/daemon-rust/src/proto.rs and src/client-zig/src/proto.zig each define these values;
+# `cargo test` and `./zb test` both read this file and fail on any value that differs, any
+# name one side lacks, or any name the file lacks. Change a value here, on both sides, and
+# (for a layout change) bump `version`, all in one commit.
+#
+# Format: one entry per line, `<group> <name> <value>`; values are decimal, or hex with
+# 0x. `frame` lines are whole encoded frames in hex. Blank lines and `#` comments are
+# ignored.
+
+# Handshake (AF_UNIX control socket).
+handshake magic 0x52474E47
+handshake version 2
+handshake frame_len 16
+handshake kind_hello 1
+handshake kind_ack 2
+handshake kind_reject 3
+handshake status_ok 0
+handshake status_bad_magic 1
+handshake status_bad_version 2
+handshake status_bad_kind 3
+
+# Shared memory rings.
+shm slot_count 32
+shm slot_size 4096
+shm slot_header 16
+shm payload_max 4080
+shm shm_size 266240
+
+# Slot kinds. 1-15 transport, 16-31 requests, 32-39 daemon -> client, 40-47 trash/recent.
+kind ping 1
+kind pong 2
+kind md_identify 16
+kind md_get 17
+kind md_set 18
+kind md_unset 19
+kind md_list 20
+kind md_removed 21
+kind md_moved 22
+kind health_query 23
+kind health_subscribe 24
+kind op_start 25
+kind op_cancel 26
+kind reply 32
+kind health_event 33
+kind op_progress 34
+kind op_done 35
+kind vfs_list 40
+kind vfs_delete 41
+kind vfs_restore 42
+kind trash_empty 43
+kind vfs_beat 44
+kind vfs_stat 45
+kind vfs_children 46
+kind vfs_stamp 47
+
+# Reply statuses: the first u32 of every reply (kind 32) body, and of op_done's.
+status ok 0
+status not_found 1
+status busy 2
+status timeout 3
+status suspect_mount 4
+status no_such_file 5
+status bad_request 6
+status key_too_long 7
+status value_too_large 8
+status too_many_keys 9
+status bad_utf8 10
+status io_error 11
+status db_error 12
+status unsupported 13
+status cancelled 14
+status os_error 15
+status would_recurse 16
+status mount_inside 17
+status not_empty 18
+
+# Schemes of the trash/recent kinds.
+scheme trash 0
+scheme recent 1
+
+# Encoded frames: magic | version | kind | status | shm_size, little-endian.
+frame hello 474e4752020001000000000000000000
+frame ack 474e4752020002000000000000100400

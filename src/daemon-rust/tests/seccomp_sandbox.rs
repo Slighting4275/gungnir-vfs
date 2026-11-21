@@ -857,11 +857,12 @@ mod daemon {
     };
 
     use gungnird::{
-        md::{Client, MSG_MD_REPLY, ST_OK, Value},
+        md::{Client, ST_OK, Value},
         ops::{
             self, Done, FLAG_ALL_METADATA, FLAG_NOFOLLOW_SYMLINKS, FLAG_OVERWRITE, MSG_OP_DONE,
             MSG_OP_PROGRESS, MSG_OP_START, OpKind, OpRequest,
         },
+        proto::MSG_REPLY,
     };
 
     pub type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -991,7 +992,7 @@ mod daemon {
                 .ok_or("no done event in time")?;
             let m = c.recv(left)?;
             match m.kind {
-                MSG_MD_REPLY if m.seq == seq => {
+                MSG_REPLY if m.seq == seq => {
                     let p = m.payload();
                     let st = u32::from_le_bytes(p[..4].try_into()?);
                     if st != ST_OK {

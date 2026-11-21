@@ -29,28 +29,11 @@ use std::{
 
 use crate::{Error, Result};
 
-/// `b"GNGR"` read as a little-endian u32. Starts every frame and the shared-memory header.
-pub const MAGIC: u32 = 0x5247_4E47;
-/// Bumped for every layout change; a client speaking another version gets a reject
-/// frame with [`STATUS_BAD_VERSION`] and no ring.
-pub const VERSION: u16 = 2;
-pub const KIND_HELLO: u16 = 1;
-pub const KIND_ACK: u16 = 2;
-pub const KIND_REJECT: u16 = 3;
-pub const STATUS_OK: u32 = 0;
-pub const STATUS_BAD_MAGIC: u32 = 1;
-pub const STATUS_BAD_VERSION: u32 = 2;
-pub const STATUS_BAD_KIND: u32 = 3;
-pub const FRAME_LEN: usize = 16;
-
-pub const SLOT_COUNT: u32 = 32;
-pub const SLOT_SIZE: usize = 4096;
-/// Slot header: kind u32 | len u32 | seq u64.
-pub const SLOT_HEADER: usize = 16;
-pub const PAYLOAD_MAX: usize = SLOT_SIZE - SLOT_HEADER;
-pub const SHM_SIZE: usize = 4096 + 2 * SLOT_COUNT as usize * SLOT_SIZE;
-pub const MSG_PING: u32 = 1;
-pub const MSG_PONG: u32 = 2;
+pub use crate::proto::{
+    FRAME_LEN, KIND_ACK, KIND_HELLO, KIND_REJECT, MAGIC, MSG_PING, MSG_PONG, PAYLOAD_MAX, SHM_SIZE,
+    SLOT_COUNT, SLOT_HEADER, SLOT_SIZE, STATUS_BAD_KIND, STATUS_BAD_MAGIC, STATUS_BAD_VERSION,
+    STATUS_OK, VERSION,
+};
 
 /// Byte offsets of one ring inside the shared memory. `head` is written only by the
 /// producer, `tail` only by the consumer; both are free-running u32 counters.
@@ -560,9 +543,9 @@ struct NoSession;
 impl Session for NoSession {
     fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
         port.reply(
-            crate::md::MSG_MD_REPLY,
+            crate::proto::MSG_REPLY,
             msg.seq,
-            &crate::md::reply_payload(crate::md::ST_UNSUPPORTED, &[]),
+            &crate::proto::reply_payload(crate::proto::ST_UNSUPPORTED, &[]),
         );
     }
 }

@@ -15,11 +15,12 @@ use crate::{
     fsid::{Backend, Resolver, Target},
     health::{EVENT_RESERVE, Monitor},
     ipc::{Handler, Msg, Port, Session},
-    md::{Ident, MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_NOT_FOUND, ST_OK, reply_payload},
+    md::Ident,
     ops::{
         Done, Gate, MSG_OP_CANCEL, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, MetaHooks, OpCtl,
         OpRequest, Ops, Progress, Sink, done_payload, progress_payload,
     },
+    proto::{MSG_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_NOT_FOUND, ST_OK, reply_payload},
     store::{DbHandle, DbReq, Job},
 };
 
@@ -224,8 +225,7 @@ struct OpsSession {
 
 impl OpsSession {
     fn start(&mut self, port: &Arc<Port>, msg: &Msg) {
-        let reply =
-            |st: u32, body: &[u8]| port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(st, body));
+        let reply = |st: u32, body: &[u8]| port.reply(MSG_REPLY, msg.seq, &reply_payload(st, body));
         let req = match OpRequest::parse(msg.payload()) {
             Ok(r) => r,
             Err(e) => return reply(e.status().0, &[]),
@@ -269,7 +269,7 @@ impl OpsSession {
                 }
             }
         };
-        port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(st, &[]));
+        port.reply(MSG_REPLY, msg.seq, &reply_payload(st, &[]));
     }
 }
 

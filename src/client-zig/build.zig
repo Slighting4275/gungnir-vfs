@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("c", c_mod);
     mod.linkSystemLibrary("gio-2.0", .{});
+    // The wire protocol table both sides test against (proto.zig, and the daemon's proto.rs).
+    mod.addAnonymousImport("wire.txt", .{ .root_source_file = b.path("../../protocol/wire.txt") });
 
     const lib = b.addLibrary(.{
         .name = "giogungnir", // -> libgiogungnir.so

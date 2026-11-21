@@ -25,7 +25,7 @@
 //!
 //! Protocol (protocol v2 stays: new message kinds only, an M6 daemon answers them with
 //! `ST_UNSUPPORTED`; mirrored in `src/client-zig/src/health.zig`). Every request gets one
-//! `MSG_MD_REPLY` (`status u32 | body`):
+//! `MSG_REPLY` (`status u32 | body`):
 //! - [`MSG_HEALTH_QUERY`] `by u8` then `0: path bytes` (absolute; longest mount-point
 //!   prefix, lexical, the path is never touched) or `1: mnt_id u64`. Body:
 //!   `mnt_id u64 | state u8 | probed u8 | latency_us u32 (u32::MAX: none yet) | path16`.
@@ -62,13 +62,10 @@ use std::{
 use crate::{
     fsid::{self, Backend, FileIdentity, FsidError, MountEntry, MountHint, Resolver, Target},
     ipc::{Handler, MAX_INFLIGHT, Msg, PAYLOAD_MAX, Port, Session},
-    md::{MSG_MD_REPLY, ST_BAD_REQUEST, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, reply_payload},
+    proto::{MSG_REPLY, ST_BAD_REQUEST, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, reply_payload},
 };
 
-pub const MSG_HEALTH_QUERY: u32 = 23;
-pub const MSG_HEALTH_SUBSCRIBE: u32 = 24;
-/// Daemon -> client, unsolicited, `seq` 0.
-pub const MSG_HEALTH_EVENT: u32 = 33;
+pub use crate::proto::{MSG_HEALTH_EVENT, MSG_HEALTH_QUERY, MSG_HEALTH_SUBSCRIBE};
 pub const QUERY_BY_PATH: u8 = 0;
 pub const QUERY_BY_ID: u8 = 1;
 pub const EV_FIRST: u8 = 1;
@@ -1242,20 +1239,20 @@ impl Session for HealthSession {
                     },
                     Err(st) => reply_payload(st, &[]),
                 };
-                port.reply(MSG_MD_REPLY, msg.seq, &p);
+                port.reply(MSG_REPLY, msg.seq, &p);
             }
             MSG_HEALTH_SUBSCRIBE if msg.payload().is_empty() => {
                 // The reply first: the snapshot follows it on the ring.
                 let (epoch, _) = self.monitor.snapshot();
                 port.reply(
-                    MSG_MD_REPLY,
+                    MSG_REPLY,
                     msg.seq,
                     &reply_payload(ST_OK, &epoch.to_le_bytes()),
                 );
                 self.monitor.subscribe(port);
             }
             MSG_HEALTH_SUBSCRIBE => {
-                port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
+                port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
             }
             _ => self.inner.request(port, msg),
         }

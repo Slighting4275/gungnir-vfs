@@ -19,8 +19,9 @@ use std::{
 };
 
 use gungnird::{
-    md::{Client, MSG_MD_REPLY, ST_OK},
+    md::{Client, ST_OK},
     ops::{self, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, OpKind, OpRequest},
+    proto::MSG_REPLY,
 };
 
 type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -159,7 +160,7 @@ fn start_copy(c: &mut Client, src: &Path, dst: &Path) -> R<u32> {
     let seq = c.send(MSG_OP_START, &r.encode())?;
     loop {
         let m = c.recv(Duration::from_secs(10))?;
-        if m.kind == MSG_MD_REPLY && m.seq == seq {
+        if m.kind == MSG_REPLY && m.seq == seq {
             return Ok(u32::from_le_bytes(m.payload()[..4].try_into()?));
         }
     }

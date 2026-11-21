@@ -18,10 +18,11 @@ const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
+const proto = @import("proto.zig");
 
-pub const msg_query: u32 = 23;
-pub const msg_subscribe: u32 = 24;
-pub const msg_event: u32 = md.msg_health_event;
+pub const msg_query = proto.msg_health_query;
+pub const msg_subscribe = proto.msg_health_subscribe;
+pub const msg_event = proto.msg_health_event;
 pub const query_by_path: u8 = 0;
 pub const query_by_id: u8 = 1;
 pub const ev_first: u8 = 1;

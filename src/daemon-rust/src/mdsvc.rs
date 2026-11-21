@@ -11,7 +11,8 @@ use std::{
 use crate::{
     fsid::{Backend, FsidError, Resolver, Target},
     ipc::{Handler, Msg, Port, Session},
-    md::{Ident, MSG_MD_REPLY, MdError, Request, ST_OK, put_ident, reply_payload},
+    md::{Ident, MdError, Request, put_ident},
+    proto::{MSG_REPLY, ST_OK, reply_payload},
     store::{DbHandle, DbReq, Job},
 };
 
@@ -139,8 +140,8 @@ impl<B: Backend> MdSession<B> {
 
 fn answer(port: &Port, seq: u64, r: Result<Vec<u8>, MdError>) {
     match r {
-        Ok(body) => port.reply(MSG_MD_REPLY, seq, &reply_payload(ST_OK, &body)),
-        Err(e) => port.reply(MSG_MD_REPLY, seq, &reply_payload(e.status(), &[])),
+        Ok(body) => port.reply(MSG_REPLY, seq, &reply_payload(ST_OK, &body)),
+        Err(e) => port.reply(MSG_REPLY, seq, &reply_payload(e.status(), &[])),
     }
 }
 

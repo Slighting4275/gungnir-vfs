@@ -10,33 +10,34 @@
 //! Everything read from the daemon is validated; malformed replies are error.Protocol.
 const std = @import("std");
 const ipc = @import("ipc.zig");
+const proto = @import("proto.zig");
 const Allocator = std.mem.Allocator;
 
-pub const msg_identify: u32 = 16;
-pub const msg_get: u32 = 17;
-pub const msg_set: u32 = 18;
-pub const msg_unset: u32 = 19;
-pub const msg_list: u32 = 20;
-pub const msg_removed: u32 = 21;
-pub const msg_moved: u32 = 22;
-pub const msg_reply: u32 = 32;
+pub const msg_identify = proto.msg_md_identify;
+pub const msg_get = proto.msg_md_get;
+pub const msg_set = proto.msg_md_set;
+pub const msg_unset = proto.msg_md_unset;
+pub const msg_list = proto.msg_md_list;
+pub const msg_removed = proto.msg_md_removed;
+pub const msg_moved = proto.msg_md_moved;
+pub const msg_reply = proto.msg_reply;
 /// Unsolicited daemon -> client slot (milestone 7, health.zig): never a reply.
-pub const msg_health_event: u32 = 33;
+pub const msg_health_event = proto.msg_health_event;
 
-pub const st_ok: u32 = 0;
-pub const st_not_found: u32 = 1;
-pub const st_busy: u32 = 2;
-pub const st_timeout: u32 = 3;
-pub const st_suspect_mount: u32 = 4;
-pub const st_no_such_file: u32 = 5;
-pub const st_bad_request: u32 = 6;
-pub const st_key_too_long: u32 = 7;
-pub const st_value_too_large: u32 = 8;
-pub const st_too_many_keys: u32 = 9;
-pub const st_bad_utf8: u32 = 10;
-pub const st_io_error: u32 = 11;
-pub const st_db_error: u32 = 12;
-pub const st_unsupported: u32 = 13;
+pub const st_ok = proto.st_ok;
+pub const st_not_found = proto.st_not_found;
+pub const st_busy = proto.st_busy;
+pub const st_timeout = proto.st_timeout;
+pub const st_suspect_mount = proto.st_suspect_mount;
+pub const st_no_such_file = proto.st_no_such_file;
+pub const st_bad_request = proto.st_bad_request;
+pub const st_key_too_long = proto.st_key_too_long;
+pub const st_value_too_large = proto.st_value_too_large;
+pub const st_too_many_keys = proto.st_too_many_keys;
+pub const st_bad_utf8 = proto.st_bad_utf8;
+pub const st_io_error = proto.st_io_error;
+pub const st_db_error = proto.st_db_error;
+pub const st_unsupported = proto.st_unsupported;
 
 pub const max_uuid_len = 64;
 pub const max_key_len = 256;
@@ -63,10 +64,22 @@ pub const Error = ipc.Error || Allocator.Error || error{
     DaemonIo,
     DaemonDb,
     Unsupported,
+    /// A system error; its errno is the reply body's first i32 (`proto.osErrno`).
+    DaemonOs,
+    WouldRecurse,
+    MountInside,
+    NotEmpty,
 };
 
-fn statusError(st: u32) Error {
+/// A reply status other than `st_ok` as an error: every status of the protocol, whichever
+/// service sent it, so no caller has to look at the raw status.
+pub fn statusError(st: u32) Error {
     return switch (st) {
+        proto.st_cancelled => error.Cancelled,
+        proto.st_os_error => error.DaemonOs,
+        proto.st_would_recurse => error.WouldRecurse,
+        proto.st_mount_inside => error.MountInside,
+        proto.st_not_empty => error.NotEmpty,
         st_not_found => error.NotFound,
         st_busy => error.Busy,
         st_timeout => error.Timeout,
@@ -276,8 +289,6 @@ pub const Client = struct {
     /// Gets the payload of every health event met while waiting for a reply (milestone
     /// 7); null drops them.
     on_event: ?*const fn (payload: []const u8) void = null,
-    /// The status of the last reply, for protocols with statuses beyond this module's.
-    last_status: u32 = 0,
 
     /// Send one request and wait for its reply. Returns the body (a slice of `reply`)
     /// on st_ok, else the status as an error. Replies to earlier, timed-out requests
@@ -316,7 +327,6 @@ pub const Client = struct {
                 reply.* = m;
                 var r: Reader = .{ .rest = reply.payload() };
                 const st = try r.int(u32);
-                c.last_status = st;
                 if (st != st_ok) return statusError(st);
                 return r.rest;
             }

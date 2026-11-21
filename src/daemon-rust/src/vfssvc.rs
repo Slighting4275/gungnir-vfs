@@ -38,36 +38,21 @@ use crate::{
     btrfs,
     fsid::{self, MountEntry},
     ipc::{Handler, Msg, PAYLOAD_MAX, Port, Session},
-    md::{
-        MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT,
-        ST_TIMEOUT, reply_payload,
-    },
     ops::{
         Anchor, Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink,
+    },
+    proto::{
+        MSG_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT,
+        ST_TIMEOUT, reply_payload,
     },
     recent,
     trash::{self, Item, Pins, TrashDir},
 };
 
-pub const MSG_VFS_LIST: u32 = 40;
-pub const MSG_VFS_DELETE: u32 = 41;
-pub const MSG_VFS_RESTORE: u32 = 42;
-pub const MSG_TRASH_EMPTY: u32 = 43;
-/// Sent while an op is under way (same seq, no payload): the client's silence bound
-/// covers everything else, and an op may take as long as it makes progress.
-pub const MSG_VFS_BEAT: u32 = 44;
-/// One item by name, without listing the rest.
-pub const MSG_VFS_STAT: u32 = 45;
-/// What is in a trashed folder.
-pub const MSG_VFS_CHILDREN: u32 = 46;
-/// A number that changes when a scheme's list does.
-pub const MSG_VFS_STAMP: u32 = 47;
-
-pub const SCHEME_TRASH: u8 = 0;
-pub const SCHEME_RECENT: u8 = 1;
-
-pub const ST_MOUNT_INSIDE: u32 = 17;
-pub const ST_NOT_EMPTY: u32 = 18;
+pub use crate::proto::{
+    MSG_TRASH_EMPTY, MSG_VFS_BEAT, MSG_VFS_CHILDREN, MSG_VFS_DELETE, MSG_VFS_LIST, MSG_VFS_RESTORE,
+    MSG_VFS_STAMP, MSG_VFS_STAT, SCHEME_RECENT, SCHEME_TRASH, ST_MOUNT_INSIDE, ST_NOT_EMPTY,
+};
 
 /// Request threads that may exist at once; the next request gets `busy`.
 pub const MAX_WAITERS: usize = 4;
@@ -1088,7 +1073,7 @@ impl VfsSession {
         seq: u64,
         job: impl FnOnce(&Svc, &Ctx) -> (u32, Vec<u8>) + Send + 'static,
     ) {
-        let busy = || port.reply(MSG_MD_REPLY, seq, &reply_payload(ST_BUSY, &[]));
+        let busy = || port.reply(MSG_REPLY, seq, &reply_payload(ST_BUSY, &[]));
         if self.svc.draining.load(Ordering::SeqCst) {
             return busy();
         }
@@ -1110,7 +1095,7 @@ impl VfsSession {
             .spawn(move || {
                 let (st, body) = job(&slot.0, &ctx);
                 let st = reply_status(st, slot.0.draining.load(Ordering::SeqCst));
-                p.reply(MSG_MD_REPLY, seq, &reply_payload(st, &body));
+                p.reply(MSG_REPLY, seq, &reply_payload(st, &body));
                 drop(slot);
                 ended.store(true, Ordering::SeqCst);
             });
@@ -1122,7 +1107,7 @@ impl VfsSession {
 
     fn list(&self, port: &Arc<Port>, msg: &Msg) {
         let p = msg.payload();
-        let bad = || port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
+        let bad = || port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
         let [scheme, a, b, c, d] = *p else {
             return bad();
         };
@@ -1133,7 +1118,7 @@ impl VfsSession {
         if cursor > 0 {
             let s = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
             let body = page(&s.0, cursor, s.1);
-            return port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_OK, &body));
+            return port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_OK, &body));
         }
         let snap = Arc::clone(&self.snapshot);
         self.spawn(port, msg.seq, move |svc, _| {
@@ -1164,7 +1149,7 @@ fn outcome(r: Result<(), Failure>) -> (u32, Vec<u8>) {
 
 impl Session for VfsSession {
     fn request(&mut self, port: &Arc<Port>, msg: &Msg) {
-        let bad = || port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
+        let bad = || port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_BAD_REQUEST, &[]));
         match msg.kind {
             MSG_VFS_LIST => self.list(port, msg),
             MSG_VFS_DELETE => {
@@ -1234,7 +1219,7 @@ impl Session for VfsSession {
                 if cursor > 0 {
                     let s = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
                     let body = page(&s.0, cursor, s.1);
-                    return port.reply(MSG_MD_REPLY, msg.seq, &reply_payload(ST_OK, &body));
+                    return port.reply(MSG_REPLY, msg.seq, &reply_payload(ST_OK, &body));
                 }
                 let snap = Arc::clone(&self.snapshot);
                 self.spawn(port, msg.seq, move |svc, _| match svc.children(&name) {

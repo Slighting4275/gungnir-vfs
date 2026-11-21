@@ -17,9 +17,10 @@ use gungnird::{
     Error,
     ipc::{self, Frame, MSG_PING, MSG_PONG},
     md::{
-        self, Client, ClientError, Ident, MAX_KEY_LEN, MAX_KEYS_PER_FILE, MSG_MD_GET, MSG_MD_REPLY,
-        MSG_MD_SET, MdError, Request, Value,
+        self, Client, ClientError, Ident, MAX_KEY_LEN, MAX_KEYS_PER_FILE, MSG_MD_GET, MSG_MD_SET,
+        MdError, Request, Value,
     },
+    proto::MSG_REPLY,
     store::{Store, StoreConfig},
 };
 
@@ -281,7 +282,7 @@ fn locked_database_answers_busy_and_ring_stays_live() -> R {
         let m = c.recv(Duration::from_secs(5))?;
         if m.kind == MSG_PONG && m.seq == ping_seq {
             pong_at = Some(t0.elapsed());
-        } else if m.kind == MSG_MD_REPLY && m.seq == set_seq {
+        } else if m.kind == MSG_REPLY && m.seq == set_seq {
             set_reply = Some((md::reply_result(m.payload()), t0.elapsed()));
         }
     }
@@ -335,7 +336,7 @@ fn pipelined_requests_are_all_answered() -> R {
             }
         }
         let m = c.recv(Duration::from_secs(5))?;
-        assert_eq!(m.kind, MSG_MD_REPLY);
+        assert_eq!(m.kind, MSG_REPLY);
         assert!(pending.remove(&m.seq), "unexpected seq {}", m.seq);
         md::reply_result(m.payload())?;
         answered += 1;
