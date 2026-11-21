@@ -329,7 +329,7 @@ fn recvReply(fd: linux.fd_t, deadline: u64) Error!struct { frame: Frame, memfd: 
     try pollIn(fd, deadline);
     var data: [frame_len]u8 = undefined;
     var cbuf: [cmsg_space]u8 align(8) = @splat(0);
-    var iov = [1]std.posix.iovec{.{ .base = &data, .len = data.len }};
+    var iov = [1]linux.iovec{.{ .base = &data, .len = data.len }};
     var msg: linux.msghdr = .{
         .name = null,
         .namelen = 0,
