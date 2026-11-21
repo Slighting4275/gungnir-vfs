@@ -330,34 +330,34 @@ fn metadataRoundTrip(gpa: std.mem.Allocator, tmp_dir: [*:0]const u8, sock: [*:0]
     _ = linux.close(@intCast(fd_rc));
     defer removeFile(file);
 
-    const id = try client.identify(std.mem.span(file));
+    const id = try md.identify(&client, std.mem.span(file));
     if (id.inode_num == 0 or id.fsUuid().len == 0) return "identify returned an empty identity";
-    const again = try client.identify(std.mem.span(file));
+    const again = try md.identify(&client, std.mem.span(file));
     if (!again.eql(&id)) return "identify is not stable";
 
-    if (try client.get(gpa, &id, "custom-icon")) |v| {
+    if (try md.get(&client, gpa, &id, "custom-icon")) |v| {
         v.deinit(gpa);
         return "a fresh file already has metadata";
     }
-    try client.setString(&id, "custom-icon", "file:///icons/spear.png");
-    const got = (try client.get(gpa, &id, "custom-icon")) orelse return "set then get returned nothing";
+    try md.setString(&client, &id, "custom-icon", "file:///icons/spear.png");
+    const got = (try md.get(&client, gpa, &id, "custom-icon")) orelse return "set then get returned nothing";
     defer got.deinit(gpa);
     if (got != .string or !std.mem.eql(u8, got.string, "file:///icons/spear.png")) return "get returned another value";
 
     const emblems = [_][]const u8{ "emblem-important", "", "emblem-\u{2603}" };
-    try client.setStringv(&id, "emblems", &emblems);
-    const gv = (try client.get(gpa, &id, "emblems")) orelse return "stringv set then get returned nothing";
+    try md.setStringv(&client, &id, "emblems", &emblems);
+    const gv = (try md.get(&client, gpa, &id, "emblems")) orelse return "stringv set then get returned nothing";
     defer gv.deinit(gpa);
     if (gv != .stringv or gv.stringv.len != emblems.len) return "stringv came back with another shape";
     for (gv.stringv, emblems) |a, b| if (!std.mem.eql(u8, a, b)) return "stringv came back different";
 
-    const keys = try client.listKeys(gpa, &id);
+    const keys = try md.listKeys(&client, gpa, &id);
     defer md.freeKeys(gpa, keys);
     if (keys.len != 2 or !std.mem.eql(u8, keys[0], "custom-icon") or !std.mem.eql(u8, keys[1], "emblems"))
         return "listKeys returned the wrong keys";
 
-    try client.unset(&id, "custom-icon");
-    if (try client.get(gpa, &id, "custom-icon")) |v| {
+    try md.unset(&client, &id, "custom-icon");
+    if (try md.get(&client, gpa, &id, "custom-icon")) |v| {
         v.deinit(gpa);
         return "unset key is still there";
     }
@@ -366,13 +366,13 @@ fn metadataRoundTrip(gpa: std.mem.Allocator, tmp_dir: [*:0]const u8, sock: [*:0]
     // keeps answering afterwards.
     const missing = tmpPath(tmp_dir, "no-such-file");
     defer c.g_free(missing);
-    if (client.identify(std.mem.span(missing))) |_| return "a missing file was identified" else |err| {
+    if (md.identify(&client, std.mem.span(missing))) |_| return "a missing file was identified" else |err| {
         if (err != error.NoSuchFile) return "a missing file gave the wrong error";
     }
-    if (client.setString(&id, "bad\xffkey", "v")) |_| return "a non-UTF-8 key was accepted" else |err| {
+    if (md.setString(&client, &id, "bad\xffkey", "v")) |_| return "a non-UTF-8 key was accepted" else |err| {
         if (err != error.BadUtf8) return "a non-UTF-8 key gave the wrong error";
     }
-    try client.setString(&id, "after-errors", "ok");
+    try md.setString(&client, &id, "after-errors", "ok");
     return null;
 }
 
@@ -693,15 +693,15 @@ fn checkDeleteDrops(gpa: std.mem.Allocator, ctx: *Ctx, file: ?*c.GFile, path: [*
     var conn = try ipc.connectAndPing(&sock_path, 2_000);
     defer conn.close();
     var client: md.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
-    const id = try client.identify(std.mem.span(path));
-    const before = (try client.get(gpa, &id, "note")) orelse return "metadata missing before the delete";
+    const id = try md.identify(&client, std.mem.span(path));
+    const before = (try md.get(&client, gpa, &id, "note")) orelse return "metadata missing before the delete";
     before.deinit(gpa);
     var err: [*c]c.GError = null;
     if (c.g_file_delete(file, null, &err) == 0) {
         logError("delete", err);
         return "g_file_delete failed";
     }
-    if (try client.get(gpa, &id, "note")) |v| {
+    if (try md.get(&client, gpa, &id, "note")) |v| {
         v.deinit(gpa);
         return "metadata survived g_file_delete";
     }
@@ -1774,7 +1774,7 @@ fn checkHungMount(ctx: *Ctx) ?[*:0]const u8 {
     var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
     {
         const t = nowMs();
-        if (cl.identify(std.mem.span(path))) |_| return "the daemon identified a file on a hung mount" else |e| {
+        if (md.identify(&cl, std.mem.span(path))) |_| return "the daemon identified a file on a hung mount" else |e| {
             if (e != error.SuspectMount) {
                 c.g_log(null, c.G_LOG_LEVEL_WARNING, "gungnir itest: identify: %s", @errorName(e).ptr);
                 return "identify on a hung mount gave the wrong error";

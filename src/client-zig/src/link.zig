@@ -24,13 +24,14 @@
 //! Mount health (milestone 7): after the ping the connector subscribes to health events
 //! (within subscribe_timeout_ms; an M6 daemon answers "unsupported" and the link works
 //! as before). Events ride the reply ring. A request meets them while it waits for its
-//! reply (md.Client.on_event) and `release` drains what is left; while the link is idle
+//! reply (rpc.Client.on_event) and `release` drains what is left; while the link is idle
 //! one "gungnir-health" GThread waits on the ring's head futex (bounded) and drains them
 //! under the lock. It only reads shared memory: it never touches a file path.
 const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
-const md = @import("md.zig");
+const rpc = @import("rpc.zig");
+const proto = @import("proto.zig");
 const health = @import("health.zig");
 const linux = std.os.linux;
 
@@ -84,7 +85,7 @@ var conn: ipc.Conn = undefined;
 var have_conn = false;
 var next_seq: u64 = 1 << 32;
 var last_attempt_ns: u64 = 0;
-var client: md.Client = undefined;
+var client: rpc.Client = undefined;
 // Atomics, not under `lock`: read by UI-thread callers before (or instead of) locking.
 /// UI-thread hooks fail at once (error.Busy) before this time.
 var quiet_until_ns: u64 = 0;
@@ -101,7 +102,7 @@ pub fn onUiThread() bool {
 pub fn budget(ms: u64) Budget {
     const ui = onUiThread();
     const use = if (ui) @min(ms, ui_budget_ms) else ms;
-    return .{ .deadline = md.nowNs() + use * std.time.ns_per_ms, .ui = ui };
+    return .{ .deadline = rpc.nowNs() + use * std.time.ns_per_ms, .ui = ui };
 }
 
 /// 1 while the current connection is subscribed to health events (set by the connector
@@ -131,7 +132,7 @@ fn connectorMain(data: c.gpointer) callconv(.c) c.gpointer {
     if (ipc.connectAndPing(&socket_path, connect_timeout_ms)) |connected| {
         var cn = connected;
         // Still exclusively ours: subscribe before anyone else can use the rings.
-        var sub: md.Client = .{ .conn = &cn, .seq = subscribe_seq, .timeout_ms = subscribe_timeout_ms };
+        var sub: rpc.Client = .{ .conn = &cn, .seq = subscribe_seq, .timeout_ms = subscribe_timeout_ms };
         const subscribed = if (health.subscribe(&sub)) |_| true else |err| blk: {
             if (isFatal(err)) {
                 cn.close();
@@ -155,7 +156,7 @@ fn connectorMain(data: c.gpointer) callconv(.c) c.gpointer {
 
 /// Start a connector thread; the state must already be "connecting".
 fn spawnConnector() void {
-    last_attempt_ns = md.nowNs();
+    last_attempt_ns = rpc.nowNs();
     var err: [*c]c.GError = null;
     connector_thread = c.g_thread_try_new("gungnir-connect", &connectorMain, null, &err);
     if (connector_thread == null) {
@@ -194,7 +195,7 @@ pub fn start() void {
 fn waitSettled(deadline: u64) AcquireError!void {
     while (true) {
         if (state() != state_connecting) return;
-        const now = md.nowNs();
+        const now = rpc.nowNs();
         if (now >= deadline) return error.Timeout;
         const left = deadline - now;
         const ts: linux.timespec = .{ .sec = @intCast(left / std.time.ns_per_s), .nsec = @intCast(left % std.time.ns_per_s) };
@@ -208,7 +209,7 @@ fn waitSettled(deadline: u64) AcquireError!void {
 /// worker waiting for a slow daemon: its request cannot end within our budget anyway).
 fn lockUntil(b: Budget) AcquireError!void {
     while (c.g_mutex_trylock(&lock) == 0) {
-        const now = md.nowNs();
+        const now = rpc.nowNs();
         if (now >= b.deadline) return error.Busy;
         if (b.ui) {
             const since = @atomicLoad(u64, &held_since_ns, .monotonic);
@@ -216,7 +217,7 @@ fn lockUntil(b: Budget) AcquireError!void {
         }
         c.g_usleep(100);
     }
-    @atomicStore(u64, &held_since_ns, @max(md.nowNs(), 1), .monotonic);
+    @atomicStore(u64, &held_since_ns, @max(rpc.nowNs(), 1), .monotonic);
 }
 
 fn unlock() void {
@@ -228,7 +229,7 @@ fn unlock() void {
 /// Joining the previous connector thread does not wait: it has set its final state.
 fn maybeReconnect() void {
     if (!have_path or state() != state_unavailable) return;
-    if (md.nowNs() -% last_attempt_ns < reconnect_interval_ms * std.time.ns_per_ms) return;
+    if (rpc.nowNs() -% last_attempt_ns < reconnect_interval_ms * std.time.ns_per_ms) return;
     if (connector_thread) |t| _ = c.g_thread_join(t);
     connector_thread = null;
     setState(state_connecting);
@@ -237,8 +238,8 @@ fn maybeReconnect() void {
 
 /// The shared metadata client, exclusively ours until `release`. Every request through it
 /// ends by `b.deadline`, including the waits in here.
-pub fn acquire(b: Budget) AcquireError!*md.Client {
-    if (b.ui and md.nowNs() < @atomicLoad(u64, &quiet_until_ns, .monotonic)) return error.Busy;
+pub fn acquire(b: Budget) AcquireError!*rpc.Client {
+    if (b.ui and rpc.nowNs() < @atomicLoad(u64, &quiet_until_ns, .monotonic)) return error.Busy;
     try waitSettled(b.deadline);
     try lockUntil(b);
     if (state() != state_connected) {
@@ -265,12 +266,12 @@ fn adoptLocked() bool {
 }
 
 /// Under `lock`: apply the health events waiting on the reply ring; anything else there
-/// is a late reply to a timed-out request and is dropped, as md.Client does.
+/// is a late reply to a timed-out request and is dropped, as rpc.Client does.
 fn drainLocked() void {
     var n: u32 = 0;
     while (n < ipc.slot_count) : (n += 1) {
         const m = (conn.shm.pop(ipc.ring_d2c) catch return) orelse return;
-        if (m.kind == md.msg_health_event) health.onEvent(m.payload());
+        if (m.kind == proto.msg_health_event) health.onEvent(m.payload());
     }
 }
 
@@ -287,7 +288,7 @@ fn closeLocked() void {
     have_conn = false;
     @atomicStore(u32, &health_subscribed, 0, .release);
     health.reset(); // nothing is known to be hung any more
-    last_attempt_ns = md.nowNs();
+    last_attempt_ns = rpc.nowNs();
     setState(state_unavailable);
     c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: daemon connection lost");
 }
@@ -315,7 +316,7 @@ fn eventsMain(data: c.gpointer) callconv(.c) c.gpointer {
             continue;
         }
         // Held like any caller's (see lockUntil), so a UI-thread caller can tell it is short.
-        @atomicStore(u64, &held_since_ns, @max(md.nowNs(), 1), .monotonic);
+        @atomicStore(u64, &held_since_ns, @max(rpc.nowNs(), 1), .monotonic);
         if (!adoptLocked()) {
             unlock();
             waitStateChange(st, 10);
@@ -351,10 +352,10 @@ pub fn isFatal(err: anyerror) bool {
 /// Give the client back with the error its last request ended in, if any: a fatal one
 /// (see isFatal) closes the connection, a timeout starts the UI quiet period, success
 /// ends it.
-pub fn release(cl: *md.Client, err: ?anyerror) void {
+pub fn release(cl: *rpc.Client, err: ?anyerror) void {
     next_seq = cl.seq;
     if (err) |e| {
-        if (e == error.Timeout) @atomicStore(u64, &quiet_until_ns, md.nowNs() + ui_quiet_ms * std.time.ns_per_ms, .monotonic);
+        if (e == error.Timeout) @atomicStore(u64, &quiet_until_ns, rpc.nowNs() + ui_quiet_ms * std.time.ns_per_ms, .monotonic);
     } else @atomicStore(u64, &quiet_until_ns, 0, .monotonic);
     const fatal = if (err) |e| isFatal(e) else false;
     if (fatal and have_conn) {
@@ -393,9 +394,9 @@ pub fn shutdown() void {
 
 test "state starts as connecting and an unsettled wait is bounded" {
     try std.testing.expectEqual(state_connecting, state());
-    const t0 = md.nowNs();
+    const t0 = rpc.nowNs();
     try std.testing.expectError(error.Timeout, acquire(.{ .deadline = t0 + 20 * std.time.ns_per_ms, .ui = false }));
-    try std.testing.expect(md.nowNs() - t0 < 500 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < 500 * std.time.ns_per_ms);
 }
 
 test "fatal errors are the transport ones" {
@@ -408,7 +409,7 @@ test "fatal errors are the transport ones" {
 
 test "the UI thread gets the short budget, other threads their own" {
     try std.testing.expect(!onUiThread());
-    const t0 = md.nowNs();
+    const t0 = rpc.nowNs();
     const w = budget(200);
     try std.testing.expect(!w.ui and w.deadline >= t0 + 200 * std.time.ns_per_ms);
     const ctx = c.g_main_context_default();
@@ -416,25 +417,25 @@ test "the UI thread gets the short budget, other threads their own" {
     defer c.g_main_context_release(ctx);
     try std.testing.expect(onUiThread());
     const u = budget(200);
-    try std.testing.expect(u.ui and u.deadline <= md.nowNs() + ui_budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(u.ui and u.deadline <= rpc.nowNs() + ui_budget_ms * std.time.ns_per_ms);
 }
 
 test "a UI-thread caller never waits during the quiet period or behind a long holder" {
     // Quiet period: refused before any wait (even while still connecting).
-    @atomicStore(u64, &quiet_until_ns, md.nowNs() + std.time.ns_per_s, .monotonic);
+    @atomicStore(u64, &quiet_until_ns, rpc.nowNs() + std.time.ns_per_s, .monotonic);
     defer @atomicStore(u64, &quiet_until_ns, 0, .monotonic);
-    var t0 = md.nowNs();
+    var t0 = rpc.nowNs();
     try std.testing.expectError(error.Busy, acquire(.{ .deadline = t0 + std.time.ns_per_s, .ui = true }));
-    try std.testing.expect(md.nowNs() - t0 < std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < std.time.ns_per_ms);
     // A worker has held the lock for longer than a UI call may take.
     c.g_mutex_lock(&lock);
-    @atomicStore(u64, &held_since_ns, md.nowNs() - 10 * std.time.ns_per_ms, .monotonic);
+    @atomicStore(u64, &held_since_ns, rpc.nowNs() - 10 * std.time.ns_per_ms, .monotonic);
     defer unlock();
-    t0 = md.nowNs();
+    t0 = rpc.nowNs();
     try std.testing.expectError(error.Busy, lockUntil(.{ .deadline = t0 + std.time.ns_per_s, .ui = true }));
-    try std.testing.expect(md.nowNs() - t0 < std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < std.time.ns_per_ms);
     // A worker caller still waits for its own deadline.
-    t0 = md.nowNs();
+    t0 = rpc.nowNs();
     try std.testing.expectError(error.Busy, lockUntil(.{ .deadline = t0 + 20 * std.time.ns_per_ms, .ui = false }));
-    try std.testing.expect(md.nowNs() - t0 >= 20 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 >= 20 * std.time.ns_per_ms);
 }

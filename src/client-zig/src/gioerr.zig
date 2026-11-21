@@ -1,10 +1,10 @@
 //! The one map from a failed gungnird call to a GIOErrorEnum code. Every service reports
 //! through it (metadata in gmeta.zig, file operations in fileop.zig, trash and recent in
 //! vfsfile.zig); each keeps only its own message text. A reply status reaches it as the
-//! error `md.statusError` gives, so a status means the same GIO error whoever sent it.
+//! error `rpc.statusError` gives, so a status means the same GIO error whoever sent it.
 const std = @import("std");
 const c = @import("c");
-const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const proto = @import("proto.zig");
 
 /// The GIOErrorEnum code for `err`. `errno` is the daemon's for `error.DaemonOs`
@@ -31,7 +31,7 @@ pub fn code(err: anyerror, errno: i32) c_int {
 
 /// [`code`] for a raw reply status (an op's done carries one, not a reply).
 pub fn ofStatus(status: u32, errno: i32) c_int {
-    return code(md.statusError(status), errno);
+    return code(rpc.statusError(status), errno);
 }
 
 test "every status maps to the GIO error it means" {

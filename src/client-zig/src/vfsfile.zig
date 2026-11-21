@@ -16,7 +16,7 @@ const std = @import("std");
 const health = @import("health.zig");
 const c = @import("c");
 const ipc = @import("ipc.zig");
-const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const proto = @import("proto.zig");
 const gioerr = @import("gioerr.zig");
 const build_options = @import("build_options");
@@ -137,7 +137,7 @@ fn envValue(name: [*c]const u8) ?[]const u8 {
 
 const Link = struct {
     conn: ipc.Conn,
-    client: md.Client,
+    client: rpc.Client,
 
     /// A fresh connection. `self` must not move afterwards.
     fn open(self: *Link, timeout_ms: u32, err: [*c][*c]c.GError) bool {
@@ -175,20 +175,20 @@ fn watch(link: *Link, k: [*c]c.GCancellable) void {
 
 /// A request, tried again while every request slot is taken: each query of one item is a
 /// list, so a folder view's worth of them at once is normal, and `busy` means a moment.
-fn requestRetry(link: *Link, kind: u32, payload: []const u8, reply: *ipc.Msg) md.Error![]const u8 {
+fn requestRetry(link: *Link, kind: u32, payload: []const u8, reply: *ipc.Msg) rpc.Error![]const u8 {
     const Call = struct {
         link: *Link,
         kind: u32,
         payload: []const u8,
         reply: *ipc.Msg,
-        fn run(a: @This()) md.Error![]const u8 {
+        fn run(a: @This()) rpc.Error![]const u8 {
             return a.link.client.request(a.kind, a.payload, a.reply);
         }
     };
     return whileBusy(Call{ .link = link, .kind = kind, .payload = payload, .reply = reply }, busy_retries, busy_wait_us);
 }
 
-fn whileBusy(call: anytype, retries: u32, wait_us: c.gulong) md.Error![]const u8 {
+fn whileBusy(call: anytype, retries: u32, wait_us: c.gulong) rpc.Error![]const u8 {
     var tries: u32 = 0;
     while (true) {
         return call.run() catch |e| {
@@ -202,7 +202,7 @@ fn whileBusy(call: anytype, retries: u32, wait_us: c.gulong) md.Error![]const u8
 
 /// Report `e` from a trash or recent call: the code is the shared map's (gioerr.zig), the
 /// words are this service's.
-fn failure(reply: *ipc.Msg, e: md.Error, err: [*c][*c]c.GError) void {
+fn failure(reply: *ipc.Msg, e: rpc.Error, err: [*c][*c]c.GError) void {
     const p = reply.payload();
     const errno: i32 = if (e == error.DaemonOs) proto.osErrno(if (p.len >= 4) p[4..] else p[0..0]) else 0;
     const code = gioerr.code(e, errno);
@@ -1757,8 +1757,8 @@ test "a target on a hung mount is refused in memory" {
 test "busy is waited out, within its bound, and nothing else is" {
     const Stub = struct {
         left: *u32,
-        err: md.Error,
-        fn run(a: @This()) md.Error![]const u8 {
+        err: rpc.Error,
+        fn run(a: @This()) rpc.Error![]const u8 {
             if (a.left.* == 0) return "ok";
             a.left.* -= 1;
             return a.err;

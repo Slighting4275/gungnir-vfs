@@ -76,17 +76,17 @@ fn freeEntries(gpa: Allocator, list: *std.ArrayList(Entry)) void {
 fn fetch(gpa: Allocator, cl: *md.Client, path: []const u8, wanted: ?[]const []const u8) Error!std.ArrayList(Entry) {
     var out: std.ArrayList(Entry) = .empty;
     errdefer freeEntries(gpa, &out);
-    const id = try cl.identify(path);
+    const id = try md.identify(cl, path);
     var listed: ?[][]u8 = null;
     defer if (listed) |l| md.freeKeys(gpa, l);
     const keys: []const []const u8 = if (wanted) |w| w else blk: {
-        listed = try cl.listKeys(gpa, &id);
+        listed = try md.listKeys(cl, gpa, &id);
         break :blk listed.?;
     };
     try out.ensureTotalCapacity(gpa, keys.len);
     for (keys) |k| {
         // Unset between the list and the get, or simply not set: no attribute.
-        const v = (try cl.get(gpa, &id, k)) orelse continue;
+        const v = (try md.get(cl, gpa, &id, k)) orelse continue;
         const key = gpa.dupe(u8, k) catch |err| {
             v.deinit(gpa);
             return err;
@@ -173,10 +173,10 @@ fn setOne(cl: *md.Client, id: *const md.Identity, info: *c.GFileInfo, attribute:
     var value: c.gpointer = null;
     if (c.g_file_info_get_attribute_data(info, attribute, &t, &value, null) == 0) return error.BadRequest;
     switch (t) {
-        c.G_FILE_ATTRIBUTE_TYPE_INVALID => try cl.unset(id, key),
+        c.G_FILE_ATTRIBUTE_TYPE_INVALID => try md.unset(cl, id, key),
         c.G_FILE_ATTRIBUTE_TYPE_STRING => {
             if (value == null) return error.BadRequest;
-            try cl.setString(id, key, std.mem.span(@as([*:0]const u8, @ptrCast(value))));
+            try md.setString(cl, id, key, std.mem.span(@as([*:0]const u8, @ptrCast(value))));
         },
         c.G_FILE_ATTRIBUTE_TYPE_STRINGV => {
             var items: [md.max_stringv_items][]const u8 = undefined;
@@ -188,7 +188,7 @@ fn setOne(cl: *md.Client, id: *const md.Identity, info: *c.GFileInfo, attribute:
                     items[n] = std.mem.span(@as([*:0]const u8, @ptrCast(v[n])));
                 }
             }
-            try cl.setStringv(id, key, items[0..n]);
+            try md.setStringv(cl, id, key, items[0..n]);
         },
         else => return error.WrongType,
     }
@@ -229,7 +229,7 @@ pub fn setAttributes(filename: [*c]const u8, info: ?*c.GFileInfo, cancellable: [
     // The error that matters to the link: a fatal one over a timeout over any other.
     var failure: ?anyerror = null;
     defer link.release(cl, failure);
-    const id = cl.identify(std.mem.span(filename)) catch |err| {
+    const id = md.identify(cl, std.mem.span(filename)) catch |err| {
         failure = err;
         markAll(inf, attrs, c.G_FILE_ATTRIBUTE_STATUS_ERROR_SETTING);
         setError(err_out, err, attrs[0]);
@@ -288,8 +288,8 @@ fn notify(n: Notice) void {
         return;
     };
     const r: Error!void = switch (n) {
-        .removed => |p| if (cl.removed(p)) |_| {} else |err| err,
-        .moved => |p| if (cl.moved(p[0], p[1])) |_| {} else |err| err,
+        .removed => |p| if (md.removed(cl, p)) |_| {} else |err| err,
+        .moved => |p| if (md.moved(cl, p[0], p[1])) |_| {} else |err| err,
     };
     link.release(cl, errOf(r));
     r catch |err| c.g_log(null, c.G_LOG_LEVEL_DEBUG, "gungnir: metadata not updated for a %s: %s", @tagName(n).ptr, @errorName(err).ptr);

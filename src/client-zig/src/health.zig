@@ -6,7 +6,7 @@
 //! msg_event slots on the reply ring. This file keeps the last complete snapshot and
 //! answers `stateOf(path)` from it: a lexical longest-prefix lookup with no syscall at
 //! all, least of all on the path, so gmeta.zig can fail a call on a hung mount before it
-//! asks the daemon anything. Snapshots arrive through md.Client's on_event hook (while a
+//! asks the daemon anything. Snapshots arrive through rpc.Client's on_event hook (while a
 //! request waits for its reply) and link.zig's event thread (while the link is idle).
 //!
 //! Wire format (little-endian; see health.rs): event `epoch u64 | flags u8 | count u16 |
@@ -17,7 +17,7 @@
 const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
-const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const proto = @import("proto.zig");
 
 pub const msg_query = proto.msg_health_query;
@@ -93,7 +93,7 @@ fn validMountPath(p: []const u8) bool {
     return p.len > 0 and p[0] == '/' and std.mem.findScalar(u8, p, 0) == null;
 }
 
-/// md.Client's on_event hook: apply one event slot. A malformed one drops the snapshot
+/// rpc.Client's on_event hook: apply one event slot. A malformed one drops the snapshot
 /// being assembled (the daemon's next snapshot replaces it anyway).
 pub fn onEvent(payload: []const u8) void {
     applyEvent(payload) catch {
@@ -250,7 +250,7 @@ pub const Info = struct {
     }
 };
 
-fn parseInfo(body: []const u8) md.Error!Info {
+fn parseInfo(body: []const u8) rpc.Error!Info {
     var r: Reader = .{ .rest = body };
     var info: Info = .{
         .mnt_id = r.int(u64) catch return error.Protocol,
@@ -270,7 +270,7 @@ fn parseInfo(body: []const u8) md.Error!Info {
 }
 
 /// The mount `path` is on and its health (an M6 daemon: error.Unsupported).
-pub fn queryPath(cl: *md.Client, path: []const u8) md.Error!Info {
+pub fn queryPath(cl: *rpc.Client, path: []const u8) rpc.Error!Info {
     if (path.len == 0 or path[0] != '/' or std.mem.findScalar(u8, path, 0) != null) return error.BadRequest;
     if (1 + path.len > ipc.payload_max) return error.PathTooLong;
     var p: [ipc.payload_max]u8 = undefined;
@@ -281,7 +281,7 @@ pub fn queryPath(cl: *md.Client, path: []const u8) md.Error!Info {
 }
 
 /// A mount by id (error.NotFound if the daemon never saw it).
-pub fn queryId(cl: *md.Client, mnt_id: u64) md.Error!Info {
+pub fn queryId(cl: *rpc.Client, mnt_id: u64) rpc.Error!Info {
     var p: [9]u8 = undefined;
     p[0] = query_by_id;
     std.mem.writeInt(u64, p[1..9], mnt_id, .little);
@@ -291,7 +291,7 @@ pub fn queryId(cl: *md.Client, mnt_id: u64) md.Error!Info {
 
 /// Ask for health events on this connection; returns the daemon's current epoch. The
 /// first snapshot follows the reply on the ring.
-pub fn subscribe(cl: *md.Client) md.Error!u64 {
+pub fn subscribe(cl: *rpc.Client) rpc.Error!u64 {
     var reply: ipc.Msg = undefined;
     const body = try cl.request(msg_subscribe, "", &reply);
     if (body.len != 8) return error.Protocol;
@@ -416,19 +416,19 @@ test "a client waiting for its reply hands events to on_event; queries round-tri
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     var conn: ipc.Conn = .{ .fd = fds[0], .shm = shm };
-    var cl: md.Client = .{ .conn = &conn, .timeout_ms = 200, .on_event = &onEvent };
+    var cl: rpc.Client = .{ .conn = &conn, .timeout_ms = 200, .on_event = &onEvent };
     // The daemon's answer is already there: an event, then the reply to seq + 1.
     var buf: [ipc.payload_max]u8 = undefined;
     try shm.push(ipc.ring_d2c, msg_event, 0, testEvent(&buf, 3, ev_first | ev_last, &.{.{ 7, hung, "/n" }}));
     var body: [64]u8 = undefined;
-    std.mem.writeInt(u32, body[0..4], md.st_ok, .little);
+    std.mem.writeInt(u32, body[0..4], proto.st_ok, .little);
     std.mem.writeInt(u64, body[4..12], 7, .little);
     body[12] = hung;
     body[13] = 1;
     std.mem.writeInt(u32, body[14..18], 1500, .little);
     std.mem.writeInt(u16, body[18..20], 2, .little);
     @memcpy(body[20..22], "/n");
-    try shm.push(ipc.ring_d2c, md.msg_reply, cl.seq + 1, body[0..22]);
+    try shm.push(ipc.ring_d2c, proto.msg_reply, cl.seq + 1, body[0..22]);
     const info = try queryPath(&cl, "/n/f");
     try testing.expectEqual(@as(u64, 7), info.mnt_id);
     try testing.expectEqual(hung, info.state);
@@ -442,7 +442,7 @@ test "a client waiting for its reply hands events to on_event; queries round-tri
     try testing.expectEqualSlices(u8, "\x00/n/f", req.payload());
     // A malformed reply is a protocol error; bad requests are refused before sending.
     std.mem.writeInt(u16, body[18..20], 3, .little);
-    try shm.push(ipc.ring_d2c, md.msg_reply, cl.seq + 1, body[0..22]);
+    try shm.push(ipc.ring_d2c, proto.msg_reply, cl.seq + 1, body[0..22]);
     try testing.expectError(error.Protocol, queryId(&cl, 7));
     try testing.expectError(error.BadRequest, queryPath(&cl, "rel"));
     // No answer: a bounded timeout.

@@ -42,7 +42,7 @@
 const std = @import("std");
 const c = @import("c");
 const ipc = @import("ipc.zig");
-const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const health = @import("health.zig");
 const proto = @import("proto.zig");
 const gioerr = @import("gioerr.zig");
@@ -143,11 +143,11 @@ fn statusError(d: Done, op: c_int, flags: c_uint) *c.GError {
     return switch (d.status) {
         st_os_error => c.g_error_new(c.g_io_error_quark(), code, "gungnird: %s", c.g_strerror(d.errno)),
         st_cancelled => c.g_error_new_literal(c.g_io_error_quark(), code, "Operation was cancelled"),
-        md.st_timeout => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird: the operation timed out"),
-        md.st_suspect_mount => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird: the file's mount is hung or gone (mount health monitor)"),
-        md.st_busy => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird is busy"),
+        proto.st_timeout => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird: the operation timed out"),
+        proto.st_suspect_mount => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird: the file's mount is hung or gone (mount health monitor)"),
+        proto.st_busy => c.g_error_new_literal(c.g_io_error_quark(), code, "gungnird is busy"),
         st_would_recurse => c.g_error_new_literal(c.g_io_error_quark(), code, "Can't recursively copy directory"),
-        md.st_unsupported => c.g_error_new_literal(c.g_io_error_quark(), code, "this gungnird does not support file operations"),
+        proto.st_unsupported => c.g_error_new_literal(c.g_io_error_quark(), code, "this gungnird does not support file operations"),
         else => c.g_error_new(c.g_io_error_quark(), code, "gungnird: operation failed (status %u)", d.status),
     };
 }
@@ -465,7 +465,7 @@ fn run(self: *GungnirFileOp, p: *Priv) ?*c.GError {
     conn.shm.push(ipc.ring_c2d, msg_start, start_seq, payload) catch
         return ioError(c.G_IO_ERROR_BUSY, "gungnird is busy");
 
-    const t0 = md.nowNs();
+    const t0 = rpc.nowNs();
     const ms = std.time.ns_per_ms;
     const timeout: u64 = if (p.timeout_ms != 0) p.timeout_ms else default_timeout_ms;
     const overall = t0 + (timeout + grace_ms) * ms;
@@ -478,14 +478,14 @@ fn run(self: *GungnirFileOp, p: *Priv) ?*c.GError {
     while (true) {
         if (!cancel_sent and cancelled(p)) {
             cancel_sent = true;
-            cancel_deadline = md.nowNs() + cancel_wait_ms * ms;
+            cancel_deadline = rpc.nowNs() + cancel_wait_ms * ms;
             if (op_id) |id| {
                 var idb: [8]u8 = undefined;
                 std.mem.writeInt(u64, &idb, id, .little);
                 conn.shm.push(ipc.ring_c2d, msg_cancel, start_seq + 1, &idb) catch {};
             }
         }
-        const now = md.nowNs();
+        const now = rpc.nowNs();
         if (cancel_sent and now >= cancel_deadline) return ioError(c.G_IO_ERROR_CANCELLED, "Operation was cancelled");
         if (op_id == null and now >= reply_deadline) return ioError(c.G_IO_ERROR_TIMED_OUT, "gungnird did not accept the operation in time");
         if (now >= overall) return ioError(c.G_IO_ERROR_TIMED_OUT, "gungnird: the operation timed out");
@@ -502,12 +502,12 @@ fn run(self: *GungnirFileOp, p: *Priv) ?*c.GError {
             const got = conn.shm.pop(ipc.ring_d2c) catch return ioError(c.G_IO_ERROR_FAILED, "corrupt reply ring from gungnird");
             if (got == null) break;
             msg = got.?;
-            last_event = md.nowNs();
+            last_event = rpc.nowNs();
             const body = msg.payload();
-            if (msg.kind == md.msg_reply and msg.seq == start_seq) {
+            if (msg.kind == proto.msg_reply and msg.seq == start_seq) {
                 if (body.len < 4) return ioError(c.G_IO_ERROR_FAILED, "short reply from gungnird");
                 const st = std.mem.readInt(u32, body[0..4], .little);
-                if (st != md.st_ok) return statusError(.{ .id = 0, .status = st, .errno = 0, .bytes = 0, .files = 0 }, p.operation, p.flags);
+                if (st != proto.st_ok) return statusError(.{ .id = 0, .status = st, .errno = 0, .bytes = 0, .files = 0 }, p.operation, p.flags);
                 if (body.len != 12) return ioError(c.G_IO_ERROR_FAILED, "bad reply from gungnird");
                 const id = std.mem.readInt(u64, body[4..12], .little);
                 op_id = id;
@@ -523,7 +523,7 @@ fn run(self: *GungnirFileOp, p: *Priv) ?*c.GError {
                 noteProgress(self, p, pr);
             } else if (msg.kind == msg_done and msg.seq == start_seq) {
                 const d = parseDone(body) orelse return ioError(c.G_IO_ERROR_FAILED, "bad done event from gungnird");
-                if (d.status == md.st_ok) return null;
+                if (d.status == proto.st_ok) return null;
                 return statusError(d, p.operation, p.flags);
             }
             // Anything else (the cancel's reply) is not ours to act on.
@@ -564,9 +564,9 @@ test "statuses map to GIO error codes" {
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_EXISTS), ioErrorCode(st_os_error, @backingInt(E.EXIST), op_copy, 0));
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(st_os_error, @backingInt(E.XDEV), op_move, flag_no_fallback_for_move));
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_CANCELLED), ioErrorCode(st_cancelled, 0, op_copy, 0));
-    try testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), ioErrorCode(md.st_suspect_mount, 0, op_copy, 0));
+    try testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), ioErrorCode(proto.st_suspect_mount, 0, op_copy, 0));
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_WOULD_RECURSE), ioErrorCode(st_would_recurse, 0, op_copy, 0));
-    try testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(md.st_unsupported, 0, op_copy, 0));
+    try testing.expectEqual(@as(c_int, c.G_IO_ERROR_NOT_SUPPORTED), ioErrorCode(proto.st_unsupported, 0, op_copy, 0));
     try testing.expectEqual(@as(c_int, c.G_IO_ERROR_FAILED), ioErrorCode(99, 0, op_copy, 0));
 }
 
