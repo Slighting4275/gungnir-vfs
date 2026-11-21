@@ -1,0 +1,200 @@
+# GitHub Actions for the GitHub mirror (github.com/Slighting4275/gungnir-vfs): the same
+# jobs as .gitlab-ci.yml, which stays the project's CI of record (merge requests, the
+# protected main). Each job runs one `./check` subcommand after tools/ci-setup, in the
+# same pinned archlinux image, from the same Arch Linux Archive day (./check rules keeps
+# both in step with .gitlab-ci.yml).
+#
+# Runs on every push to the mirror and by hand (Actions > CI > Run workflow), where
+# `mirrors: live` installs from the live Arch mirrors instead of the archive (for when
+# archive.archlinux.org is down; that run gets the day's packages, not the pinned ones)
+# and `perf: true` adds the 50k-event benchmark.
+
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      mirrors:
+        description: "archive: the pinned Arch Linux Archive day; live: today's mirrors"
+        type: choice
+        options: [archive, live]
+        default: archive
+      perf:
+        description: "Also run the 50k-event benchmark (./check perf)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The day pacman installs from; the same day as the image below and as
+  # .gitlab-ci.yml's arch_snapshot default.
+  ARCH_SNAPSHOT_PINNED: "2026/11/08"
+  CARGO_TERM_COLOR: "never"
+  GUNGNIR_ALLOW_MISSING: "1"
+
+# Every job: the pinned image (defined at rust-lint), as root. Docker's default seccomp profile refuses
+# io_uring_setup, and the io_uring engine tests must run in CI (D-061: ./check requires
+# io_uring whenever CI is set), so the container runs without it.
+jobs:
+  rust-lint:
+    runs-on: ubuntu-24.04
+    # archlinux:base-20261108.0.623074, pinned by digest (the tag alone can be re-pushed).
+    container: &container
+      image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+      options: --security-opt seccomp=unconfined
+    timeout-minutes: 20
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &env
+        name: Job environment
+        run: |
+          if [ "${{ inputs.mirrors }}" = live ]; then snap=; else snap=$ARCH_SNAPSHOT_PINNED; fi
+          {
+            echo "ARCH_SNAPSHOT=$snap"
+            echo "CARGO_HOME=$GITHUB_WORKSPACE/.build/cargo-home"
+            echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.build/zig-global-cache"
+          } >>"$GITHUB_ENV"
+      - &setup-rust
+        run: tools/ci-setup rust
+      - &cargo-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: cargo-release-${{ hashFiles('Cargo.lock') }}
+          path: &cargo-paths |
+            .build/cargo-home/registry/index/
+            .build/cargo-home/registry/cache/
+            .build/cargo-home/git/db/
+            .build/target/
+      - run: ./check rust-static
+
+  zig-lint:
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 20
+    steps:
+      - *checkout
+      - *env
+      - &setup-zig
+        run: |
+          tools/ci-setup zig
+          echo "$GITHUB_WORKSPACE/.build/zig-dl/zig" >>"$GITHUB_PATH"
+      - run: ./check zig-static
+
+  # Only this job saves the cargo cache; every other job only restores it.
+  rust-build:
+    needs: rust-lint
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 20
+    steps:
+      - *checkout
+      - *env
+      - *setup-rust
+      - *cargo-restore
+      # Builds the release gungnird; the shipped daemon must never carry the test hooks.
+      - run: ./check release-hooks
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: cargo-release-${{ hashFiles('Cargo.lock') }}
+          path: *cargo-paths
+
+  zig-build:
+    needs: zig-lint
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 20
+    steps:
+      - *checkout
+      - *env
+      - *setup-zig
+      - *cargo-restore
+      # Builds the module: three GIO exports only, no test hook, indexed by gio-querymodules.
+      - run: ./check zig-artifacts
+
+  # The tests run as the unprivileged `tester` (tools/ci-setup tester says why).
+  rust-test:
+    needs: rust-build
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 25
+    steps:
+      - *checkout
+      - *env
+      - *setup-rust
+      - *cargo-restore
+      - run: |
+          tools/ci-setup tester
+          runuser -u tester -- ./check test default
+
+  # The test-hooks build's tests, then the cross-user tests again as root, which drops to
+  # `nobody` for its second user: no opt-out, they must run or fail.
+  rust-test-hooks:
+    needs: rust-build
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 25
+    steps:
+      - *checkout
+      - *env
+      - *setup-rust
+      - *cargo-restore
+      - run: |
+          tools/ci-setup tester
+          runuser -u tester -- ./check test hooks
+          chown -R root:root .build
+          ./check cross-user
+
+  # The thread-pool fallback engine, forced (D-048, RC-F022).
+  rust-test-no-uring:
+    needs: rust-build
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 25
+    steps:
+      - *checkout
+      - *env
+      - *setup-rust
+      - *cargo-restore
+      - run: |
+          tools/ci-setup tester
+          runuser -u tester -- ./check test no-uring
+
+  # GitLab hands rust:build's gungnird to this job as an artifact; here it is rebuilt
+  # (incrementally, from the restored cache) before the itest checks it carries no hook.
+  zig-test:
+    needs: [zig-build, rust-build]
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 25
+    steps:
+      - *checkout
+      - *env
+      - *setup-zig
+      - *cargo-restore
+      - run: |
+          tools/ci-setup tester
+          runuser -u tester -- ./check release-hooks
+          runuser -u tester -- ./check zig-test
+
+  # The 50k-event benchmark (AGENTS.md §4): by hand only, shared runners make its timing
+  # noisy (D-055); when it runs, a missed SLO fails the run.
+  rust-perf:
+    if: github.event_name == 'workflow_dispatch' && inputs.perf
+    needs: rust-build
+    runs-on: ubuntu-24.04
+    container: *container
+    timeout-minutes: 25
+    steps:
+      - *checkout
+      - *env
+      - *setup-rust
+      - *cargo-restore
+      - run: ./check perf

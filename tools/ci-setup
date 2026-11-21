@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# CI job setup, shared by GitLab CI (.gitlab-ci.yml) and GitHub Actions
+# (.github/workflows/ci.yml): the one copy of what a job installs before its ./check
+# subcommand. Runs as root in the pinned archlinux image, from anywhere in the checkout.
+#
+#   tools/ci-setup rust     Rust toolchain (rust gcc pkgconf)
+#   tools/ci-setup zig      Rust + GLib + Zig master into .build/zig-dl/zig (signature
+#                           verified); the caller puts that directory on PATH
+#   tools/ci-setup tester   the unprivileged `tester` user the test jobs run as; the
+#                           checkout is handed to it
+#
+# Environment: ARCH_SNAPSHOT (YYYY/MM/DD: install from that day of the Arch Linux Archive;
+# empty: the image's live mirrors). Both CI files set it; ./check rules keeps their
+# pinned day and image the same.
+
+root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
+cd "$root" || exit 1
+
+ZIG_INDEX_URL="https://ziglang.org/download/index.json"
+# Zig's published minisign key (https://ziglang.org/download/).
+ZIG_PUBKEY="RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+
+# The checkout can arrive with umask 0000 (GitLab runners), so .build/tmp would be 0777.
+# The tests already create a private 0700 directory per test under .build/tmp and
+# gungnird refuses any socket dir others can write to; this is only belt and braces.
+private_tmp() {
+    umask 0022
+    mkdir -p .build/tmp
+    chmod go-w .build .build/tmp
+}
+
+pacman_install() { # pacman_install <package...>
+    sed -i 's/^#DisableDownloadTimeout/DisableDownloadTimeout/' /etc/pacman.conf
+    grep -q '^DisableDownloadTimeout' /etc/pacman.conf || sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf
+    if [ -n "$ARCH_SNAPSHOT" ]; then
+        # $repo and $arch are pacman's own placeholders, written literally.
+        # shellcheck disable=SC2016
+        printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" >/etc/pacman.d/mirrorlist
+    fi
+    grep -v '^#' /etc/pacman.d/mirrorlist | grep . || true
+    # Three attempts, then fail the job here (RC-F023), not later on a missing tool.
+    local attempt
+    for attempt in 1 2 3; do
+        if pacman -Syuu --noconfirm --needed "$@"; then
+            return 0
+        fi
+        if [ "$attempt" = 3 ]; then
+            echo "pacman install failed 3 times" >&2
+            return 1
+        fi
+        echo "pacman install attempt $attempt failed; retrying in 5s..." >&2
+        sleep 5
+        pacman -Syy --noconfirm || true
+    done
+}
+
+# Zig master from ziglang.org, accepted only if minisign verifies the tarball against
+# Zig's pinned public key (ZIG_PUBKEY), the signed trusted comment names exactly that file, the sha256 matches
+# index.json, and it is not older than build.zig.zon's minimum_zig_version (Zig itself
+# does not enforce that field). Each curl attempt is time-boxed, and one that stalls
+# (under 10 kB/s for 60 s) is aborted and retried at once instead of sitting out
+# --max-time (pacman already aborts transfers that stall, via its download timeout).
+install_zig() (
+    set -eo pipefail
+    dl=.build/zig-dl
+    mkdir -p "$dl/cache"
+    curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_INDEX_URL" -o "$dl/index.json"
+    ZIG_VERSION=$(jq -er '.master.version' "$dl/index.json")
+    ZIG_URL=$(jq -er '.master["x86_64-linux"].tarball' "$dl/index.json")
+    ZIG_SHA=$(jq -er '.master["x86_64-linux"].shasum' "$dl/index.json")
+    ZIG_TARBALL=${ZIG_URL##*/}
+    [ "$ZIG_TARBALL" = "zig-x86_64-linux-$ZIG_VERSION.tar.xz" ] ||
+        { echo "unexpected Zig tarball name: $ZIG_TARBALL (master is $ZIG_VERSION)" >&2; exit 1; }
+    # Reuse the cached download only if it is this exact tarball; it is verified anyway.
+    if [ "$(cat "$dl/cache/name" 2>/dev/null)" != "$ZIG_TARBALL" ]; then
+        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 600 "$ZIG_URL" -o "$dl/cache/zig.tar.xz"
+        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_URL.minisig" -o "$dl/cache/zig.tar.xz.minisig"
+        echo "$ZIG_TARBALL" >"$dl/cache/name"
+    fi
+    minisign -Vm "$dl/cache/zig.tar.xz" -P "$ZIG_PUBKEY" >"$dl/minisign.out" ||
+        { cat "$dl/minisign.out"; echo "Zig tarball signature verification FAILED" >&2; exit 1; }
+    cat "$dl/minisign.out"
+    # The signed trusted comment is "timestamp:<n>\tfile:<name>\thashed": require the
+    # exact file field, so a validly signed but different tarball is rejected.
+    awk -F'\t' -v want="file:$ZIG_TARBALL" '
+        /^Trusted comment: / { for (i = 1; i <= NF; i++) if ($i == want) ok = 1 }
+        END { exit !ok }' "$dl/minisign.out" ||
+        { echo "signed file name does not match $ZIG_TARBALL" >&2; exit 1; }
+    echo "$ZIG_SHA  $dl/cache/zig.tar.xz" | sha256sum -c -
+    rm -rf "$dl/zig" && mkdir -p "$dl/zig"
+    tar -xJf "$dl/cache/zig.tar.xz" -C "$dl/zig" --strip-components=1
+    [ "$("$dl/zig/zig" version)" = "$ZIG_VERSION" ] || { echo "zig version mismatch" >&2; exit 1; }
+    # Refuse a master older than the oldest nightly the project is verified on.
+    min=$(sed -n 's/^ *\.minimum_zig_version = "\(.*\)",$/\1/p' src/client-zig/build.zig.zon)
+    [ -n "$min" ] || { echo "no minimum_zig_version in build.zig.zon" >&2; exit 1; }
+    oldest=$(printf '%s\n%s\n' "$min" "$ZIG_VERSION" | sort -V | head -n1)
+    [ "$oldest" = "$min" ] || { echo "Zig master $ZIG_VERSION is older than minimum_zig_version $min" >&2; exit 1; }
+    echo "zig $ZIG_VERSION in $root/$dl/zig"
+)
+
+# The test jobs run their tests as an unprivileged user, like gungnird itself (a per-user
+# daemon): as root, the tests of what an unreadable file does cannot run (root reads
+# everything). runuser keeps the job's environment (PATH with Zig, CARGO_HOME, ...).
+tester() {
+    id tester >/dev/null 2>&1 || useradd -m -U tester || return 1
+    # A subordinate uid range, so the cross-user tests can run a second user (a SKIP line
+    # in the log where the container cannot map one).
+    grep -q '^tester:' /etc/subuid 2>/dev/null ||
+        usermod --add-subuids 200000-265535 --add-subgids 200000-265535 tester ||
+        echo "no subordinate ids for tester"
+    chown -R tester:tester "$root"
+}
+
+case "$1" in
+rust)
+    private_tmp
+    pacman_install rust gcc pkgconf || exit 1
+    rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
+    ;;
+zig)
+    # Zig jobs also need Rust: the Zig integration test builds and starts gungnird.
+    private_tmp
+    pacman_install rust gcc glib2 pkgconf binutils minisign jq curl xz tar || exit 1
+    install_zig || exit 1
+    rustc --version && pkg-config --modversion gio-2.0
+    ;;
+tester) tester ;;
+*)
+    sed -n '2,14p' "$0"
+    exit 2
+    ;;
+esac

@@ -11,7 +11,8 @@ spec:
 # GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
 # Each job runs one `./check` subcommand (the gates of AGENTS.md §4 live there, once);
 # a job adds only its environment: the tester user, the skip opt-outs, root for
-# `./check cross-user`. All output stays under .build/ (AGENTS.md §3).
+# `./check cross-user`. All output stays under .build/ (AGENTS.md §3). Its setup is
+# tools/ci-setup; .github/workflows/ci.yml runs the same jobs on the GitHub mirror.
 #
 # Reproducible base: the archlinux image is pinned by tag AND digest, and pacman installs
 # from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT, from the input
@@ -20,12 +21,10 @@ spec:
 # the digest from the registry, `docker-content-digest` of the tag's index manifest).
 # The archive down: run a pipeline by hand (Build > Pipelines > New pipeline) with the
 # input arch_snapshot empty, to use the live mirrors instead. Pipeline variables cannot
-# be set by hand in this project, so this is an input.
+# be set by hand in this project, so this is an input. The day and the image must match
+# .github/workflows/ci.yml (./check rules fails otherwise).
 #
-# Zig is the current master tarball from ziglang.org, accepted only if its minisign
-# signature verifies against Zig's pinned public key, the signed trusted comment names
-# exactly that file, the sha256 matches index.json, and it is not older than
-# build.zig.zon's minimum_zig_version (Zig itself does not enforce that field).
+# Zig is the current master tarball from ziglang.org, signature-verified (tools/ci-setup).
 
 workflow:
   rules:
@@ -48,9 +47,6 @@ variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.build/cargo-home"
   CARGO_TERM_COLOR: "never"
   ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.build/zig-global-cache"
-  ZIG_INDEX_URL: "https://ziglang.org/download/index.json"
-  # Zig's published minisign key (https://ziglang.org/download/).
-  ZIG_PUBKEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 
 default:
   # archlinux:base-20261108.0.623074, pinned by digest (the tag alone can be re-pushed).
@@ -89,36 +85,8 @@ default:
     - .build/zig-dl/cache/
   policy: pull
 
-.pacman: &pacman
-  - |
-    sed -i 's/^#DisableDownloadTimeout/DisableDownloadTimeout/' /etc/pacman.conf
-    grep -q '^DisableDownloadTimeout' /etc/pacman.conf || sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf
-    if [ -n "$ARCH_SNAPSHOT" ]; then
-      printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist
-    fi
-    cat /etc/pacman.d/mirrorlist | grep -v '^#' | grep . || true
-
-# GitLab runners check the repo out with umask 0000, so .build/tmp arrives 0777 (and it is
-# in no cache or artifact: those only hold cargo-home, target, zig-dl and the two build
-# outputs). The tests already create a private 0700 directory per test under .build/tmp
-# and gungnird refuses any socket dir others can write to; this is only belt and braces.
-.private-tmp: &private-tmp
-  - |
-    umask 0022
-    mkdir -p .build/tmp
-    chmod go-w .build .build/tmp
-
-# The test jobs run their tests as an unprivileged user, like gungnird itself (a per-user
-# daemon): as root, the tests of what an unreadable file does cannot run (root reads
-# everything). The runner's checkout (sources, caches, .build) is handed to that user.
-# runuser keeps the job's environment (PATH with Zig, CARGO_HOME, ...), only HOME changes.
-.as-tester: &as-tester
-  - |
-    id tester >/dev/null 2>&1 || useradd -m -U tester
-    # A subordinate uid range, so the cross-user tests can run a second user (a SKIP line
-    # in the log where the container cannot map one).
-    grep -q '^tester:' /etc/subuid 2>/dev/null || usermod --add-subuids 200000-265535 --add-subgids 200000-265535 tester || echo "no subordinate ids for tester"
-    chown -R tester:tester "$CI_PROJECT_DIR"
+# Each job's setup (packages from the archive, the verified Zig, the tester user) is
+# tools/ci-setup, shared with .github/workflows/ci.yml.
 
 # Every job normally finishes in under 4 minutes, so a stalled runner or a hung step
 # fails at 20 minutes instead of the project's (by default 1 hour). Test jobs: 25.
@@ -127,89 +95,17 @@ default:
   cache:
     - *cargo-cache
   before_script:
-    - *private-tmp
-    - *pacman
-    - |
-      # Three attempts, then fail the job here (RC-F023), not later on a missing tool.
-      for attempt in 1 2 3; do
-        if pacman -Syuu --noconfirm --needed rust gcc pkgconf; then
-          break
-        fi
-        if [ "$attempt" = 3 ]; then
-          echo "pacman install failed 3 times" >&2
-          exit 1
-        fi
-        echo "pacman install attempt $attempt failed; retrying in 5s..." >&2
-        sleep 5
-        pacman -Syy --noconfirm || true
-      done
-    - rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
+    - tools/ci-setup rust
 
-# Zig jobs also need Rust: the Zig integration test builds and starts gungnird.
 .zig:
   timeout: 20 minutes
   cache:
     - *cargo-cache
     - *zig-cache
   before_script:
-    - *private-tmp
-    - *pacman
-    - |
-      # Three attempts, then fail the job here (RC-F023), not later on a missing tool.
-      for attempt in 1 2 3; do
-        if pacman -Syuu --noconfirm --needed rust gcc glib2 pkgconf binutils minisign jq curl xz tar; then
-          break
-        fi
-        if [ "$attempt" = 3 ]; then
-          echo "pacman install failed 3 times" >&2
-          exit 1
-        fi
-        echo "pacman install attempt $attempt failed; retrying in 5s..." >&2
-        sleep 5
-        pacman -Syy --noconfirm || true
-      done
-    - |
-      # Install Zig master from ziglang.org; fail unless minisign verifies the tarball.
-      # Each curl attempt is time-boxed, and one that stalls (under 10 kB/s for 60 s) is
-      # aborted and retried at once instead of sitting out --max-time (pacman already
-      # aborts transfers that stall, via its default download timeout).
-      set -eo pipefail
-      dl=.build/zig-dl
-      mkdir -p "$dl/cache"
-      curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_INDEX_URL" -o "$dl/index.json"
-      ZIG_VERSION=$(jq -er '.master.version' "$dl/index.json")
-      ZIG_URL=$(jq -er '.master["x86_64-linux"].tarball' "$dl/index.json")
-      ZIG_SHA=$(jq -er '.master["x86_64-linux"].shasum' "$dl/index.json")
-      ZIG_TARBALL=${ZIG_URL##*/}
-      [ "$ZIG_TARBALL" = "zig-x86_64-linux-$ZIG_VERSION.tar.xz" ] \
-        || { echo "unexpected Zig tarball name: $ZIG_TARBALL (master is $ZIG_VERSION)" >&2; exit 1; }
-      # Reuse the cached download only if it is this exact tarball; it is verified anyway.
-      if [ "$(cat "$dl/cache/name" 2>/dev/null)" != "$ZIG_TARBALL" ]; then
-        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 600 "$ZIG_URL" -o "$dl/cache/zig.tar.xz"
-        curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 120 "$ZIG_URL.minisig" -o "$dl/cache/zig.tar.xz.minisig"
-        echo "$ZIG_TARBALL" > "$dl/cache/name"
-      fi
-      minisign -Vm "$dl/cache/zig.tar.xz" -P "$ZIG_PUBKEY" > "$dl/minisign.out" \
-        || { cat "$dl/minisign.out"; echo "Zig tarball signature verification FAILED" >&2; exit 1; }
-      cat "$dl/minisign.out"
-      # The signed trusted comment is "timestamp:<n>\tfile:<name>\thashed": require the
-      # exact file field, so a validly signed but different tarball is rejected.
-      awk -F'\t' -v want="file:$ZIG_TARBALL" '
-        /^Trusted comment: / { for (i = 1; i <= NF; i++) if ($i == want) ok = 1 }
-        END { exit !ok }' "$dl/minisign.out" \
-        || { echo "signed file name does not match $ZIG_TARBALL" >&2; exit 1; }
-      echo "$ZIG_SHA  $dl/cache/zig.tar.xz" | sha256sum -c -
-      rm -rf "$dl/zig" && mkdir -p "$dl/zig"
-      tar -xJf "$dl/cache/zig.tar.xz" -C "$dl/zig" --strip-components=1
-      export PATH="$CI_PROJECT_DIR/$dl/zig:$PATH"
-      [ "$(zig version)" = "$ZIG_VERSION" ] || { echo "zig version mismatch" >&2; exit 1; }
-      # Refuse a master older than the oldest nightly the project is verified on.
-      min=$(sed -n 's/^ *\.minimum_zig_version = "\(.*\)",$/\1/p' src/client-zig/build.zig.zon)
-      [ -n "$min" ] || { echo "no minimum_zig_version in build.zig.zon" >&2; exit 1; }
-      oldest=$(printf '%s\n%s\n' "$min" "$ZIG_VERSION" | sort -V | head -n1)
-      [ "$oldest" = "$min" ] || { echo "Zig master $ZIG_VERSION is older than minimum_zig_version $min" >&2; exit 1; }
+    - tools/ci-setup zig
+    - export PATH="$CI_PROJECT_DIR/.build/zig-dl/zig:$PATH"
     - zig version
-    - rustc --version && pkg-config --modversion gio-2.0
 
 # ---- lint -------------------------------------------------------------------
 
@@ -272,7 +168,7 @@ rust:test:
     # run, never skip: ./check requires io_uring whenever CI is set (D-061).
     GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - *as-tester
+    - tools/ci-setup tester
     # --no-fail-fast (inside ./check): one failing test binary must not hide the others.
     - runuser -u tester -- ./check test default
 
@@ -288,7 +184,7 @@ rust:test-hooks:
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - *as-tester
+    - tools/ci-setup tester
     # Prints what did not run here, one SKIP line each.
     - runuser -u tester -- ./check test hooks
     # The cross-user tests need a second user. As tester they cannot have one here (the
@@ -309,7 +205,7 @@ rust:test-no-uring:
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - *as-tester
+    - tools/ci-setup tester
     - runuser -u tester -- ./check test no-uring
 
 zig:test:
@@ -321,7 +217,7 @@ zig:test:
   variables:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
-    - *as-tester
+    - tools/ci-setup tester
     # Also checks the itest's test-hooks daemon never landed over the release artifact.
     - runuser -u tester -- ./check zig-test
 

@@ -105,6 +105,20 @@ rules() { # mechanical rules lint cannot express; each prints offending lines
         echo "$hits"
         bad=1
     fi
+    # GitLab CI and the GitHub mirror's Actions build from one pinned base: the same
+    # archlinux image (tag and digest) and the Arch Linux Archive day that image was built.
+    local gl_img gh_img gl_day gh_day
+    gl_img=$(grep -oE 'archlinux:base-[0-9.]+@sha256:[0-9a-f]{64}' .gitlab-ci.yml)
+    gh_img=$(grep -oE 'archlinux:base-[0-9.]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml)
+    gl_day=$(sed -n 's|^ *default: "\([0-9]\{4\}/[0-9]\{2\}/[0-9]\{2\}\)"$|\1|p' .gitlab-ci.yml)
+    gh_day=$(sed -n 's|^ *ARCH_SNAPSHOT_PINNED: "\(.*\)"$|\1|p' .github/workflows/ci.yml)
+    if [ -z "$gl_img" ] || [ "$gl_img" != "$gh_img" ] || [ -z "$gl_day" ] || [ "$gl_day" != "$gh_day" ] ||
+        [ "${gl_img:15:8}" != "${gl_day//\//}" ]; then
+        echo "CI base out of step (bump .gitlab-ci.yml and .github/workflows/ci.yml together):"
+        echo "  .gitlab-ci.yml:           ${gl_img:-no image} day ${gl_day:-none}"
+        echo "  .github/workflows/ci.yml: ${gh_img:-no image} day ${gh_day:-none}"
+        bad=1
+    fi
     return $bad
 }
 
