@@ -200,6 +200,20 @@ impl Msg {
     pub fn payload(&self) -> &[u8] {
         &self.buf[..self.len]
     }
+
+    /// A request as the ring thread would hand it to a session (tests drive services
+    /// in process with it). `payload` must fit a slot.
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: u32, seq: u64, payload: &[u8]) -> Self {
+        let mut buf = [0; PAYLOAD_MAX];
+        buf[..payload.len()].copy_from_slice(payload);
+        Self {
+            kind,
+            seq,
+            len: payload.len(),
+            buf,
+        }
+    }
 }
 
 /// A mapping of the shared ring memory. The peer can write anything into it, so every
@@ -450,6 +464,12 @@ impl Port {
     #[cfg(test)]
     pub(crate) fn for_test(shm: Shm) -> Self {
         Self::new(shm)
+    }
+
+    /// The next slot a service pushed to the client, if any (tests read replies here).
+    #[cfg(test)]
+    pub(crate) fn take_reply(&self) -> Option<Msg> {
+        self.shm.pop(RING_D2C).ok().flatten()
     }
 
     fn new(shm: Shm) -> Self {
