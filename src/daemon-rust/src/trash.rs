@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::ops::Anchor;
+use crate::{fsid::MountEntry, ops::Anchor};
 
 /// Longest `.trashinfo` read; anything bigger is listed degraded.
 const INFO_MAX: u64 = 64 * 1024;
@@ -1233,6 +1233,192 @@ pub fn remove_orphans(d: &TrashDir) -> usize {
     n
 }
 
+// ---------------------------------------------------------------------------------------
+// Which trash directories exist: discovery from the mount table
+
+/// Filesystems that never hold a volume trash.
+const NO_TRASH_TYPES: [&str; 13] = [
+    "proc",
+    "sysfs",
+    "devpts",
+    "cgroup",
+    "cgroup2",
+    "devtmpfs",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "nsfs",
+    "bpf",
+    "autofs",
+    "mqueue",
+];
+
+fn is_type(e: &MountEntry, names: &[&str]) -> bool {
+    names.iter().any(|n| n.as_bytes() == e.fstype.as_slice())
+}
+
+/// Mount points of a mount table that could hold a trash directory.
+fn mount_points(table: &[MountEntry]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in table.iter().filter(|e| !is_type(e, &NO_TRASH_TYPES)) {
+        let p = e.mount_point_path();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The mount `path` is on: the longest of `tops` above it, so a mount below another one
+/// counts as itself.
+fn mount_of<'a>(tops: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    tops.iter()
+        .filter(|t| path.starts_with(t))
+        .max_by_key(|t| t.components().count())
+}
+
+/// The mount points of a mount table whose topmost mount is FUSE: a FUSE mount found
+/// gone has lost its server for good (a remount is a new mount), so it can hold no trash
+/// anyone can reach again.
+fn fuse_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
+    let mut top: Vec<(PathBuf, bool)> = Vec::new();
+    for e in table {
+        let fuse = is_type(e, &["fuse", "fuseblk"]) || e.fstype.starts_with(b"fuse.");
+        let p = e.mount_point_path();
+        // A later line mounted over the same point: it is what the path reaches now.
+        top.retain(|(q, _)| *q != p);
+        top.push((p, fuse));
+    }
+    top.into_iter()
+        .filter(|(_, f)| *f)
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// The mount points of a mount table that are btrfs: opening anything else to find out
+/// would touch mounts that may hang.
+fn btrfs_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in table.iter().filter(|e| is_type(e, &["btrfs"])) {
+        let p = e.mount_point_path();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// What volume discovery works from. Everything it may not do itself comes in here: the
+/// mount table (read by the caller), and as callbacks whether a path's mount is hung or
+/// gone, whether a FUSE mount's server is gone, and the btrfs subvolume search (which
+/// runs on a thread of the caller's, with its own bounds).
+pub struct Volumes<'a> {
+    pub table: &'a [MountEntry],
+    /// The home trash, if there is one.
+    pub home: Option<&'a TrashDir>,
+    /// `$HOME`, whose subvolumes hold trash as well.
+    pub home_root: Option<&'a Path>,
+    pub uid: u32,
+    /// Volumes beyond the mount table.
+    pub extra_tops: &'a [PathBuf],
+    /// Search the table's btrfs mounts for subvolumes.
+    pub host_subvols: bool,
+    pub blocked: &'a dyn Fn(&Path) -> bool,
+    pub fuse_gone: &'a dyn Fn(&Path) -> bool,
+    /// The subvolumes below these roots, and whether that is all of them.
+    pub subvolumes: &'a dyn Fn(Vec<PathBuf>) -> (Vec<PathBuf>, bool),
+}
+
+/// The trash directories reachable now.
+#[derive(Debug, Default)]
+pub struct Dirs {
+    pub dirs: Vec<TrashDir>,
+    /// Volumes left out as hung or gone; they may hold a trash.
+    pub skipped: Vec<PathBuf>,
+    /// Every subvolume was seen.
+    pub complete: bool,
+}
+
+/// Every trash directory `v` can reach: the home trash, then each volume's (mounts, test
+/// volumes, subvolumes, other devices right below a mount or `$HOME`). A hung or gone
+/// volume is never touched, only named; a FUSE mount whose server is gone holds nothing
+/// to miss; a mounted btrfs snapshot is a backup unless the system or the user lives on
+/// it.
+#[must_use]
+pub fn discover(v: &Volumes<'_>) -> Dirs {
+    let blocked = v.blocked;
+    let mut dirs: Vec<TrashDir> = Vec::new();
+    let mut skipped = Vec::new();
+    if let Some(h) = v.home {
+        if blocked(&h.dir) {
+            skipped.push(h.dir.clone());
+        } else {
+            dirs.push(h.clone());
+        }
+    }
+    let mut tops = mount_points(v.table);
+    tops.extend(v.extra_tops.iter().cloned());
+    let mut roots = if v.host_subvols {
+        btrfs_mounts(v.table)
+    } else {
+        Vec::new()
+    };
+    roots.extend(v.extra_tops.iter().cloned());
+    // A mounted snapshot is a backup, unless the system or the user lives on it (a
+    // rollback runs from one, even with /home mounted apart): only then is its trash a
+    // real one.
+    let lived_on: Vec<PathBuf> = [
+        Some(Path::new("/")),
+        v.home_root,
+        v.home.map(|h| h.dir.as_path()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|p| mount_of(&tops, p).cloned())
+    .collect();
+    tops.retain(|t| {
+        !roots.contains(t) || blocked(t) || lived_on.contains(t) || !crate::btrfs::is_snapshot(t)
+    });
+    roots.retain(|t| tops.contains(t));
+    // A subvolume needs no mount of its own, and g_file_trash treats it as a volume.
+    // Btrfs lists its own, at any depth. Other filesystems: what shows as another device
+    // right below a root, which needs no walking of the disk.
+    let (subvols, complete) = (v.subvolumes)(roots);
+    let mut below = Vec::new();
+    for root in tops.iter().map(PathBuf::as_path).chain(v.home_root) {
+        if !blocked(root) {
+            below.extend(subvolume_tops(root, &|p| blocked(p)));
+        }
+    }
+    tops.extend(below);
+    tops.extend(subvols);
+    let fuse = fuse_mounts(v.table);
+    for top in tops {
+        // A FUSE mount whose server is gone can never be read again (a stale AppImage
+        // mount, say): no trash there to miss, so it does not make listings partial.
+        // Hung mounts, and network mounts that may come back, still do.
+        if fuse.contains(&top) && (v.fuse_gone)(&top) {
+            continue;
+        }
+        if blocked(&top) {
+            // Only a volume with a trash matters, and asking would touch it: a hung mount
+            // from the mount table is named, as it may hold one.
+            skipped.push(top);
+            continue;
+        }
+        for d in volume_dirs(&top, v.uid) {
+            if !dirs.iter().any(|x| x.dir == d.dir) {
+                dirs.push(d);
+            }
+        }
+    }
+    Dirs {
+        dirs,
+        skipped,
+        complete,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,5 +2237,103 @@ mod tests {
         let log = std::cell::RefCell::default();
         delete(&d, me(), b"a b", engine(&log)).unwrap();
         assert_eq!(fs::read(d.dir.join("directorysizes")).unwrap(), b"3 4 c\n");
+    }
+
+    fn table(t: &str) -> Vec<MountEntry> {
+        crate::fsid::parse_mountinfo(t.as_bytes())
+    }
+
+    #[test]
+    fn fuse_mounts_are_the_topmost_fuse_ones() {
+        let t = "1 0 0:1 / / rw - btrfs /dev/sda2 rw\n\
+            2 1 0:2 / /tmp/.mount_app rw - fuse.app app ro\n\
+            3 1 0:3 / /home/u/remote rw - fuse.sshfs h:/ rw\n\
+            4 1 0:4 / /mnt/x rw - fuse dead rw\n\
+            5 4 0:5 / /mnt/x rw - ext4 /dev/sdb1 rw\n\
+            6 1 0:6 / /m\\040n rw - fuseblk /dev/sdc1 rw\n";
+        assert_eq!(
+            fuse_mounts(&table(t)),
+            [
+                PathBuf::from("/tmp/.mount_app"),
+                PathBuf::from("/home/u/remote"),
+                PathBuf::from("/m n"),
+            ]
+        );
+    }
+
+    /// A mount nested in a snapshot is not the snapshot: home on it says nothing of that.
+    #[test]
+    fn home_belongs_to_the_nearest_mount() {
+        let tops: Vec<PathBuf> = ["/", "/mnt/snap", "/mnt/snap/home"]
+            .map(PathBuf::from)
+            .into();
+        let on = |p: &str| mount_of(&tops, Path::new(p)).map(|t| t.to_str().unwrap_or(""));
+        assert_eq!(on("/mnt/snap/home/u"), Some("/mnt/snap/home"));
+        assert_eq!(on("/mnt/snap/x"), Some("/mnt/snap"));
+        assert_eq!(on("/home/u"), Some("/"));
+    }
+
+    #[test]
+    fn only_btrfs_mounts_are_searched() {
+        let t = "36 1 0:32 / / rw - btrfs /dev/a rw\n\
+                 37 1 0:33 / /mnt/my\\040disk rw shared:1 - btrfs /dev/b rw\n\
+                 38 1 0:34 / /mnt/nfs rw - nfs4 s:/x rw\n";
+        assert_eq!(
+            btrfs_mounts(&table(t)),
+            vec![PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
+        );
+    }
+
+    #[test]
+    fn mountinfo_gives_candidate_volumes() {
+        let t = "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n\
+                 23 22 0:22 / /proc rw - proc proc rw\n\
+                 24 22 0:23 / /mnt/my\\040disk rw shared:1 - vfat /dev/sdb1 rw\n\
+                 garbage line\n";
+        assert_eq!(
+            mount_points(&table(t)),
+            [PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
+        );
+    }
+
+    /// Discovery from a table alone: a hung volume is named and never opened, a FUSE
+    /// mount whose server is gone is left out without making the listing partial, and the
+    /// subvolume search's verdict is the listing's.
+    #[test]
+    fn discovery_names_hung_volumes_and_drops_dead_fuse_ones() {
+        let t = T::new("discover");
+        let home = t.trash();
+        let ok = t.0.join("ok");
+        let hung = t.0.join("hung");
+        let dead = t.0.join("dead");
+        for v in [&ok, &hung, &dead] {
+            fs::create_dir_all(v.join(format!(".Trash-{}/files", me()))).unwrap();
+        }
+        let line = |n: u32, p: &Path, fs: &str| {
+            format!("{n} 1 0:{n} / {} rw - {fs} src rw\n", p.display())
+        };
+        let text = [
+            line(30, &ok, "ext4"),
+            line(31, &hung, "nfs4"),
+            line(32, &dead, "fuse.app"),
+        ]
+        .concat();
+        let found = discover(&Volumes {
+            table: &table(&text),
+            home: Some(&home),
+            home_root: None,
+            uid: me(),
+            extra_tops: &[],
+            host_subvols: false,
+            blocked: &|p| p.starts_with(&hung),
+            fuse_gone: &|p| p.starts_with(&dead),
+            subvolumes: &|_| (Vec::new(), false),
+        });
+        let tops: Vec<&Path> = found.dirs.iter().map(|d| d.top.as_path()).collect();
+        assert!(tops.contains(&ok.as_path()), "{tops:?}");
+        assert!(!tops.contains(&dead.as_path()) && !tops.contains(&hung.as_path()));
+        assert!(found.dirs.iter().any(|d| d.home), "the home trash first");
+        assert_eq!(found.skipped, [hung]);
+        assert!(!found.complete, "an unfinished subvolume search says so");
     }
 }

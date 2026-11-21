@@ -44,7 +44,7 @@ use crate::{
         ST_TIMEOUT, reply_payload,
     },
     recent,
-    trash::{self, Item, Pins, TrashDir},
+    trash::{self, Dirs, Item, Pins, TrashDir},
 };
 
 pub use crate::proto::{
@@ -159,14 +159,6 @@ impl Ctx {
     }
 }
 
-/// What the trash directories are right now.
-struct Dirs {
-    dirs: Vec<TrashDir>,
-    skipped: Vec<PathBuf>,
-    /// Every subvolume was seen.
-    complete: bool,
-}
-
 /// The subvolume search, shared with its thread: the lock is never held across it.
 #[derive(Default)]
 struct Subvols {
@@ -250,23 +242,6 @@ pub struct Svc {
     stopping: AtomicBool,
 }
 
-/// Filesystems that never hold a volume trash.
-const NO_TRASH_TYPES: [&str; 13] = [
-    "proc",
-    "sysfs",
-    "devpts",
-    "cgroup",
-    "cgroup2",
-    "devtmpfs",
-    "debugfs",
-    "tracefs",
-    "securityfs",
-    "nsfs",
-    "bpf",
-    "autofs",
-    "mqueue",
-];
-
 /// Where the service reads the mount table: procfs in the daemon, a fixture in tests.
 pub trait MountTable: Send + Sync {
     /// The table as it is now.
@@ -283,61 +258,6 @@ impl MountTable for ProcMounts {
     fn read(&self) -> std::io::Result<Vec<MountEntry>> {
         Ok(fsid::parse_mountinfo(&fs::read("/proc/self/mountinfo")?))
     }
-}
-
-fn is_type(e: &MountEntry, names: &[&str]) -> bool {
-    names.iter().any(|n| n.as_bytes() == e.fstype.as_slice())
-}
-
-/// Mount points of a mount table that could hold a trash directory.
-fn mount_points(table: &[MountEntry]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for e in table.iter().filter(|e| !is_type(e, &NO_TRASH_TYPES)) {
-        let p = e.mount_point_path();
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    out
-}
-
-/// The mount `path` is on: the longest of `tops` above it, so a mount below another one
-/// counts as itself.
-fn mount_of<'a>(tops: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
-    tops.iter()
-        .filter(|t| path.starts_with(t))
-        .max_by_key(|t| t.components().count())
-}
-
-/// The mount points of a mount table whose topmost mount is FUSE: a FUSE mount found
-/// gone has lost its server for good (a remount is a new mount), so it can hold no trash
-/// anyone can reach again.
-fn fuse_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
-    let mut top: Vec<(PathBuf, bool)> = Vec::new();
-    for e in table {
-        let fuse = is_type(e, &["fuse", "fuseblk"]) || e.fstype.starts_with(b"fuse.");
-        let p = e.mount_point_path();
-        // A later line mounted over the same point: it is what the path reaches now.
-        top.retain(|(q, _)| *q != p);
-        top.push((p, fuse));
-    }
-    top.into_iter()
-        .filter(|(_, f)| *f)
-        .map(|(p, _)| p)
-        .collect()
-}
-
-/// The mount points of a mount table that are btrfs: opening anything else to find out
-/// would touch mounts that may hang.
-fn btrfs_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for e in table.iter().filter(|e| is_type(e, &["btrfs"])) {
-        let p = e.mount_point_path();
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    out
 }
 
 /// Admission over `jobs`: at most [`MAX_WAITERS`] jobs younger than the lease, and
@@ -461,83 +381,27 @@ impl Svc {
             .map_or((Vec::new(), false), |d| (d.1.clone(), d.2))
     }
 
+    /// [`trash::discover`] over the mount table as it is now. A table that cannot be read
+    /// hides every volume: the listing then says it may not be all, never that the
+    /// volumes have no trash.
     fn dirs_as_of(&self, fresh: bool) -> Dirs {
-        let mut dirs: Vec<TrashDir> = Vec::new();
-        let mut skipped = Vec::new();
-        if let Some(h) = &self.home {
-            if self.blocked(&h.dir) {
-                skipped.push(h.dir.clone());
-            } else {
-                dirs.push(h.clone());
-            }
-        }
-        // A table that cannot be read hides every volume: the listing says it may not be
-        // all, never that the volumes have no trash.
         let (table, readable) = match self.mounts.read() {
             Ok(t) => (t, true),
             Err(_) => (Vec::new(), false),
         };
-        let mut tops = mount_points(&table);
-        tops.extend(self.extra_tops.iter().cloned());
-        let mut roots = if self.host_subvols {
-            btrfs_mounts(&table)
-        } else {
-            Vec::new()
-        };
-        roots.extend(self.extra_tops.iter().cloned());
-        // A mounted snapshot is a backup, unless the system or the user lives on it (a
-        // rollback runs from one, even with /home mounted apart): only then is its trash
-        // a real one.
-        let lived_on: Vec<PathBuf> = [
-            Some(Path::new("/")),
-            self.home_root.as_deref(),
-            self.home.as_ref().map(|h| h.dir.as_path()),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|p| mount_of(&tops, p).cloned())
-        .collect();
-        tops.retain(|t| {
-            !roots.contains(t) || self.blocked(t) || lived_on.contains(t) || !btrfs::is_snapshot(t)
+        let mut found = trash::discover(&trash::Volumes {
+            table: &table,
+            home: self.home.as_ref(),
+            home_root: self.home_root.as_deref(),
+            uid: self.uid,
+            extra_tops: &self.extra_tops,
+            host_subvols: self.host_subvols,
+            blocked: &|p| self.blocked(p),
+            fuse_gone: &|p| self.ops.gone(p.as_os_str().as_bytes()),
+            subvolumes: &|roots| self.subvolumes(roots, fresh),
         });
-        roots.retain(|t| tops.contains(t));
-        // A subvolume needs no mount of its own, and g_file_trash treats it as a volume.
-        // Btrfs lists its own, at any depth. Other filesystems: what shows as another
-        // device right below a root, which needs no walking of the disk.
-        let (subvols, complete) = self.subvolumes(roots, fresh);
-        let mut below = Vec::new();
-        for root in tops.iter().chain(&self.home_root) {
-            if !self.blocked(root) {
-                below.extend(trash::subvolume_tops(root, &|p| self.blocked(p)));
-            }
-        }
-        tops.extend(below);
-        tops.extend(subvols);
-        let fuse = fuse_mounts(&table);
-        for top in tops {
-            // A FUSE mount whose server is gone can never be read again (a stale AppImage
-            // mount, say): no trash there to miss, so it does not make listings partial.
-            // Hung mounts, and network mounts that may come back, still do.
-            if fuse.contains(&top) && self.ops.gone(top.as_os_str().as_bytes()) {
-                continue;
-            }
-            if self.blocked(&top) {
-                // Only a volume with a trash matters, and asking would touch it: a hung
-                // mount from the mount table is named, as it may hold one.
-                skipped.push(top);
-                continue;
-            }
-            for d in trash::volume_dirs(&top, self.uid) {
-                if !dirs.iter().any(|x| x.dir == d.dir) {
-                    dirs.push(d);
-                }
-            }
-        }
-        Dirs {
-            dirs,
-            skipped,
-            complete: complete && readable,
-        }
+        found.complete &= readable;
+        found
     }
 
     /// Everything in every trash, and whether that may not be all of it.
@@ -1268,48 +1132,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fuse_mounts_are_the_topmost_fuse_ones() {
-        let table = "1 0 0:1 / / rw - btrfs /dev/sda2 rw\n\
-            2 1 0:2 / /tmp/.mount_app rw - fuse.app app ro\n\
-            3 1 0:3 / /home/u/remote rw - fuse.sshfs h:/ rw\n\
-            4 1 0:4 / /mnt/x rw - fuse dead rw\n\
-            5 4 0:5 / /mnt/x rw - ext4 /dev/sdb1 rw\n\
-            6 1 0:6 / /m\\040n rw - fuseblk /dev/sdc1 rw\n";
-        let got = fuse_mounts(&fsid::parse_mountinfo(table.as_bytes()));
-        assert_eq!(
-            got,
-            [
-                PathBuf::from("/tmp/.mount_app"),
-                PathBuf::from("/home/u/remote"),
-                PathBuf::from("/m n"),
-            ]
-        );
-    }
-
-    /// A mount nested in a snapshot is not the snapshot: home on it says nothing of that.
-    #[test]
-    fn home_belongs_to_the_nearest_mount() {
-        let tops: Vec<PathBuf> = ["/", "/mnt/snap", "/mnt/snap/home"]
-            .map(PathBuf::from)
-            .into();
-        let on = |p: &str| mount_of(&tops, Path::new(p)).map(|t| t.to_str().unwrap_or(""));
-        assert_eq!(on("/mnt/snap/home/u"), Some("/mnt/snap/home"));
-        assert_eq!(on("/mnt/snap/x"), Some("/mnt/snap"));
-        assert_eq!(on("/home/u"), Some("/"));
-    }
-
-    #[test]
-    fn only_btrfs_mounts_are_searched() {
-        let table = "36 1 0:32 / / rw - btrfs /dev/a rw\n\
-                     37 1 0:33 / /mnt/my\\040disk rw shared:1 - btrfs /dev/b rw\n\
-                     38 1 0:34 / /mnt/nfs rw - nfs4 s:/x rw\n";
-        assert_eq!(
-            btrfs_mounts(&fsid::parse_mountinfo(table.as_bytes())),
-            vec![PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
-        );
-    }
-
-    #[test]
     fn a_failed_restore_says_what_failed() {
         assert_eq!(
             restore_failure(Failure::st(ST_MOUNT_INSIDE)).errno,
@@ -1466,18 +1288,6 @@ mod tests {
         assert_eq!(Failure::os(libc::EBUSY).status, ST_MOUNT_INSIDE);
         assert_eq!(Failure::os(libc::EACCES).status, ST_OS_ERROR);
         assert_eq!(Failure::os(libc::EACCES).body(), libc::EACCES.to_le_bytes());
-    }
-
-    #[test]
-    fn mountinfo_gives_candidate_volumes() {
-        let t = "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n\
-                 23 22 0:22 / /proc rw - proc proc rw\n\
-                 24 22 0:23 / /mnt/my\\040disk rw shared:1 - vfat /dev/sdb1 rw\n\
-                 garbage line\n";
-        assert_eq!(
-            mount_points(&fsid::parse_mountinfo(t.as_bytes())),
-            [PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
-        );
     }
 
     /// A fixed mount table, or a table that cannot be read.
