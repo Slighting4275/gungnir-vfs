@@ -21,6 +21,7 @@
 const std = @import("std");
 const c = @import("c");
 const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const gioerr = @import("gioerr.zig");
 const link = @import("link.zig");
 const health = @import("health.zig");
@@ -34,7 +35,7 @@ pub const query_budget_ms: u64 = 200;
 /// Whole budget of one set_attribute(s), removed or moved notification.
 pub const update_budget_ms: u64 = 300;
 
-pub const Error = md.Error || link.AcquireError || error{ WrongType, MountHung };
+pub const Error = rpc.Error || link.AcquireError || error{ WrongType, MountHung };
 
 fn errOf(r: anytype) ?anyerror {
     return if (r) |_| null else |err| err;
@@ -73,7 +74,7 @@ fn freeEntries(gpa: Allocator, list: *std.ArrayList(Entry)) void {
 }
 
 /// Fetch the wanted keys (all of them if `wanted` is null) of the file at `path`.
-fn fetch(gpa: Allocator, cl: *md.Client, path: []const u8, wanted: ?[]const []const u8) Error!std.ArrayList(Entry) {
+fn fetch(gpa: Allocator, cl: *rpc.Client, path: []const u8, wanted: ?[]const []const u8) Error!std.ArrayList(Entry) {
     var out: std.ArrayList(Entry) = .empty;
     errdefer freeEntries(gpa, &out);
     const id = try md.identify(cl, path);
@@ -167,7 +168,7 @@ fn setError(err_out: [*c][*c]c.GError, err: Error, attribute: [*c]const u8) void
 }
 
 /// Store one metadata attribute of `info`: string, stringv, or unset (type INVALID).
-fn setOne(cl: *md.Client, id: *const md.Identity, info: *c.GFileInfo, attribute: [*c]const u8) Error!void {
+fn setOne(cl: *rpc.Client, id: *const md.Identity, info: *c.GFileInfo, attribute: [*c]const u8) Error!void {
     const key = keyOf(std.mem.span(attribute)) orelse return error.BadRequest;
     var t: c.GFileAttributeType = c.G_FILE_ATTRIBUTE_TYPE_INVALID;
     var value: c.gpointer = null;
@@ -350,11 +351,11 @@ test "setting without a daemon fails fast with a GIO error, every attribute mark
     c.g_file_info_set_attribute_string(info, "metadata::a", "x");
     c.g_file_info_set_attribute(info, "metadata::b", c.G_FILE_ATTRIBUTE_TYPE_INVALID, null);
     var err: [*c]c.GError = null;
-    const t0 = md.nowNs();
+    const t0 = rpc.nowNs();
     // No GungnirVfs was created in the unit tests: the link stays "connecting", so the
     // set waits out its budget and reports a timeout.
     try std.testing.expectEqual(@as(c.gboolean, 0), setAttributes("/nonexistent", info, null, &err));
-    try std.testing.expect(md.nowNs() - t0 < (update_budget_ms + 200) * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < (update_budget_ms + 200) * std.time.ns_per_ms);
     try std.testing.expect(err != null);
     defer c.g_error_free(err);
     try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), err.*.code);
@@ -383,11 +384,11 @@ test "a mount known to be hung fails at once, without the daemon" {
     defer c.g_object_unref(info);
     c.g_file_info_set_attribute_string(info, "metadata::a", "x");
     var err: [*c]c.GError = null;
-    const t0 = md.nowNs();
+    const t0 = rpc.nowNs();
     // The link is still "connecting" in the unit tests: a set that asked it would wait
     // out its whole budget. This one does not even try.
     try std.testing.expectEqual(@as(c.gboolean, 0), setAttributes("/hung-m/f", info, null, &err));
-    try std.testing.expect(md.nowNs() - t0 < 50 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < 50 * std.time.ns_per_ms);
     try std.testing.expect(err != null);
     defer c.g_error_free(err);
     try std.testing.expectEqual(@as(c_int, c.G_IO_ERROR_TIMED_OUT), err.*.code);
@@ -398,15 +399,15 @@ test "a mount known to be hung fails at once, without the daemon" {
     defer c.g_file_attribute_matcher_unref(m);
     const q = c.g_file_info_new() orelse return error.OutOfMemory;
     defer c.g_object_unref(q);
-    const t1 = md.nowNs();
+    const t1 = rpc.nowNs();
     addInfo(std.testing.allocator, "/hung-m/f", m, q);
-    try std.testing.expect(md.nowNs() - t1 < 50 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t1 < 50 * std.time.ns_per_ms);
     try std.testing.expect(c.g_file_info_has_namespace(q, namespace) == 0);
     // Notifications are skipped (they would wait for the link otherwise).
-    const t2 = md.nowNs();
+    const t2 = rpc.nowNs();
     fileRemoved("/hung-m/f");
     fileMoved("/elsewhere", "/hung-m/g");
-    try std.testing.expect(md.nowNs() - t2 < 50 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t2 < 50 * std.time.ns_per_ms);
 }
 
 test "namespace is listed as writable and copied with the file" {
@@ -428,7 +429,7 @@ const FakeDaemon = struct {
         const ipc = @import("ipc.zig");
         const f: *FakeDaemon = @ptrCast(@alignCast(data));
         while (!@atomicLoad(bool, &f.stop, .acquire)) {
-            f.shm.waitReadable(ipc.ring_c2d, md.nowNs() + 10 * std.time.ns_per_ms) catch continue;
+            f.shm.waitReadable(ipc.ring_c2d, rpc.nowNs() + 10 * std.time.ns_per_ms) catch continue;
             while (f.shm.pop(ipc.ring_c2d) catch null) |m| {
                 var buf: [64]u8 = @splat(0);
                 var n: usize = 4; // status 0 (ok)
@@ -460,7 +461,7 @@ test "the query path is leak-free and all-or-nothing" {
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     var conn: ipc.Conn = .{ .fd = fds[0], .shm = fake.shm };
-    var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
+    var cl: rpc.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
     const t = c.g_thread_new("fake-gungnird", &FakeDaemon.main, &fake);
     defer {
         @atomicStore(bool, &fake.stop, true, .release);
@@ -485,6 +486,6 @@ test "the query path is leak-free and all-or-nothing" {
     try std.testing.expectEqualStrings("x", std.mem.span(c.g_file_info_get_attribute_string(info, "metadata::a")));
 
     // Out of time: an error, no partial result, nothing leaked.
-    cl.deadline_ns = md.nowNs();
+    cl.deadline_ns = rpc.nowNs();
     try std.testing.expectError(error.Timeout, fetch(gpa, &cl, "/f", null));
 }

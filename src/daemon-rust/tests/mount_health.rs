@@ -123,7 +123,11 @@ fn health_queries_and_events_over_the_real_socket() -> R {
         assert_ne!(mp, fake.as_os_str().as_bytes());
         assert!(c.identify(&f).is_ok());
         let log = fs::read_to_string(dir.join("log"))?;
-        assert!(log.contains("ignored"), "log: {log}");
+        // This hook's own warning: other hook variables the fixture sets say "ignored" too.
+        assert!(
+            log.contains(&format!("{FAKE_HUNG_ENV} ignored")),
+            "log: {log}"
+        );
     }
     drop(c);
     drop(d);

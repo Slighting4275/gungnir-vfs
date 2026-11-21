@@ -195,6 +195,8 @@ fn run() -> Result<()> {
         seccomp,
         no_uring: env::var_os(ops::NO_URING_ENV),
         carried_store_lock: handoff.store_lock,
+        xdg_data: env::var_os("XDG_DATA_HOME"),
+        home: env::var_os("HOME"),
         hooks,
     };
     // Every refusal or error from here on leaves no socket and, when this start created

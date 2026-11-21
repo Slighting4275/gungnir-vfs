@@ -73,6 +73,16 @@ fn engines() -> Vec<EngineKind> {
     e
 }
 
+/// `f` on each engine, each run in a fresh directory named after `tag`: the rules are the
+/// same whichever engine moves or deletes the payload, and both are checked.
+fn each_engine(tag: &str, f: impl Fn(&TestDir, EngineKind) -> R) -> R {
+    for engine in engines() {
+        let d = TestDir::new(tag)?;
+        f(&d, engine).map_err(|e| format!("{engine:?}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn call(c: &mut Local, kind: u32, payload: &[u8]) -> R<(u32, Vec<u8>)> {
     c.seq += 1;
     let seq = c.seq;
@@ -220,188 +230,197 @@ fn listing_restoring_and_deleting() -> R {
 /// Restoring never replaces what is at the destination, and the item stays.
 #[test]
 fn a_restore_onto_an_existing_file_keeps_both() -> R {
-    let d = TestDir::new("loc-noclobber")?;
-    let t = trash_dir(&d)?;
-    let there = d.join("there");
-    fs::write(&there, b"newer")?;
-    trashed(&t, "e", &there)?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    assert_ne!(restore(&mut c, b"h-e", b"")?, ST_OK);
-    assert_eq!(fs::read(&there)?, b"newer");
-    assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
-    Ok(())
+    each_engine("loc-noclobber", |d, engine| {
+        let t = trash_dir(d)?;
+        let there = d.join("there");
+        fs::write(&there, b"newer")?;
+        trashed(&t, "e", &there)?;
+        let mut c = local(d, engine, None)?;
+        assert_ne!(restore(&mut c, b"h-e", b"")?, ST_OK);
+        assert_eq!(fs::read(&there)?, b"newer");
+        assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
+        Ok(())
+    })
 }
 
 /// BC-T005-F1: with a non-empty directory at the info path nothing is touched.
 #[test]
 fn an_item_whose_info_cannot_go_keeps_its_payload() -> R {
-    let d = TestDir::new("loc-infodir")?;
-    let t = trash_dir(&d)?;
-    fs::write(t.join("files/e"), b"payload")?;
-    fs::create_dir_all(t.join("info/e.trashinfo/x"))?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    assert_ne!(delete(&mut c, SCHEME_TRASH, b"h-e")?, ST_OK);
-    assert!(t.join("files/e").exists());
-    assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
-    Ok(())
+    each_engine("loc-infodir", |d, engine| {
+        let t = trash_dir(d)?;
+        fs::write(t.join("files/e"), b"payload")?;
+        fs::create_dir_all(t.join("info/e.trashinfo/x"))?;
+        let mut c = local(d, engine, None)?;
+        assert_ne!(delete(&mut c, SCHEME_TRASH, b"h-e")?, ST_OK);
+        assert!(t.join("files/e").exists());
+        assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
+        Ok(())
+    })
 }
 
 /// F05: a symlink at Trash/files never aims a delete anywhere.
 #[test]
 fn a_symlinked_files_directory_is_never_followed() -> R {
-    let d = TestDir::new("loc-link")?;
-    let t = d.join("data/Trash");
-    fs::create_dir_all(t.join("info"))?;
-    let elsewhere = d.join("elsewhere");
-    fs::create_dir(&elsewhere)?;
-    fs::write(elsewhere.join("precious"), b"p")?;
-    std::os::unix::fs::symlink(&elsewhere, t.join("files"))?;
-    fs::write(t.join("info/precious.trashinfo"), "[Trash Info]\nPath=/p\n")?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    assert!(list(&mut c, SCHEME_TRASH)?.is_empty());
-    assert_ne!(delete(&mut c, SCHEME_TRASH, b"h-precious")?, ST_OK);
-    let (st, _) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
-    assert_ne!(st, ST_OK);
-    assert!(elsewhere.join("precious").exists());
-    Ok(())
+    each_engine("loc-link", |d, engine| {
+        let t = d.join("data/Trash");
+        fs::create_dir_all(t.join("info"))?;
+        let elsewhere = d.join("elsewhere");
+        fs::create_dir(&elsewhere)?;
+        fs::write(elsewhere.join("precious"), b"p")?;
+        std::os::unix::fs::symlink(&elsewhere, t.join("files"))?;
+        fs::write(t.join("info/precious.trashinfo"), "[Trash Info]\nPath=/p\n")?;
+        let mut c = local(d, engine, None)?;
+        assert!(list(&mut c, SCHEME_TRASH)?.is_empty());
+        assert_ne!(delete(&mut c, SCHEME_TRASH, b"h-precious")?, ST_OK);
+        let (st, _) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
+        assert_ne!(st, ST_OK);
+        assert!(elsewhere.join("precious").exists());
+        Ok(())
+    })
 }
 
 /// REV-1: a trash that cannot be used is not an empty trash.
 #[test]
 fn empty_does_not_report_success_past_an_unusable_trash() -> R {
-    let d = TestDir::new("loc-rev1")?;
-    let t = d.join("data/Trash");
-    fs::create_dir_all(t.join("info"))?;
-    let elsewhere = d.join("elsewhere");
-    fs::create_dir(&elsewhere)?;
-    fs::write(elsewhere.join("kept"), b"p")?;
-    std::os::unix::fs::symlink(&elsewhere, t.join("files"))?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    let (st, _) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
-    assert_ne!(st, ST_OK, "items remain behind a trash that was skipped");
-    assert!(elsewhere.join("kept").exists());
-    Ok(())
+    each_engine("loc-rev1", |d, engine| {
+        let t = d.join("data/Trash");
+        fs::create_dir_all(t.join("info"))?;
+        let elsewhere = d.join("elsewhere");
+        fs::create_dir(&elsewhere)?;
+        fs::write(elsewhere.join("kept"), b"p")?;
+        std::os::unix::fs::symlink(&elsewhere, t.join("files"))?;
+        let mut c = local(d, engine, None)?;
+        let (st, _) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
+        assert_ne!(st, ST_OK, "items remain behind a trash that was skipped");
+        assert!(elsewhere.join("kept").exists());
+        Ok(())
+    })
 }
 
 /// REV-2: a payload whose name leaves no room for ".trashinfo" can still be deleted.
 #[test]
 fn a_payload_with_a_maximum_length_name_can_be_deleted() -> R {
-    let d = TestDir::new("loc-rev2")?;
-    let t = trash_dir(&d)?;
-    let e = "n".repeat(250);
-    fs::write(t.join("files").join(&e), b"x")?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
-    let name = format!("h-{e}");
-    assert_eq!(delete(&mut c, SCHEME_TRASH, name.as_bytes())?, ST_OK);
-    assert!(list(&mut c, SCHEME_TRASH)?.is_empty());
-    Ok(())
+    each_engine("loc-rev2", |d, engine| {
+        let t = trash_dir(d)?;
+        let e = "n".repeat(250);
+        fs::write(t.join("files").join(&e), b"x")?;
+        let mut c = local(d, engine, None)?;
+        assert_eq!(list(&mut c, SCHEME_TRASH)?.len(), 1);
+        let name = format!("h-{e}");
+        assert_eq!(delete(&mut c, SCHEME_TRASH, name.as_bytes())?, ST_OK);
+        assert!(list(&mut c, SCHEME_TRASH)?.is_empty());
+        Ok(())
+    })
 }
 
 /// REV-3: a hostile volume's symlink cannot steer a restore off the volume.
 #[test]
 fn a_restore_cannot_follow_a_volume_symlink_off_the_volume() -> R {
-    let d = TestDir::new("loc-rev3")?;
-    trash_dir(&d)?;
-    let vol = d.join("vol");
-    let vt = volume_trash(&vol)?;
-    let victim = d.join("autostart");
-    fs::create_dir(&victim)?;
-    std::os::unix::fs::symlink(&victim, vol.join("link"))?;
-    fs::write(vt.join("files/evil"), b"payload")?;
-    fs::write(
-        vt.join("info/evil.trashinfo"),
-        "[Trash Info]\nPath=link/evil\n",
-    )?;
-    let mut c = local(&d, EngineKind::Threads, Some(&vol))?;
-    let rows = list(&mut c, SCHEME_TRASH)?;
-    assert_ne!(restore(&mut c, &rows[0].name, b"")?, ST_OK);
-    assert!(!victim.join("evil").exists(), "escaped the volume");
-    // What every real client sends: g_file_move names the item's own orig-path.
-    assert_ne!(restore(&mut c, &rows[0].name, &rows[0].orig)?, ST_OK);
-    assert!(
-        !victim.join("evil").exists(),
-        "escaped the volume by its own path"
-    );
-    // A path through the volume is checked however it came to be spelled.
-    fs::write(
-        vt.join("info/evil.trashinfo"),
-        "[Trash Info]\nPath=link//evil\n",
-    )?;
-    let rows = list(&mut c, SCHEME_TRASH)?;
-    let there = vol.join("link/evil");
-    let spelled = there.to_str().ok_or("path")?.as_bytes();
-    assert_ne!(restore(&mut c, &rows[0].name, spelled)?, ST_OK);
-    assert!(!victim.join("evil").exists(), "escaped by respelling");
-    assert!(vt.join("files/evil").exists(), "the item stays");
-    Ok(())
+    each_engine("loc-rev3", |d, engine| {
+        trash_dir(d)?;
+        let vol = d.join("vol");
+        let vt = volume_trash(&vol)?;
+        let victim = d.join("autostart");
+        fs::create_dir(&victim)?;
+        std::os::unix::fs::symlink(&victim, vol.join("link"))?;
+        fs::write(vt.join("files/evil"), b"payload")?;
+        fs::write(
+            vt.join("info/evil.trashinfo"),
+            "[Trash Info]\nPath=link/evil\n",
+        )?;
+        let mut c = local(d, engine, Some(&vol))?;
+        let rows = list(&mut c, SCHEME_TRASH)?;
+        assert_ne!(restore(&mut c, &rows[0].name, b"")?, ST_OK);
+        assert!(!victim.join("evil").exists(), "escaped the volume");
+        // What every real client sends: g_file_move names the item's own orig-path.
+        assert_ne!(restore(&mut c, &rows[0].name, &rows[0].orig)?, ST_OK);
+        assert!(
+            !victim.join("evil").exists(),
+            "escaped the volume by its own path"
+        );
+        // A path through the volume is checked however it came to be spelled.
+        fs::write(
+            vt.join("info/evil.trashinfo"),
+            "[Trash Info]\nPath=link//evil\n",
+        )?;
+        let rows = list(&mut c, SCHEME_TRASH)?;
+        let there = vol.join("link/evil");
+        let spelled = there.to_str().ok_or("path")?.as_bytes();
+        assert_ne!(restore(&mut c, &rows[0].name, spelled)?, ST_OK);
+        assert!(!victim.join("evil").exists(), "escaped by respelling");
+        assert!(vt.join("files/evil").exists(), "the item stays");
+        Ok(())
+    })
 }
 
 /// A failed item keeps everything listed; empty never reports success (SEC-F-001).
 #[test]
 fn empty_never_reports_success_with_items_left() -> R {
-    let d = TestDir::new("loc-left")?;
-    let t = trash_dir(&d)?;
-    trashed(&t, "good", &d.join("g"))?;
-    fs::write(t.join("files/stuck"), b"x")?;
-    fs::create_dir_all(t.join("info/stuck.trashinfo/x"))?;
-    fs::write(t.join("info/orphan.trashinfo"), "[Trash Info]\nPath=/o\n")?;
-    let then = std::time::SystemTime::now() - Duration::from_secs(60);
-    fs::File::options()
-        .write(true)
-        .open(t.join("info/orphan.trashinfo"))?
-        .set_modified(then)?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    let (st, body) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
-    assert_ne!(st, ST_OK, "{body:?}");
-    assert_eq!(u32::from_le_bytes(body[..4].try_into()?), 1, "deleted");
-    assert_eq!(u32::from_le_bytes(body[4..8].try_into()?), 1, "failed");
-    assert!(t.join("files/stuck").exists() && !t.join("files/good").exists());
-    assert!(!t.join("info/orphan.trashinfo").exists(), "orphan removed");
-    Ok(())
+    each_engine("loc-left", |d, engine| {
+        let t = trash_dir(d)?;
+        trashed(&t, "good", &d.join("g"))?;
+        fs::write(t.join("files/stuck"), b"x")?;
+        fs::create_dir_all(t.join("info/stuck.trashinfo/x"))?;
+        fs::write(t.join("info/orphan.trashinfo"), "[Trash Info]\nPath=/o\n")?;
+        let then = std::time::SystemTime::now() - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(t.join("info/orphan.trashinfo"))?
+            .set_modified(then)?;
+        let mut c = local(d, engine, None)?;
+        let (st, body) = call(&mut c, MSG_TRASH_EMPTY, &[])?;
+        assert_ne!(st, ST_OK, "{body:?}");
+        assert_eq!(u32::from_le_bytes(body[..4].try_into()?), 1, "deleted");
+        assert_eq!(u32::from_le_bytes(body[4..8].try_into()?), 1, "failed");
+        assert!(t.join("files/stuck").exists() && !t.join("files/good").exists());
+        assert!(!t.join("info/orphan.trashinfo").exists(), "orphan removed");
+        Ok(())
+    })
 }
 
 /// A volume trash: the entry's name carries the volume, and paths are relative to it.
 #[test]
 fn a_volume_trash_is_listed_and_restored_relative_to_its_top() -> R {
-    let d = TestDir::new("loc-vol")?;
-    trash_dir(&d)?;
-    let vol = d.join("vol");
-    let vt = volume_trash(&vol)?;
-    fs::write(vt.join("files/v"), b"payload")?;
-    fs::write(vt.join("info/v.trashinfo"), "[Trash Info]\nPath=sub/v\n")?;
-    fs::create_dir(vol.join("sub"))?;
-    let mut c = local(&d, EngineKind::Threads, Some(&vol))?;
-    let rows = list(&mut c, SCHEME_TRASH)?;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].orig, vol.join("sub/v").as_os_str().as_bytes());
-    assert_eq!(restore(&mut c, &rows[0].name, b"")?, ST_OK);
-    assert_eq!(fs::read(vol.join("sub/v"))?, b"payload");
-    Ok(())
+    each_engine("loc-vol", |d, engine| {
+        trash_dir(d)?;
+        let vol = d.join("vol");
+        let vt = volume_trash(&vol)?;
+        fs::write(vt.join("files/v"), b"payload")?;
+        fs::write(vt.join("info/v.trashinfo"), "[Trash Info]\nPath=sub/v\n")?;
+        fs::create_dir(vol.join("sub"))?;
+        let mut c = local(d, engine, Some(&vol))?;
+        let rows = list(&mut c, SCHEME_TRASH)?;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].orig, vol.join("sub/v").as_os_str().as_bytes());
+        assert_eq!(restore(&mut c, &rows[0].name, b"")?, ST_OK);
+        assert_eq!(fs::read(vol.join("sub/v"))?, b"payload");
+        Ok(())
+    })
 }
 
 #[test]
 fn recent_lists_and_forgets_without_touching_the_file() -> R {
-    let d = TestDir::new("loc-recent")?;
-    fs::create_dir_all(d.join("data"))?;
-    let f = d.join("doc.txt");
-    fs::write(&f, b"keep me")?;
-    let xbel = format!(
-        "<?xml version=\"1.0\"?>\n<xbel version=\"1.0\">\n\
+    each_engine("loc-recent", |d, engine| {
+        fs::create_dir_all(d.join("data"))?;
+        let f = d.join("doc.txt");
+        fs::write(&f, b"keep me")?;
+        let xbel = format!(
+            "<?xml version=\"1.0\"?>\n<xbel version=\"1.0\">\n\
          <bookmark href=\"file://{}\" added=\"x\"/>\n\
          <bookmark href=\"https://example.invalid/\" added=\"x\"/>\n</xbel>\n",
-        f.display()
-    );
-    fs::write(d.join("data/recently-used.xbel"), &xbel)?;
-    let mut c = local(&d, EngineKind::Threads, None)?;
-    let rows = list(&mut c, SCHEME_RECENT)?;
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].kind, 1);
-    assert_eq!(delete(&mut c, SCHEME_RECENT, &rows[0].name)?, ST_OK);
-    assert_eq!(list(&mut c, SCHEME_RECENT)?.len(), 1);
-    assert_eq!(fs::read(&f)?, b"keep me");
-    assert_eq!(delete(&mut c, SCHEME_RECENT, b"zz")?, ST_BAD_REQUEST);
-    Ok(())
+            f.display()
+        );
+        fs::write(d.join("data/recently-used.xbel"), &xbel)?;
+        let mut c = local(d, engine, None)?;
+        let rows = list(&mut c, SCHEME_RECENT)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, 1);
+        assert_eq!(delete(&mut c, SCHEME_RECENT, &rows[0].name)?, ST_OK);
+        assert_eq!(list(&mut c, SCHEME_RECENT)?.len(), 1);
+        assert_eq!(fs::read(&f)?, b"keep me");
+        assert_eq!(delete(&mut c, SCHEME_RECENT, b"zz")?, ST_BAD_REQUEST);
+        Ok(())
+    })
 }
 
 /// SEC H-007: a restore destination with `.` or `..` components (or an empty one) is

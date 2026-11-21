@@ -1,10 +1,8 @@
-//! Metadata client API (protocol v2, milestones 5 and 6). Mirrors src/daemon-rust/src/md.rs;
-//! keep both in sync. Requests travel in ring slots; every call waits for its reply on
-//! the daemon->client ring with a deadline, never longer, and notices a stopped daemon
-//! (closed control socket) within `liveness_slice_ms`. The GIO metadata::* wiring on top
-//! of it is gmeta.zig.
+//! The metadata requests (protocol v2, milestones 5 and 6): their payloads, limits and
+//! validation, each one request over an `rpc.Client` (deadlines, liveness and the reply
+//! envelope are rpc.zig's). Mirrors src/daemon-rust/src/md.rs; keep both in sync. The GIO
+//! metadata::* wiring on top of it is gmeta.zig.
 //!
-//! A Client is not thread-safe: one request at a time per connection.
 //! error.NoSuchFile from set or unset (and nothing from get) can also mean the identity is
 //! outdated (its file was replaced on the same inode): identify the path again.
 //! Everything read from the daemon is validated; malformed replies are error.Protocol.
@@ -50,13 +48,10 @@ pub const max_keys_per_file = 128;
 const value_string: u8 = 1;
 const value_stringv: u8 = 2;
 
-// The client, its errors and the reply envelope are every service's (rpc.zig); metadata
-// is one service over it.
-pub const Client = rpc.Client;
-pub const Error = rpc.Error;
-pub const statusError = rpc.statusError;
-pub const nowNs = rpc.nowNs;
-pub const liveness_slice_ms = rpc.liveness_slice_ms;
+// The client and its errors are every service's (rpc.zig); metadata is one service over
+// it. Short names for this file only: other modules name rpc themselves.
+const Client = rpc.Client;
+const Error = rpc.Error;
 
 /// A file's metadata key, as the daemon identified it (fs_uuid, subvol, inode,
 /// generation) plus its btime for the daemon's staleness check.
@@ -407,8 +402,8 @@ test "client-side limits" {
     try std.testing.expectError(error.KeyTooLong, validKey(&long));
     try validKey(long[0..max_key_len]);
     try std.testing.expectEqual(st_unsupported, @as(u32, 13));
-    try std.testing.expectEqual(error.Busy, statusError(st_busy));
-    try std.testing.expectEqual(error.Protocol, statusError(1000));
+    try std.testing.expectEqual(error.Busy, rpc.statusError(st_busy));
+    try std.testing.expectEqual(error.Protocol, rpc.statusError(1000));
 }
 
 test "moved and removed requests" {
@@ -443,9 +438,9 @@ test "moved and removed requests" {
     client.timeout_ms = 10_000;
     _ = linux.close(fds[1]);
     fds[1] = -1;
-    const t0 = nowNs();
+    const t0 = rpc.nowNs();
     try std.testing.expectError(error.DaemonAbsent, removed(&client, "/x"));
-    try std.testing.expect(nowNs() - t0 < 100 * std.time.ns_per_ms);
+    try std.testing.expect(rpc.nowNs() - t0 < 100 * std.time.ns_per_ms);
 }
 
 test "a maximal set request fits one slot" {

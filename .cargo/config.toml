@@ -5,3 +5,8 @@ target-dir = ".build/target"
 
 [env]
 TMPDIR = { value = ".build/tmp", relative = true }
+# Every gungnird a test starts, however it starts it, keeps to the test's own trash
+# volumes: the host's btrfs subvolumes stay out (hooks::NO_HOST_SUBVOLS_ENV, honoured by
+# test-hooks builds; a release build notes it and ignores it). Also applies to a daemon
+# started with `cargo run`.
+GUNGNIR_TEST_NO_HOST_SUBVOLS = "1"

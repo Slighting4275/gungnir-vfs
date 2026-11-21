@@ -9,7 +9,6 @@
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::Path,
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -98,24 +97,7 @@ fn serves(d: &Dir, env: &[(&str, &str)]) -> R<String> {
     })
 }
 
-/// Every path under `dir`, relative, sorted.
-fn tree(dir: &Path) -> Vec<String> {
-    fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
-        if let Ok(rd) = fs::read_dir(d) {
-            for e in rd.flatten() {
-                let p = e.path();
-                out.push(p.strip_prefix(base).unwrap().display().to_string());
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    walk(base, &p, out);
-                }
-            }
-        }
-    }
-    let mut v = Vec::new();
-    walk(dir, dir, &mut v);
-    v.sort();
-    v
-}
+use gungnird::testenv::tree;
 
 const TSYNC: (&str, &str) = ("GUNGNIR_TEST_TSYNC_FAIL", "1");
 

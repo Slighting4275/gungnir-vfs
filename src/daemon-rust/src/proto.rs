@@ -91,10 +91,10 @@ pub const SCHEME_TRASH: u8 = 0;
 pub const SCHEME_RECENT: u8 = 1;
 
 // What a listed trash or recent item is (the `kind u8` of a list entry).
-pub const KIND_FILE: u8 = 1;
-pub const KIND_DIR: u8 = 2;
-pub const KIND_SYMLINK: u8 = 3;
-pub const KIND_SPECIAL: u8 = 4;
+pub const ITEM_FILE: u8 = 1;
+pub const ITEM_DIR: u8 = 2;
+pub const ITEM_SYMLINK: u8 = 3;
+pub const ITEM_SPECIAL: u8 = 4;
 
 /// Reply payload: `status u32 | body`.
 #[must_use]
@@ -181,10 +181,10 @@ mod tests {
             ("status", "not_empty", ST_NOT_EMPTY.into()),
             ("scheme", "trash", SCHEME_TRASH.into()),
             ("scheme", "recent", SCHEME_RECENT.into()),
-            ("item", "file", KIND_FILE.into()),
-            ("item", "dir", KIND_DIR.into()),
-            ("item", "symlink", KIND_SYMLINK.into()),
-            ("item", "special", KIND_SPECIAL.into()),
+            ("item", "file", ITEM_FILE.into()),
+            ("item", "dir", ITEM_DIR.into()),
+            ("item", "symlink", ITEM_SYMLINK.into()),
+            ("item", "special", ITEM_SPECIAL.into()),
         ]
     }
 

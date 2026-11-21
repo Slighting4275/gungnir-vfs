@@ -83,7 +83,7 @@ Autonomous agents must strictly adhere to this two-language architecture:
 - `main` is protected on GitLab: land a branch through a merge request (auto-merge "when checks pass" once its pipeline runs), never a direct push.
 
 ## 4. CONCRETE VERIFICATION TARGETS & SLOs
-Before declaring any task complete, run `./check`, one line per gate. It is the only copy of the gates: each CI job calls one of its subcommands (`./check --help` lists them), so it runs everything a push pipeline runs except the root-only rerun of the cross-user tests (and the scheduled `./check perf`). `./check --fast` runs the static gates in seconds (also the pre-commit hook: `./check --install-hook`); `./check --snapshot` runs on a copy of the working tree under `.build/snapshot`, so editing can go on during the 10-minute suite. What each suite must cover, and the skip policy: `docs/spec/testing.md`. The SLOs below are the targets the suites measure.
+Before declaring any task complete, run `./check`, one line per gate. It is the only copy of the gates: each CI job calls one of its subcommands (`./check --help` lists them), so it runs everything a push pipeline runs (the cross-user tests only as root: `sudo ./check cross-user`; the scheduled `./check perf` apart). `./check --fast` runs the static gates in seconds (also the pre-commit hook: `./check --install-hook`); `./check --snapshot` runs on a copy of the working tree under `.build/snapshot`, so editing can go on during the 10-minute suite. What each suite must cover, and the skip policy: `docs/spec/testing.md`. The SLOs below are the targets the suites measure.
 
 1. **Batch Removal & Event Throughput Benchmark:**
    - An automated test burst of **50,000 file deletion/update events** must satisfy:

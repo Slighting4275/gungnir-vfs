@@ -1,9 +1,11 @@
-//! One request and its reply over a connection's rings: the client every service module
-//! speaks through (metadata in md.zig, health.zig, fileop.zig, vfsfile.zig). It owns the
-//! reply envelope (`status u32 | body`, kind `proto.msg_reply`) and turns every status of
-//! the protocol into an error, so no caller looks at a raw status. Every wait has a
-//! deadline, and a stopped daemon (closed control socket) is noticed within
-//! `liveness_slice_ms`.
+//! One request and its reply over a connection's rings: the client every request/reply
+//! service speaks through (metadata in md.zig, health.zig, the trash and recent requests
+//! in vfsfile.zig, the shared link). It owns the reply envelope (`status u32 | body`, kind
+//! `proto.msg_reply`) and turns every status into an error (`statusError`). File
+//! operations (fileop.zig) are the one exception: an op streams progress and ends with a
+//! done on its own connection, so fileop reads those slots itself and maps the done's
+//! status through `gioerr.ofStatus`. Every wait has a deadline, and a stopped daemon
+//! (closed control socket) is noticed within `liveness_slice_ms`.
 //!
 //! A Client is not thread-safe: one request at a time per connection.
 const std = @import("std");

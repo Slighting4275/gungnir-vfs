@@ -33,6 +33,7 @@ extern "c" fn mkfifo(path: [*c]const u8, mode: c_uint) c_int;
 const c = @import("c");
 const ipc = @import("ipc.zig");
 const md = @import("md.zig");
+const rpc = @import("rpc.zig");
 const health = @import("health.zig");
 const link = @import("link.zig");
 const mountfilter = @import("mountfilter.zig");
@@ -317,11 +318,11 @@ fn checkMetadata(ctx: *Ctx) ?[*:0]const u8 {
     return what;
 }
 
-fn metadataRoundTrip(gpa: std.mem.Allocator, tmp_dir: [*:0]const u8, sock: [*:0]const u8) md.Error!?[*:0]const u8 {
+fn metadataRoundTrip(gpa: std.mem.Allocator, tmp_dir: [*:0]const u8, sock: [*:0]const u8) rpc.Error!?[*:0]const u8 {
     const sock_path = try ipc.resolveSocketPath(std.mem.span(sock), null, null);
     var conn = try ipc.connectAndPing(&sock_path, 2_000);
     defer conn.close();
-    var client: md.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
+    var client: rpc.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
 
     const file = tmpPath(tmp_dir, "meta-file");
     defer c.g_free(file);
@@ -688,11 +689,11 @@ fn checkThreads(file: ?*c.GFile) ?[*:0]const u8 {
     return null;
 }
 
-fn checkDeleteDrops(gpa: std.mem.Allocator, ctx: *Ctx, file: ?*c.GFile, path: [*c]const u8) md.Error!?[*:0]const u8 {
+fn checkDeleteDrops(gpa: std.mem.Allocator, ctx: *Ctx, file: ?*c.GFile, path: [*c]const u8) rpc.Error!?[*:0]const u8 {
     const sock_path = try ipc.resolveSocketPath(std.mem.span(ctx.sock), null, null);
     var conn = try ipc.connectAndPing(&sock_path, 2_000);
     defer conn.close();
-    var client: md.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
+    var client: rpc.Client = .{ .conn = &conn, .timeout_ms = 5_000 };
     const id = try md.identify(&client, std.mem.span(path));
     const before = (try md.get(&client, gpa, &id, "note")) orelse return "metadata missing before the delete";
     before.deinit(gpa);
@@ -1564,7 +1565,7 @@ fn waitHungKnown(ctx: *Ctx, path: [*c]const u8, timeout_ms: i64) ?[*:0]const u8 
             continue;
         };
         defer conn.close();
-        var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
+        var cl: rpc.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
         const info = health.queryPath(&cl, std.mem.span(path)) catch {
             c.g_usleep(20 * 1000);
             continue;
@@ -1771,7 +1772,7 @@ fn checkHungMount(ctx: *Ctx) ?[*:0]const u8 {
     const sock_path = ipc.resolveSocketPath(std.mem.span(ctx.sock), null, null) catch return "bad socket path";
     var conn = ipc.connectAndPing(&sock_path, 2_000) catch return "second connection failed";
     defer conn.close();
-    var cl: md.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
+    var cl: rpc.Client = .{ .conn = &conn, .timeout_ms = 2_000 };
     {
         const t = nowMs();
         if (md.identify(&cl, std.mem.span(path))) |_| return "the daemon identified a file on a hung mount" else |e| {

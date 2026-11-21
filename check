@@ -3,9 +3,9 @@
 # calls one subcommand below with its own environment (the tester user, the skip
 # opt-outs), so a check changes here and nowhere else. Quiet on success.
 #   ./check              everything a push pipeline runs: rust-static, zig-static,
-#                        release-hooks, zig-artifacts, test (all three) and zig-test.
-#                        Not here: rust:test-hooks' rerun of the cross-user tests as root
-#                        (it needs root), and the scheduled `perf` job.
+#                        release-hooks, zig-artifacts, test (all three) and zig-test,
+#                        plus cross-user when run as root (CI runs it as root). Not
+#                        here: the scheduled `perf` job.
 #   ./check --fast       rust-static and zig-static, in seconds: the pre-commit hook
 #   ./check rust-static  fmt, -D warnings check, clippy with and without test-hooks, the
 #                        no-unwrap/expect pass on the non-test targets, the grep rules
@@ -19,6 +19,7 @@
 #   ./check zig-artifacts  build libgiogungnir.so: exactly the three GIO exports, no test
 #                        hook, indexed by gio-querymodules as a VFS and volume monitor
 #   ./check perf         the 50k-event SLO benchmark (scheduled in CI, not per push)
+#   ./check cross-user   as root: the cross-user security tests with a real second user
 #   ./check --snapshot [subcommand]
 #                        copy the working tree (uncommitted changes included) to
 #                        .build/snapshot and run there, so editing can go on meanwhile;
@@ -76,9 +77,9 @@ rules() { # mechanical rules lint cannot express; each prints offending lines
     # Protocol numbers are defined as constants only in proto.rs / proto.zig (both tested
     # against protocol/wire.txt): any visibility, any width, any literal (decimal, 0x, 0b).
     # Not caught: a bare number written straight into a match arm or a call.
-    hits=$(grep -rnE '^\s*(pub(\([a-z]+\))? )?const (MSG|ST|KIND|STATUS|SCHEME)_[A-Z0-9_]+\s*:\s*u(8|16|32|64)\s*=\s*[0-9]' \
+    hits=$(grep -rnE '^\s*(pub(\([a-z]+\))? )?const (MSG|ST|KIND|STATUS|SCHEME|ITEM)_[A-Z0-9_]+\s*:\s*u(8|16|32|64)\s*=\s*[0-9]' \
         src/daemon-rust/src --include='*.rs' | grep -v '^src/daemon-rust/src/proto\.rs:')
-    hits+=$'\n'$(grep -rnE '^\s*(pub )?const (msg|st|kind|status|scheme)_[a-z0-9_]+(\s*:\s*u(8|16|32|64))?\s*=\s*[0-9]' \
+    hits+=$'\n'$(grep -rnE '^\s*(pub )?const (msg|st|kind|status|scheme|item)_[a-z0-9_]+(\s*:\s*u(8|16|32|64))?\s*=\s*[0-9]' \
         src/client-zig/src --include='*.zig' | grep -v '^src/client-zig/src/proto\.zig:')
     hits=$(printf '%s\n' "$hits" | sed '/^$/d')
     if [ -n "$hits" ]; then
@@ -86,7 +87,9 @@ rules() { # mechanical rules lint cannot express; each prints offending lines
         echo "$hits"
         bad=1
     fi
-    # Test hooks are read only by hooks::Hooks.
+    # Test hooks are read only by hooks::Hooks. The test harness's own knobs (testenv in
+    # lib.rs: GUNGNIR_ALLOW_MISSING, GUNGNIR_TEST_ON_TMPFS) are not daemon hooks: the
+    # daemon never reads them, so they are not in this list.
     hits=$(grep -rnE 'env::var(_os)?\([^)]*(GUNGNIR_TEST_|FAKE_HUNG_ENV|SLOW_OPS_ENV|PAUSE_AT_ENV|RING_LOSS_ENV|MIXED_RINGS_ENV|DRAIN_MS_ENV|TSYNC_FAIL_ENV|UPGRADE_EXE_ENV|TEST_TOP_ENV|NO_HOST_SUBVOLS_ENV)' \
         src/daemon-rust/src --include='*.rs' | grep -vE '^src/daemon-rust/src/hooks\.rs:|/tests\.rs:')
     if [ -n "$hits" ]; then
@@ -144,6 +147,11 @@ zig_artifacts() {
 }
 
 tests() { # tests [default|hooks|no-uring]...
+    # The io_uring engine tests must run, never skip (AGENTS.md §4), unless the machine
+    # lacks io_uring and GUNGNIR_ALLOW_NO_URING=1 asks to skip them on purpose.
+    if [ -z "$GUNGNIR_ALLOW_NO_URING" ] || [ "$GUNGNIR_ALLOW_NO_URING" = 0 ]; then
+        export GUNGNIR_REQUIRE_URING="${GUNGNIR_REQUIRE_URING:-1}"
+    fi
     local which
     for which in "${@:-default hooks no-uring}"; do
         for w in $which; do
@@ -193,6 +201,17 @@ zig-test)
     gate "release gungnird still has no test hook" sh -c "! grep -q 'TEST HOOK' .build/target/release/gungnird"
     ;;
 perf) gate "50k-event benchmark" cargo test --release --test stress_throughput -- --ignored --nocapture ;;
+cross-user)
+    # Run as root: the tests drop to `nobody` for their second user (testenv::as_other_user),
+    # and must run, never skip (no GUNGNIR_ALLOW_MISSING).
+    if [ "$(id -u)" != 0 ]; then
+        echo "FAIL cross-user: run as root (the tests drop to nobody for a second user)"
+        exit 1
+    fi
+    gate "cross-user tests as root" env -u GUNGNIR_ALLOW_MISSING cargo test --release \
+        --features test-hooks --no-fail-fast --test lifecycle --test trash_ipc -- \
+        another_user another_users
+    ;;
 "")
     rust_static
     zig_static
@@ -200,9 +219,15 @@ perf) gate "50k-event benchmark" cargo test --release --test stress_throughput -
     gate "libgiogungnir.so exports, hooks, giomodule.cache" zig_artifacts
     tests
     zig_test
+    if [ "$(id -u)" = 0 ]; then
+        "$0" cross-user || failed=$((failed + 1))
+    else
+        # Said, never silent: these need root (CI runs them as root).
+        echo "not run: cross-user tests (need root: sudo ./check cross-user)"
+    fi
     ;;
 *)
-    sed -n '2,29p' "$0"
+    sed -n '2,30p' "$0"
     exit 2
     ;;
 esac

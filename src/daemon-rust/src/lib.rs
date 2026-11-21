@@ -49,6 +49,29 @@ pub mod testenv {
     /// Set in a test's rerun on tmpfs (see [`rerun_on_tmpfs`]).
     pub const ON_TMPFS_ENV: &str = "GUNGNIR_TEST_ON_TMPFS";
 
+    /// Every path below `dir`, relative and sorted, SQLite's `-wal`/`-shm` journals left
+    /// out (they come and go with any open): what a start left behind, for tests to
+    /// compare.
+    #[must_use]
+    pub fn tree(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
+                if !rel.ends_with("-wal") && !rel.ends_with("-shm") {
+                    out.push(rel);
+                }
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(base, &p, out);
+                }
+            }
+        }
+        let mut v = Vec::new();
+        walk(dir, dir, &mut v);
+        v.sort();
+        v
+    }
+
     /// A line straight to stderr: the test harness swallows `eprintln!` of a passing test,
     /// and a skip must always show.
     pub fn say(line: &str) {

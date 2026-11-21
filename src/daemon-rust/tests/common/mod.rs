@@ -89,11 +89,10 @@ impl Drop for Reaped {
 /// The log file could not be created.
 pub fn gungnird(d: &Dir) -> R<Command> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
+    // The host's btrfs subvolumes are already out for every test daemon:
+    // GUNGNIR_TEST_NO_HOST_SUBVOLS comes from .cargo/config.toml's [env].
     cmd.env("HOME", &d.0)
         .env("XDG_DATA_HOME", d.join("data"))
-        // The trash service keeps to the test's own volumes (test-hooks builds; a
-        // release build only notes the variable and ignores it).
-        .env(gungnird::hooks::NO_HOST_SUBVOLS_ENV, "1")
         .env_remove("GUNGNIR_SECCOMP")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -31,9 +31,9 @@ const msg_stamp = proto.msg_vfs_stamp;
 const scheme_trash = proto.scheme_trash;
 const scheme_recent = proto.scheme_recent;
 
-const kind_file = proto.kind_file;
-const kind_dir = proto.kind_dir;
-const kind_symlink = proto.kind_symlink;
+const item_file = proto.item_file;
+const item_dir = proto.item_dir;
+const item_symlink = proto.item_symlink;
 
 const connect_timeout_ms = 500;
 const list_timeout_ms = 5_000;
@@ -312,9 +312,9 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
     c.g_file_info_set_display_name(info, display);
 
     const file_kind: c.GFileType = switch (r.kind) {
-        kind_file => c.G_FILE_TYPE_REGULAR,
-        kind_dir => c.G_FILE_TYPE_DIRECTORY,
-        kind_symlink => c.G_FILE_TYPE_SYMBOLIC_LINK,
+        item_file => c.G_FILE_TYPE_REGULAR,
+        item_dir => c.G_FILE_TYPE_DIRECTORY,
+        item_symlink => c.G_FILE_TYPE_SYMBOLIC_LINK,
         else => c.G_FILE_TYPE_SPECIAL,
     };
     c.g_file_info_set_file_type(info, file_kind);
@@ -326,7 +326,7 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
     c.g_file_info_set_attribute_boolean(info, "access::can-delete", 1);
     setCommon(info);
     if (inner) c.g_file_info_set_attribute_boolean(info, "access::can-delete", 0);
-    if (r.kind == kind_symlink) {
+    if (r.kind == item_symlink) {
         c.g_file_info_set_is_symlink(info, 1);
         // g_file_copy with NOFOLLOW recreates the link from this, instead of reading it.
         const l = dupz(r.link);
@@ -334,7 +334,7 @@ fn infoFor(scheme: u8, r: *const Row) ?*c.GFileInfo {
         if (r.link.len != 0) c.g_file_info_set_symlink_target(info, l);
     }
 
-    if (r.kind == kind_dir) {
+    if (r.kind == item_dir) {
         c.g_file_info_set_content_type(info, "inode/directory");
         setIcons(info, "inode/directory");
     } else {

@@ -56,6 +56,9 @@ pub struct StartConfig {
     pub no_uring: Option<OsString>,
     /// The store's lock a live upgrade carried ([`ipc::Handoff::store_lock`]).
     pub carried_store_lock: Option<RawFd>,
+    /// `$XDG_DATA_HOME` and `$HOME`: the home trash and the recent list live there.
+    pub xdg_data: Option<OsString>,
+    pub home: Option<OsString>,
     pub hooks: Hooks,
 }
 
@@ -200,7 +203,10 @@ fn serve(
     }
 
     // 5. The services and their router.
-    let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::daemon(hooks));
+    let vfs = vfssvc::Svc::new(
+        Arc::clone(&ops),
+        vfssvc::SvcConfig::daemon(hooks, cfg.xdg_data.clone(), cfg.home.clone()),
+    );
     let ops_for_ledger = Arc::clone(&ops);
     let services: Vec<Arc<dyn ipc::Service>> = vec![
         Arc::new(vfssvc::VfsService::new(vfs)),
@@ -253,19 +259,22 @@ fn serve(
             eprintln!("gungnird: database checkpoint {when} failed: {e}");
         }
     };
+    // An exit: the store persisted, then the socket gone (the live upgrade keeps it).
+    let shut_down = |when: &str| {
+        persist(when);
+        listener.cleanup();
+    };
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         match ipc::serve_counting(&listener.socket, ipc_cfg, &handler, &active)? {
             ipc::ShutdownReason::Signal(sig) => {
                 eprintln!("gungnird: signal {sig} received; persisting state and shutting down");
-                persist("on shutdown");
-                listener.cleanup();
+                shut_down("on shutdown");
                 break;
             }
             ipc::ShutdownReason::IdleTimeout => {
                 eprintln!("gungnird: idle timeout elapsed; persisting state and shutting down");
-                persist("on idle shutdown");
-                listener.cleanup();
+                shut_down("on idle shutdown");
                 break;
             }
             ipc::ShutdownReason::LiveUpgrade(sig) if seccomp_mode != SeccompMode::Disabled => {
@@ -277,8 +286,7 @@ fn serve(
                      draining, then exiting for the service manager to start the new binary"
                 );
                 let cut = drain(handler.as_ref(), hooks.drain.unwrap_or(UPGRADE_DRAIN_MAX));
-                persist("before upgrade exit");
-                listener.cleanup();
+                shut_down("before upgrade exit");
                 if let Some(why) = cut {
                     // Not a clean upgrade exit: some ops were cancelled (BC-A2-F03b/c).
                     return Err(Error::Io(io::Error::other(why)));
@@ -436,7 +444,7 @@ fn drain(handler: &dyn ipc::Handler, max: Duration) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdir::TestDir;
+    use crate::{testdir::TestDir, testenv::tree};
     use std::sync::Mutex;
 
     /// An exec that never replaces the test process.
@@ -551,7 +559,11 @@ mod tests {
 
     /// A start that serves until its idle timeout, then stops cleanly.
     fn served(dir: &TestDir, sock: &str, db: &Path) -> Result<()> {
-        let listener = ipc::bind(&dir.join(sock))?;
+        served_at(&dir.join(sock), db)
+    }
+
+    fn served_at(sock: &Path, db: &Path) -> Result<()> {
+        let listener = ipc::bind(sock)?;
         let sandbox = Recording::default();
         let cfg = StartConfig {
             db_path: db.to_path_buf(),
@@ -562,24 +574,61 @@ mod tests {
         run(&listener, &cfg, &ports(&sandbox))
     }
 
-    /// Every path below `dir` but SQLite's journal files, relative and sorted.
-    fn tree(dir: &Path) -> Vec<String> {
-        fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
-            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
-                let p = e.path();
-                let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
-                if !rel.ends_with("-wal") && !rel.ends_with("-shm") {
-                    out.push(rel);
-                }
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    walk(base, &p, out);
-                }
-            }
+    /// [`served_at`] on a thread, within `limit`: a start that blocks fails the test
+    /// instead of hanging it (the stuck thread is left behind).
+    fn served_within(sock: &Path, db: &Path, limit: Duration) -> std::result::Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (sock, db) = (sock.to_path_buf(), db.to_path_buf());
+        std::thread::spawn(move || {
+            let _ = tx.send(served_at(&sock, &db).map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(limit)
+            .map_err(|_| format!("the start did not serve and stop within {limit:?}"))?
+    }
+
+    /// A FIFO under a temp ledger's name blocked the start in `open(2)` before it served:
+    /// the daemon never answered. Now the ledger is refused, logged, and the start goes on.
+    #[test]
+    fn a_fifo_in_place_of_a_temp_ledger_never_blocks_the_start() -> Result<()> {
+        for name in ["ops-pending", "ops-pending.kept"] {
+            let dir = TestDir::new("daemon-ledger-fifo")?;
+            let fifo = std::ffi::CString::new(dir.join(name).into_os_string().into_encoded_bytes())
+                .map_err(|e| Error::Io(io::Error::other(e)))?;
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            let r = served_within(
+                &dir.join("s.sock"),
+                &dir.join("meta.db"),
+                Duration::from_secs(10),
+            );
+            assert_eq!(r, Ok(()), "{name}");
         }
-        let mut v = Vec::new();
-        walk(dir, dir, &mut v);
-        v.sort();
-        v
+        Ok(())
+    }
+
+    /// A damaged database failed every start ("file is not a database"); it is now kept
+    /// aside, byte for byte, and the daemon serves on an empty store.
+    #[test]
+    fn a_damaged_database_does_not_stop_the_daemon() -> Result<()> {
+        let dir = TestDir::new("daemon-damaged-db")?;
+        let db = dir.join("meta.db");
+        let junk: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        std::fs::write(&db, &junk)?;
+        let r = served_within(&dir.join("s.sock"), &db, Duration::from_secs(10));
+        assert_eq!(r, Ok(()));
+        let kept: Vec<_> = std::fs::read_dir(dir.path())?
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("meta.db.corrupt-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path())?, junk);
+        Ok(())
     }
 
     /// A start refused on a store an earlier start made keeps that store as it was

@@ -1,8 +1,7 @@
 # GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
 # Each job runs one `./check` subcommand (the gates of AGENTS.md §4 live there, once);
-# a job adds only its environment: the tester user, the skip opt-outs. The one CI-only
-# step is rust:test-hooks' rerun of the cross-user tests as root. All output stays under
-# .build/ (AGENTS.md §3).
+# a job adds only its environment: the tester user, the skip opt-outs, root for
+# `./check cross-user`. All output stays under .build/ (AGENTS.md §3).
 #
 # Reproducible base: the archlinux image is pinned by tag AND digest, and pacman installs
 # from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT), so every run gets
@@ -254,11 +253,9 @@ rust:test:
   timeout: 25 minutes
   needs: ["rust:build"]
   variables:
-    # The io_uring engine tests must run here: fail, never skip, if io_uring is
-    # unavailable (ENOSYS/EPERM/ENOMEM in the runner's container). D-061.
-    GUNGNIR_REQUIRE_URING: "1"
     # What this container cannot have (btrfs) is skipped, each test on a SKIP line in the
-    # log; everything else must run (gungnird::testenv).
+    # log; everything else must run (gungnird::testenv). The io_uring engine tests must
+    # run, never skip: ./check requires io_uring by default (D-061).
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
@@ -275,7 +272,6 @@ rust:test-hooks:
   timeout: 25 minutes
   needs: ["rust:build"]
   variables:
-    GUNGNIR_REQUIRE_URING: "1"
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
@@ -286,8 +282,7 @@ rust:test-hooks:
     # `nobody` (testenv::as_other_user): no opt-out, they must run or fail.
     - |
       chown -R root:root "$CI_PROJECT_DIR/.build"
-      env -u GUNGNIR_ALLOW_MISSING cargo test --release --features test-hooks --no-fail-fast \
-        --test lifecycle --test trash_ipc -- another_user another_users
+      ./check cross-user
 
 # Milestone 8: the thread-pool fallback engine, forced. Its own job, in every pipeline,
 # needing only rust:build, so an io_uring failure in rust:test never hides it (D-048,

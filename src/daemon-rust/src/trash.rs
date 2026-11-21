@@ -81,7 +81,7 @@ pub struct TrashDir {
 }
 
 /// Kinds of payload, as on the wire.
-pub use crate::proto::{KIND_DIR, KIND_FILE, KIND_SPECIAL, KIND_SYMLINK};
+pub use crate::proto::{ITEM_DIR, ITEM_FILE, ITEM_SPECIAL, ITEM_SYMLINK};
 
 /// One listed item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,10 +543,10 @@ pub fn original_path(d: &TrashDir, path: &[u8]) -> Option<Vec<u8>> {
 
 fn kind_of(st: &libc::stat) -> u8 {
     match st.st_mode & libc::S_IFMT {
-        libc::S_IFLNK => KIND_SYMLINK,
-        libc::S_IFDIR => KIND_DIR,
-        libc::S_IFREG => KIND_FILE,
-        _ => KIND_SPECIAL,
+        libc::S_IFLNK => ITEM_SYMLINK,
+        libc::S_IFDIR => ITEM_DIR,
+        libc::S_IFREG => ITEM_FILE,
+        _ => ITEM_SPECIAL,
     }
 }
 
@@ -563,9 +563,9 @@ fn item_at(d: &TrashDir, files: Option<&OwnedFd>, info: Option<&OwnedFd>, entry:
     let st = files.and_then(|f| stat_at(f.as_raw_fd(), &c_path(entry).ok()?).ok());
     let (kind, size, mtime) = match st {
         Some(s) => (kind_of(&s), s.st_size as u64, s.st_mtime),
-        None => (KIND_SPECIAL, 0, 0),
+        None => (ITEM_SPECIAL, 0, 0),
     };
-    let link = (kind == KIND_SYMLINK)
+    let link = (kind == ITEM_SYMLINK)
         .then(|| read_link_at(files?.as_raw_fd(), &c_path(entry).ok()?).ok())
         .flatten()
         .unwrap_or_default();
@@ -703,7 +703,7 @@ fn inner_item(
     let cleaf = c_path(leaf)?;
     let st = stat_at(dir, &cleaf)?;
     let kind = kind_of(&st);
-    let link = if kind == KIND_SYMLINK {
+    let link = if kind == ITEM_SYMLINK {
         read_link_at(dir, &cleaf).unwrap_or_default()
     } else {
         Vec::new()
@@ -820,7 +820,7 @@ pub fn children_of(
                 entry: Vec::new(),
                 orig: joined(&orig, leaf),
                 target,
-                kind: KIND_SPECIAL,
+                kind: ITEM_SPECIAL,
                 size: 0,
                 mtime: 0,
                 deleted: Vec::new(),
@@ -1257,16 +1257,21 @@ fn is_type(e: &MountEntry, names: &[&str]) -> bool {
     names.iter().any(|n| n.as_bytes() == e.fstype.as_slice())
 }
 
-/// Mount points of a mount table that could hold a trash directory.
-fn mount_points(table: &[MountEntry]) -> Vec<PathBuf> {
+/// The mount points of the entries `keep` takes, each once, in table order.
+fn mount_points_where(table: &[MountEntry], keep: impl Fn(&MountEntry) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for e in table.iter().filter(|e| !is_type(e, &NO_TRASH_TYPES)) {
+    for e in table.iter().filter(|e| keep(e)) {
         let p = e.mount_point_path();
         if !out.contains(&p) {
             out.push(p);
         }
     }
     out
+}
+
+/// Mount points of a mount table that could hold a trash directory.
+fn mount_points(table: &[MountEntry]) -> Vec<PathBuf> {
+    mount_points_where(table, |e| !is_type(e, &NO_TRASH_TYPES))
 }
 
 /// The mount `path` is on: the longest of `tops` above it, so a mount below another one
@@ -1298,20 +1303,15 @@ fn fuse_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
 /// The mount points of a mount table that are btrfs: opening anything else to find out
 /// would touch mounts that may hang.
 fn btrfs_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for e in table.iter().filter(|e| is_type(e, &["btrfs"])) {
-        let p = e.mount_point_path();
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    out
+    mount_points_where(table, |e| is_type(e, &["btrfs"]))
 }
 
-/// What volume discovery works from. Everything it may not do itself comes in here: the
+/// What volume discovery works from. Everything it asks of the system comes in here: the
 /// mount table (read by the caller), and as callbacks whether a path's mount is hung or
-/// gone, whether a FUSE mount's server is gone, and the btrfs subvolume search (which
-/// runs on a thread of the caller's, with its own bounds).
+/// gone, whether a FUSE mount's server is gone, whether a btrfs mount is a snapshot, and
+/// the btrfs subvolume search (which runs on a thread of the caller's, with its own
+/// bounds). Discovery itself only opens volume tops to look for trash directories in
+/// them ([`volume_dirs`], [`subvolume_tops`]), never one `blocked` names.
 pub struct Volumes<'a> {
     pub table: &'a [MountEntry],
     /// The home trash, if there is one.
@@ -1325,6 +1325,8 @@ pub struct Volumes<'a> {
     pub host_subvols: bool,
     pub blocked: &'a dyn Fn(&Path) -> bool,
     pub fuse_gone: &'a dyn Fn(&Path) -> bool,
+    /// Whether a btrfs mount is a snapshot (asked only of mounts not `blocked`).
+    pub is_snapshot: &'a dyn Fn(&Path) -> bool,
     /// The subvolumes below these roots, and whether that is all of them.
     pub subvolumes: &'a dyn Fn(Vec<PathBuf>) -> (Vec<PathBuf>, bool),
 }
@@ -1377,7 +1379,7 @@ pub fn discover(v: &Volumes<'_>) -> Dirs {
     .filter_map(|p| mount_of(&tops, p).cloned())
     .collect();
     tops.retain(|t| {
-        !roots.contains(t) || blocked(t) || lived_on.contains(t) || !crate::btrfs::is_snapshot(t)
+        !roots.contains(t) || blocked(t) || lived_on.contains(t) || !(v.is_snapshot)(t)
     });
     roots.retain(|t| tops.contains(t));
     // A subvolume needs no mount of its own, and g_file_trash treats it as a volume.
@@ -1551,7 +1553,7 @@ mod tests {
         assert_eq!(get(b"relative").orig, rel);
         for bad in [&b"malformed"[..], b"noinfo", b"dirinfo", b"sock"] {
             assert_eq!(get(bad).orig, b"", "{}", String::from_utf8_lossy(bad));
-            assert_eq!(get(bad).kind, KIND_FILE);
+            assert_eq!(get(bad).kind, ITEM_FILE);
         }
         // SAFETY: plain getter.
         if unsafe { libc::geteuid() } != 0 {
@@ -1914,12 +1916,12 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (b"h-dir/out".to_vec(), KIND_SYMLINK),
-                (b"h-dir/sub".to_vec(), KIND_DIR)
+                (b"h-dir/out".to_vec(), ITEM_SYMLINK),
+                (b"h-dir/sub".to_vec(), ITEM_DIR)
             ]
         );
         let leaf = child_item(&d, &pins, b"dir", b"sub/leaf", b"h-dir/sub/leaf").unwrap();
-        assert_eq!((leaf.kind, leaf.size), (KIND_FILE, 5));
+        assert_eq!((leaf.kind, leaf.size), (ITEM_FILE, 5));
         assert_eq!(leaf.orig, b"/o/dir/sub/leaf");
         assert!(leaf.target.ends_with(b"files/dir/sub/leaf"));
         // A link is not walked through, and no name climbs out.
@@ -1947,11 +1949,11 @@ mod tests {
         fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
         // SAFETY: plain getter.
         if unsafe { libc::geteuid() } != 0 {
-            assert_eq!(got.unwrap()[0].kind, KIND_SPECIAL);
+            assert_eq!(got.unwrap()[0].kind, ITEM_SPECIAL);
         }
         assert_eq!(
             skipped.unwrap()[0].kind,
-            KIND_SPECIAL,
+            ITEM_SPECIAL,
             "a hung child is not touched"
         );
     }
@@ -2327,6 +2329,7 @@ mod tests {
             host_subvols: false,
             blocked: &|p| p.starts_with(&hung),
             fuse_gone: &|p| p.starts_with(&dead),
+            is_snapshot: &|_| false,
             subvolumes: &|_| (Vec::new(), false),
         });
         let tops: Vec<&Path> = found.dirs.iter().map(|d| d.top.as_path()).collect();

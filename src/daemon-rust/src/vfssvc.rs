@@ -201,16 +201,20 @@ pub struct SvcConfig {
 }
 
 impl SvcConfig {
-    /// The daemon's: `$XDG_DATA_HOME` and `$HOME`, its euid, procfs, and what the test
-    /// hooks ask for (one more volume, [`TEST_TOP_ENV`]; the host's btrfs subvolumes left
-    /// out, [`crate::hooks::NO_HOST_SUBVOLS_ENV`]). With no hook set, a `test-hooks`
-    /// build behaves as a release build.
+    /// The daemon's: the `$XDG_DATA_HOME` and `$HOME` its caller read, its euid, procfs,
+    /// and what the test hooks ask for (one more volume, [`TEST_TOP_ENV`]; the host's
+    /// btrfs subvolumes left out, [`crate::hooks::NO_HOST_SUBVOLS_ENV`]). With no hook
+    /// set, a `test-hooks` build behaves as a release build. Reads no environment.
     #[must_use]
-    pub fn daemon(hooks: &crate::hooks::Hooks) -> Self {
+    pub fn daemon(
+        hooks: &crate::hooks::Hooks,
+        xdg_data: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> Self {
         let extra_tops = hooks.trash_top.iter().cloned().collect();
         Self {
-            xdg_data: std::env::var_os("XDG_DATA_HOME"),
-            home: std::env::var_os("HOME"),
+            xdg_data,
+            home,
             // SAFETY: plain getter.
             uid: unsafe { libc::geteuid() },
             extra_tops,
@@ -398,6 +402,7 @@ impl Svc {
             host_subvols: self.host_subvols,
             blocked: &|p| self.blocked(p),
             fuse_gone: &|p| self.ops.gone(p.as_os_str().as_bytes()),
+            is_snapshot: &|p| btrfs::is_snapshot(p),
             subvolumes: &|roots| self.subvolumes(roots, fresh),
         });
         found.complete &= readable;
@@ -440,7 +445,7 @@ impl Svc {
     fn recent_item(&self, e: recent::Entry) -> Item {
         {
             let target = recent::file_path(&e.uri).unwrap_or_default();
-            let (mut kind, mut size, mut mtime) = (trash::KIND_SPECIAL, 0, 0);
+            let (mut kind, mut size, mut mtime) = (trash::ITEM_SPECIAL, 0, 0);
             let tp = Path::new(OsStr::from_bytes(&target));
             // A file on a hung mount is listed without touching it.
             if !target.is_empty()
@@ -449,9 +454,9 @@ impl Svc {
             {
                 use std::os::unix::fs::MetadataExt;
                 kind = if m.is_dir() {
-                    trash::KIND_DIR
+                    trash::ITEM_DIR
                 } else {
-                    trash::KIND_FILE
+                    trash::ITEM_FILE
                 };
                 size = m.len();
                 mtime = m.mtime();
@@ -1211,7 +1216,7 @@ mod tests {
             entry: format!("{n}").into_bytes(),
             orig: vec![b'o'; text],
             target: vec![b't'; text],
-            kind: trash::KIND_FILE,
+            kind: trash::ITEM_FILE,
             size: 1,
             mtime: 2,
             deleted: Vec::new(),
