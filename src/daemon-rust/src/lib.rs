@@ -1,10 +1,12 @@
 use std::{fmt, io, path::PathBuf};
 
 pub mod btrfs;
+pub mod daemon;
 pub mod fsid;
 pub mod health;
 pub mod hooks;
 pub mod ipc;
+pub mod lockfile;
 pub mod md;
 pub mod mdsvc;
 pub mod ops;

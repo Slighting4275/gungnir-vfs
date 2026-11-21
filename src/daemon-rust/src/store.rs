@@ -12,7 +12,6 @@
 use std::{
     ffi::OsStr,
     fs,
-    os::fd::AsRawFd,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -24,6 +23,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, pa
 
 use crate::{
     Error, Result,
+    lockfile::LockError,
     md::{Ident, MAX_KEYS_PER_FILE, MdError, Value, check_key, list_body},
 };
 
@@ -147,32 +147,7 @@ fn tighten_sidecars(path: &Path) -> Result<()> {
 /// daemon could be waiting on it, only by a failed start that created the store and
 /// still holds it (see `FreshStore` in main.rs). Closed on exec, so a live upgrade
 /// (an `execve` of the same process) takes it again.
-#[derive(Debug)]
-pub struct StoreLock {
-    _file: fs::File,
-    path: PathBuf,
-    created: bool,
-}
-
-impl StoreLock {
-    /// The lock file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Whether this start created the lock file.
-    #[must_use]
-    pub fn created(&self) -> bool {
-        self.created
-    }
-
-    /// The lock's fd (carried across a live upgrade, BC-CM-D02).
-    #[must_use]
-    pub fn fd(&self) -> std::os::fd::RawFd {
-        self._file.as_raw_fd()
-    }
-}
+pub type StoreLock = crate::lockfile::LockFile;
 
 /// Take the store's lock (see [`StoreLock`]), creating its directory as
 /// [`open_db`] would. `None` for an in-memory database. `carried` is the lock's fd a live
@@ -191,45 +166,15 @@ pub fn lock_store(db: &Path, carried: Option<std::os::fd::RawFd>) -> Result<Opti
     path.push(".lock");
     let path = PathBuf::from(path);
     if let Some(fd) = carried {
-        let file = crate::ipc::adopt_lock_fd(fd, &path)?;
-        return Ok(Some(StoreLock {
-            _file: file,
-            path,
-            created: false,
-        }));
+        return Ok(Some(StoreLock::adopt(fd, path)?));
     }
-    let open = |create_new: bool| {
-        let mut o = fs::OpenOptions::new();
-        o.read(true).write(true).mode(0o600);
-        if create_new {
-            o.create_new(true);
-        }
-        o.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-    };
-    let (file, created) = match open(true) {
-        Ok(f) => (f, true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (open(false)?, false),
-        Err(e) => return Err(e.into()),
-    };
-    let md = file.metadata()?;
-    if !md.is_file() || md.uid() != euid() {
-        return Err(Error::InsecureDbDir(path));
-    }
-    // SAFETY: flock on an fd this function owns; no pointers.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
-            Error::StoreInUse(db.to_path_buf())
-        } else {
-            e.into()
-        });
-    }
-    Ok(Some(StoreLock {
-        _file: file,
-        path,
-        created,
-    }))
+    StoreLock::take(path.clone())
+        .map(Some)
+        .map_err(|e| match e {
+            LockError::Held => Error::StoreInUse(db.to_path_buf()),
+            LockError::Foreign => Error::InsecureDbDir(path),
+            LockError::Io(e) => e.into(),
+        })
 }
 
 /// Create the database directory as [`prepare_dir`] does; create the file 0600 (and

@@ -151,7 +151,7 @@ fn systemd_socket_activation_rejection_on_mismatch() -> R {
         env::set_var("LISTEN_FDS", "1");
     }
     assert!(
-        ipc::systemd_listener()?.is_none(),
+        ipc::systemd_listener(&ipc::Handoff::default())?.is_none(),
         "must reject PID mismatch"
     );
 
@@ -161,7 +161,7 @@ fn systemd_socket_activation_rejection_on_mismatch() -> R {
         env::set_var("LISTEN_FDS", "0");
     }
     assert!(
-        ipc::systemd_listener()?.is_none(),
+        ipc::systemd_listener(&ipc::Handoff::default())?.is_none(),
         "must reject LISTEN_FDS = 0"
     );
 

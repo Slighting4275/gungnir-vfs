@@ -14,7 +14,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
             ffi::{OsStrExt, OsStringExt},
-            fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -28,7 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    lockfile::{LockError, LockFile},
+};
 
 pub use crate::proto::{
     FRAME_LEN, KIND_ACK, KIND_HELLO, KIND_REJECT, MAGIC, MSG_PING, MSG_PONG, PAYLOAD_MAX, SHM_SIZE,
@@ -703,7 +706,7 @@ pub struct Listener {
     pub socket: UnixListener,
     pub path: Option<PathBuf>,
     pub socket_activated: bool,
-    _lock: Option<fs::File>,
+    _lock: Option<LockFile>,
     /// Device and inode of the socket file this daemon bound (BC-HC-F07): its path is
     /// unlinked on exit only while it is still that file, never another daemon's.
     bound: Option<(u64, u64)>,
@@ -719,7 +722,7 @@ impl Listener {
     /// The fd of the held instance lock, if any (carried across a live upgrade).
     #[must_use]
     pub fn lock_fd(&self) -> Option<RawFd> {
-        self._lock.as_ref().map(AsRawFd::as_raw_fd)
+        self._lock.as_ref().map(LockFile::fd)
     }
 
     /// Construct a socket-activated `Listener` around an already open `UnixListener`.
@@ -836,10 +839,38 @@ fn take_upgrade_bound() -> Option<(u64, u64)> {
     Some((dev.parse().ok()?, ino.parse().ok()?))
 }
 
+/// What a live upgrade's old image hands the new one, besides the listening socket on
+/// fd 3: the two lock fds it held, and whether it had bound the socket itself. Written
+/// by [`perform_live_upgrade`] into the new image's environment, read back once by
+/// [`Handoff::take`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Handoff {
+    /// The socket's lock ([`UPGRADE_SOCKET_LOCK_ENV`]), adopted by [`systemd_listener`].
+    pub socket_lock: Option<RawFd>,
+    /// The store's lock ([`UPGRADE_STORE_LOCK_ENV`]), adopted by
+    /// [`crate::store::lock_store`].
+    pub store_lock: Option<RawFd>,
+    /// The bound socket's device and inode ([`UPGRADE_BOUND_SOCKET_ENV`]).
+    pub bound: Option<(u64, u64)>,
+}
+
+impl Handoff {
+    /// Read the handoff and remove its variables from the environment. Call once, first
+    /// thing, while the process is single-threaded: nothing else may read the
+    /// environment meanwhile.
+    #[must_use]
+    pub fn take() -> Self {
+        Self {
+            socket_lock: take_upgrade_fd(UPGRADE_SOCKET_LOCK_ENV),
+            store_lock: take_upgrade_fd(UPGRADE_STORE_LOCK_ENV),
+            bound: take_upgrade_bound(),
+        }
+    }
+}
+
 /// The fd number a live upgrade left in `var`, removing the variable. Call only while the
 /// process is single-threaded (start-up).
-#[must_use]
-pub fn take_upgrade_fd(var: &str) -> Option<RawFd> {
+fn take_upgrade_fd(var: &str) -> Option<RawFd> {
     let v = env::var_os(var)?;
     // SAFETY: start-up, before any thread exists; nothing reads the environment
     // concurrently.
@@ -847,72 +878,28 @@ pub fn take_upgrade_fd(var: &str) -> Option<RawFd> {
     v.to_str()?.parse::<RawFd>().ok().filter(|fd| *fd > 2)
 }
 
-/// Adopt `fd`, inherited across a live upgrade, as the lock file `lock_path`: it must be
-/// that very file (same device and inode, a regular file of ours) and still hold the
-/// exclusive `flock` (re-taken on the same open file, which succeeds only for the holder's
-/// own open file). Never reopens the path, so there is no moment without the lock.
-///
-/// # Errors
-/// [`Error::Io`] if `fd` is not that lock, or the lock is not held through it; the fd is
-/// then left as it was.
-pub fn adopt_lock_fd(fd: RawFd, lock_path: &Path) -> Result<fs::File> {
-    let mismatch = || {
-        Error::Io(io::Error::other(format!(
-            "the lock fd {fd} inherited from a live upgrade is not {}",
-            lock_path.display()
-        )))
-    };
-    let mut st = mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat on an fd number; reads the buffer only on success.
-    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
-        return Err(mismatch());
-    }
-    // SAFETY: fstat succeeded.
-    let st = unsafe { st.assume_init() };
-    let md = fs::symlink_metadata(lock_path).map_err(|_| mismatch())?;
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG
-        || (st.st_dev, st.st_ino) != (md.dev(), md.ino())
-        || st.st_uid != euid()
-    {
-        return Err(mismatch());
-    }
-    // SAFETY: flock on a validated fd; no pointers.
-    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(mismatch());
-    }
-    // SAFETY: fcntl on a validated fd; no pointers.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    // SAFETY: the fd was handed to this image for exactly this; nothing else owns it.
-    Ok(unsafe { fs::File::from_raw_fd(fd) })
-}
-
 /// Take the single-instance lock of the socket at `path`: an exclusive non-blocking
 /// `flock` on `<path>.lock` (0600). Both ways of starting take it, and both refuse to
 /// serve without it (BC-HC-F07).
 ///
+/// A live upgrade's new image adopts the lock its old image held (`carried`, BC-CM-D02).
+///
 /// # Errors
-/// [`Error::AlreadyRunning`] if another daemon holds it, or I/O errors.
-fn lock_socket(path: &Path) -> Result<fs::File> {
+/// [`Error::AlreadyRunning`] if another daemon holds it, [`Error::InsecureSocketDir`] if
+/// the lock path is not a regular file of ours, a carried fd that is not this lock, or
+/// I/O errors.
+fn lock_socket(path: &Path, carried: Option<RawFd>) -> Result<LockFile> {
     let mut lock_path = OsString::from(path.as_os_str());
     lock_path.push(".lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&lock_path)?;
-    // SAFETY: flock on an fd this function owns; no pointers.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        let e = io::Error::last_os_error();
-        return if e.kind() == io::ErrorKind::WouldBlock {
-            Err(Error::AlreadyRunning(path.to_path_buf()))
-        } else {
-            Err(e.into())
-        };
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(fd) = carried {
+        return Ok(LockFile::adopt(fd, lock_path)?);
     }
-    Ok(lock)
+    LockFile::take(lock_path.clone()).map_err(|e| match e {
+        LockError::Held => Error::AlreadyRunning(path.to_path_buf()),
+        LockError::Foreign => Error::InsecureSocketDir(lock_path),
+        LockError::Io(e) => e.into(),
+    })
 }
 
 /// Bind the control socket, creating its directory (0700) and checking an existing one.
@@ -933,7 +920,7 @@ pub fn bind(path: &Path) -> Result<Listener> {
         .mode(0o700)
         .create(dir)?;
     check_socket_dir(dir)?;
-    let lock = lock_socket(path)?;
+    let lock = lock_socket(path, None)?;
 
     match fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_socket() => {
@@ -987,7 +974,9 @@ fn socket_path_from_fd(fd: i32) -> Option<PathBuf> {
 ///
 /// If `LISTEN_PID` matches our PID and `LISTEN_FDS >= 1`, adopts fd 3 (`SD_LISTEN_FDS_START`),
 /// sets non-blocking mode, unsets the environment variables, and returns a socket-activated `Listener`.
-pub fn systemd_listener() -> Result<Option<Listener>> {
+/// After a live upgrade, `handoff` carries the socket's lock and whether the old image
+/// had bound the socket itself.
+pub fn systemd_listener(handoff: &Handoff) -> Result<Option<Listener>> {
     let listen_pid = match env::var("LISTEN_PID") {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -1034,15 +1023,9 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     // Refused, not served unlocked (BC-HC-F07): a daemon already holds this socket's
     // lock, or the lock cannot be taken. The socket itself is systemd's and stays.
     // A live upgrade's new image adopts the lock its old image held (BC-CM-D02).
-    let carried = take_upgrade_fd(UPGRADE_SOCKET_LOCK_ENV);
-    let lock = match (&path, carried) {
-        (Some(p), Some(fd)) => {
-            let mut lp = OsString::from(p.as_os_str());
-            lp.push(".lock");
-            Some(adopt_lock_fd(fd, Path::new(&lp))?)
-        }
-        (Some(p), None) => Some(lock_socket(p)?),
-        (None, _) => None,
+    let lock = match &path {
+        Some(p) => Some(lock_socket(p, handoff.socket_lock)?),
+        None => None,
     };
 
     // SAFETY: raw_fd is validated above.
@@ -1050,7 +1033,7 @@ pub fn systemd_listener() -> Result<Option<Listener>> {
     socket.set_nonblocking(true)?;
 
     // A live upgrade of a daemon that bound this socket itself: still its own (F08).
-    let bound = path.as_ref().and(take_upgrade_bound());
+    let bound = path.as_ref().and(handoff.bound);
     Ok(Some(Listener {
         socket,
         path,
