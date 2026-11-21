@@ -56,7 +56,7 @@ jobs:
       - &env
         name: Job environment
         run: |
-          if [ "${{ inputs.mirrors }}" = live ]; then snap=; else snap=$ARCH_SNAPSHOT_PINNED; fi
+          snap=  # ci-trial only: the archive is down
           {
             echo "ARCH_SNAPSHOT=$snap"
             echo "CARGO_HOME=$GITHUB_WORKSPACE/.build/cargo-home"
