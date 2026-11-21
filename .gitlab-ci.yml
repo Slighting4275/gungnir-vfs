@@ -1,12 +1,26 @@
+spec:
+  inputs:
+    arch_snapshot:
+      description: >-
+        The Arch Linux Archive day pacman installs from (YYYY/MM/DD, the same day as the
+        pinned image below). Empty: the live mirrors, for when the archive is down; such a
+        run gets today's packages instead of the pinned ones.
+      default: "2026/11/08"
+      regex: '^(\d{4}/\d{2}/\d{2})?$'
+---
 # GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
 # Each job runs one `./check` subcommand (the gates of AGENTS.md §4 live there, once);
 # a job adds only its environment: the tester user, the skip opt-outs, root for
 # `./check cross-user`. All output stays under .build/ (AGENTS.md §3).
 #
 # Reproducible base: the archlinux image is pinned by tag AND digest, and pacman installs
-# from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT), so every run gets
-# the same packages. To move forward, bump both together (tags: hub.docker.com/_/archlinux).
-# Set ARCH_SNAPSHOT to "" (e.g. as a pipeline variable) to use the live mirrors instead.
+# from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT, from the input
+# arch_snapshot above), so every run gets the same packages. To move forward, bump both
+# together: the input's default and the image (tags: hub.docker.com/_/archlinux; take
+# the digest from the registry, `docker-content-digest` of the tag's index manifest).
+# The archive down: run a pipeline by hand (Build > Pipelines > New pipeline) with the
+# input arch_snapshot empty, to use the live mirrors instead. Pipeline variables cannot
+# be set by hand in this project, so this is an input.
 #
 # Zig is the current master tarball from ziglang.org, accepted only if its minisign
 # signature verifies against Zig's pinned public key, the signed trusted comment names
@@ -30,7 +44,7 @@ stages:
   - test
 
 variables:
-  ARCH_SNAPSHOT: "2026/10/18"
+  ARCH_SNAPSHOT: "$[[ inputs.arch_snapshot ]]"
   CARGO_HOME: "$CI_PROJECT_DIR/.build/cargo-home"
   CARGO_TERM_COLOR: "never"
   ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.build/zig-global-cache"
@@ -39,8 +53,8 @@ variables:
   ZIG_PUBKEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 
 default:
-  # archlinux:base-20261018.0.612668, pinned by digest (the tag alone can be re-pushed).
-  image: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+  # archlinux:base-20261108.0.623074, pinned by digest (the tag alone can be re-pushed).
+  image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
   interruptible: true
   # No `timeout:` here: GitLab accepts it under `default:` but never applies it (only a
   # job's own or extended `timeout:` counts; gitlab-org/gitlab#213634), so it is set in
