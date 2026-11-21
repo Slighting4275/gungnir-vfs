@@ -1,7 +1,9 @@
 //! DIR-A2-F01: a start refused after the bind (a TSYNC failure, or workers short of
 //! restricted rings, both injected by the test-hooks build) leaves no socket, releases
-//! the lock, and removes the store when that start created it; an existing store is
-//! kept and still opens.
+//! the lock, and removes the store when that start created it. Through the real binary
+//! on the io_uring engine with the real seccomp path: restricted rings are process-wide,
+//! so this cannot run in a test process. The rollback itself (fresh and existing store,
+//! a held store) is tested in process, `daemon::tests`.
 #![cfg(feature = "test-hooks")]
 
 use std::{
@@ -117,8 +119,10 @@ fn tree(dir: &Path) -> Vec<String> {
 
 const TSYNC: (&str, &str) = ("GUNGNIR_TEST_TSYNC_FAIL", "1");
 
-fn engines() -> [(&'static str, &'static str); 2] {
-    [("GUNGNIR_NO_URING", "0"), ("GUNGNIR_NO_URING", "1")]
+/// The io_uring engine only: the thread engine's refusal runs in process
+/// (`daemon::tests::a_refused_sandbox_leaves_nothing_behind`).
+fn engines() -> [(&'static str, &'static str); 1] {
+    [("GUNGNIR_NO_URING", "0")]
 }
 
 #[test]
@@ -135,34 +139,6 @@ fn a_refused_start_on_a_fresh_store_leaves_no_socket_and_no_store() -> R {
         // The lock is free: a normal start right after works.
         serves(&d, &[eng])?;
         assert!(d.0.join("data/gungnir/m.db").exists());
-    }
-    Ok(())
-}
-
-#[test]
-fn a_refused_start_on_an_existing_store_leaves_no_socket_and_keeps_the_store() -> R {
-    for eng in engines() {
-        let d = Dir::new("existing")?;
-        fs::create_dir(d.0.join("run"))?;
-        fs::set_permissions(d.0.join("run"), fs::Permissions::from_mode(0o700))?;
-        serves(&d, &[eng])?;
-        let db = d.0.join("data/gungnir/m.db");
-        let before = fs::read(&db)?;
-        let paths = tree(&d.0);
-        let (st, err) = refused(&d, &[eng, TSYNC])?;
-        assert!(!st.success(), "{eng:?}: {st}\n{err}");
-        assert!(
-            !d.0.join("run/s.sock").exists(),
-            "{eng:?}: socket left\n{err}"
-        );
-        let mut after = tree(&d.0);
-        after.retain(|p| !p.ends_with("-shm") && !p.ends_with("-wal"));
-        let mut want = paths.clone();
-        want.retain(|p| !p.ends_with("-shm") && !p.ends_with("-wal"));
-        assert_eq!(after, want, "{eng:?}\n{err}");
-        assert!(!err.contains("removed the store"), "{eng:?}\n{err}");
-        assert_eq!(fs::read(&db)?.len(), before.len(), "{eng:?}");
-        serves(&d, &[eng])?;
     }
     Ok(())
 }

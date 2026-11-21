@@ -548,4 +548,106 @@ mod tests {
         assert!(sandbox.seen.lock().unwrap().is_empty());
         Ok(())
     }
+
+    /// A start that serves until its idle timeout, then stops cleanly.
+    fn served(dir: &TestDir, sock: &str, db: &Path) -> Result<()> {
+        let listener = ipc::bind(&dir.join(sock))?;
+        let sandbox = Recording::default();
+        let cfg = StartConfig {
+            db_path: db.to_path_buf(),
+            no_uring: Some("1".into()),
+            idle_timeout: Some(Duration::from_millis(200)),
+            ..StartConfig::default()
+        };
+        run(&listener, &cfg, &ports(&sandbox))
+    }
+
+    /// Every path below `dir` but SQLite's journal files, relative and sorted.
+    fn tree(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
+                if !rel.ends_with("-wal") && !rel.ends_with("-shm") {
+                    out.push(rel);
+                }
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(base, &p, out);
+                }
+            }
+        }
+        let mut v = Vec::new();
+        walk(dir, dir, &mut v);
+        v.sort();
+        v
+    }
+
+    /// A start refused on a store an earlier start made keeps that store as it was
+    /// (FreshStore notes only what this start created) and leaves no socket.
+    #[test]
+    fn a_refused_start_on_an_existing_store_keeps_it() -> Result<()> {
+        let dir = TestDir::new("daemon-existing")?;
+        let db = dir.join("data/metadata.db");
+        served(&dir, "a.sock", &db)?;
+        let before = tree(dir.path());
+        assert!(before.iter().any(|p| p == "data/metadata.db"), "{before:?}");
+        let sock = dir.join("b.sock");
+        let listener = ipc::bind(&sock)?;
+        let sandbox = Recording {
+            refuse: true,
+            db: db.clone(),
+            ..Recording::default()
+        };
+        let cfg = StartConfig {
+            db_path: db.clone(),
+            seccomp: SeccompMode::Filter,
+            no_uring: Some("1".into()),
+            ..StartConfig::default()
+        };
+        assert!(run(&listener, &cfg, &ports(&sandbox)).is_err());
+        assert!(!sock.exists(), "no socket left");
+        drop(listener);
+        let mut after = tree(dir.path());
+        // The refused start's socket lock file stays, like after any stop.
+        after.retain(|p| p != "b.sock.lock");
+        assert_eq!(after, before, "the store is as it was");
+        Ok(())
+    }
+
+    /// DIR-C1-F02: a second daemon on another socket but the same store is refused before
+    /// it touches the store: the first daemon's temp ledger and its live temp files stay,
+    /// and no socket is left. Then, once the store is free, a start takes it again.
+    #[test]
+    fn a_held_store_is_refused_untouched_then_taken_once_free() -> Result<()> {
+        let dir = TestDir::new("daemon-held")?;
+        let db = dir.join("data/metadata.db");
+        served(&dir, "a.sock", &db)?;
+        // The first daemon, as far as the store can tell: its lock held, its ledger
+        // naming a temp file of an op still running.
+        let held = store::lock_store(&db, None)?;
+        let ledger = dir.join("data/ops-pending");
+        std::fs::create_dir(dir.join("dest"))?;
+        let live = dir.join("dest/.gungnir-00000000000000f2-0.tmp");
+        std::fs::write(&live, b"copy in progress")?;
+        let hex: String = dir
+            .join("dest/file")
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(&ledger, format!("S 00000000000000f2 {hex}\n"))?;
+
+        let sock = dir.join("b.sock");
+        let err = served(&dir, "b.sock", &db).err().map(|e| e.to_string());
+        let err = err.unwrap_or_default();
+        assert!(err.contains("already using the store"), "refused: {err}");
+        assert!(ledger.exists(), "the first daemon's ledger stays");
+        assert!(!dir.join("data/ops-pending.sweep").exists());
+        assert_eq!(std::fs::read(&live)?, b"copy in progress");
+        assert!(!sock.exists(), "the refused start left a socket");
+
+        drop(held);
+        served(&dir, "c.sock", &db)
+    }
 }
