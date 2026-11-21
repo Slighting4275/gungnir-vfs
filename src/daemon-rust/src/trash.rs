@@ -25,7 +25,10 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::MetadataExt,
+        },
     },
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard, TryLockError},
@@ -548,13 +551,6 @@ fn kind_of(st: &libc::stat) -> u8 {
     }
 }
 
-/// One item from its entry name.
-#[must_use]
-pub fn read_item(d: &TrashDir, entry: &[u8]) -> Item {
-    let (files, info) = (d.pin_files().ok(), d.pin(Some("info")).ok());
-    item_at(d, files.as_ref(), info.as_ref(), entry)
-}
-
 /// One item through a held pair.
 #[must_use]
 pub fn item_in(d: &TrashDir, pins: &Pins, entry: &[u8]) -> Item {
@@ -943,23 +939,12 @@ fn no_such_info(e: &io::Error) -> bool {
 }
 
 /// Check that the info entry of `entry` can be removed, before the payload is touched
-/// (BC-T005-F1): `info/` is writable, and what is there is removable. Absent is fine: the
-/// payload is an item of its own then. A non-empty directory there refuses.
+/// (BC-T005-F1): the held `info/` is writable, and what is there is removable. Absent is
+/// fine: the payload is an item of its own then. A non-empty directory there refuses.
 ///
 /// # Errors
 /// The errno that would stop the removal.
-pub fn check_info_removable(d: &TrashDir, entry: &[u8]) -> Result<(), i32> {
-    let dir = d
-        .pin(Some("info"))
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-    check_info_removable_at(&dir, entry)
-}
-
-/// [`check_info_removable`] in a held `info/`.
-///
-/// # Errors
-/// The errno that would stop the removal.
-pub fn check_info_removable_at(dir: &OwnedFd, entry: &[u8]) -> Result<(), i32> {
+fn check_info_removable_at(dir: &OwnedFd, entry: &[u8]) -> Result<(), i32> {
     let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
     // SAFETY: valid NUL-terminated path, and "." is the pinned directory itself.
     if unsafe { libc::faccessat(dir.as_raw_fd(), c".".as_ptr(), libc::W_OK | libc::X_OK, 0) } != 0 {
@@ -980,26 +965,12 @@ pub fn check_info_removable_at(dir: &OwnedFd, entry: &[u8]) -> Result<(), i32> {
     }
 }
 
-/// Remove the info entry and the item's `directorysizes` line, after the payload went.
+/// Remove the info entry and the item's `directorysizes` line, after the payload went, in
+/// the held `info/`: the entry checked is the entry removed.
 ///
 /// # Errors
 /// The removal failed; the payload is gone by then, and the error says so to the caller.
-pub fn remove_info(d: &TrashDir, entry: &[u8]) -> io::Result<()> {
-    let dir = d.pin(Some("info"));
-    match dir {
-        Ok(dir) => remove_info_at(d, &dir, entry),
-        Err(e) => {
-            let _ = drop_size_line(d, entry);
-            Err(e)
-        }
-    }
-}
-
-/// [`remove_info`] in a held `info/`: the entry checked is the entry removed.
-///
-/// # Errors
-/// See [`remove_info`].
-pub fn remove_info_at(d: &TrashDir, dir: &OwnedFd, entry: &[u8]) -> io::Result<()> {
+fn remove_info_at(d: &TrashDir, dir: &OwnedFd, entry: &[u8]) -> io::Result<()> {
     let r = (|| {
         let name = info_name(entry)?;
         match stat_at(dir.as_raw_fd(), &name) {
@@ -1013,6 +984,152 @@ pub fn remove_info_at(d: &TrashDir, dir: &OwnedFd, entry: &[u8]) -> io::Result<(
     // it is not worth reporting.
     let _ = drop_size_line(d, entry);
     r
+}
+
+/// A place an op works at, held open: a directory and a name in it. The op acts on that
+/// directory's entry, never on a path walked again, so it stays in the trash it checked.
+#[derive(Debug)]
+pub struct At {
+    pub dir: OwnedFd,
+    pub leaf: CString,
+}
+
+/// The payload step of an item's delete or restore, for the caller's op engine to run.
+#[derive(Debug)]
+pub enum Step {
+    /// Remove the payload, whatever it holds.
+    DeleteTree { src: Vec<u8>, src_at: At },
+    /// Move the payload to `dest`. `dest_at` is set when the destination is on the trash's
+    /// own volume, walked and checked from its top.
+    Move {
+        src: Vec<u8>,
+        src_at: At,
+        dest: Vec<u8>,
+        dest_at: Option<At>,
+    },
+}
+
+/// Why an item's delete or restore stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemError<E> {
+    /// A system error, before or after the payload step.
+    Os(i32),
+    /// No such item.
+    NotFound,
+    /// A destination with no single meaning.
+    BadRequest,
+    /// The payload step itself failed; the item is still listed.
+    Step(E),
+}
+
+fn os_of<E>(e: &io::Error) -> ItemError<E> {
+    ItemError::Os(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn at(dir: OwnedFd, leaf: &[u8]) -> Result<At, ()> {
+    Ok(At {
+        dir,
+        leaf: CString::new(leaf).map_err(|_| ())?,
+    })
+}
+
+/// An absolute path in its one canonical spelling: no empty, `.` or `..` component, no
+/// trailing slash, not `/` itself. What GIO sends (`g_file_get_path`) always is.
+fn canonical_abs(p: &[u8]) -> bool {
+    let Some(rest) = p.strip_prefix(b"/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split(|&b| b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..")
+}
+
+/// Delete one item. The info entry is checked before `run` touches the payload and
+/// removed after it is gone, all in one pinned pair of directories, so a failed delete
+/// leaves the item listed and retryable. A delete that leaves `files/` empty sweeps the
+/// orphans (real clients empty a trash item by item).
+///
+/// # Errors
+/// [`ItemError`]; `run`'s own error comes back as [`ItemError::Step`].
+pub fn delete<E>(
+    d: &TrashDir,
+    uid: u32,
+    entry: &[u8],
+    run: impl FnOnce(Step) -> Result<(), E>,
+) -> Result<(), ItemError<E>> {
+    if !sound(d, uid) {
+        return Err(ItemError::Os(libc::ENOTDIR));
+    }
+    let pins = d.pins().map_err(|e| os_of(&e))?;
+    check_info_removable_at(&pins.info, entry).map_err(ItemError::Os)?;
+    match stat_payload(&pins.files, entry) {
+        Ok(()) => {
+            let src = d.payload(entry).into_os_string().into_vec();
+            let src_at = at(pins.files, entry).map_err(|()| ItemError::BadRequest)?;
+            run(Step::DeleteTree { src, src_at }).map_err(ItemError::Step)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ItemError::NotFound),
+        Err(e) => return Err(os_of(&e)),
+    }
+    let r = remove_info_at(d, &pins.info, entry).map_err(|e| os_of(&e));
+    // An orphan that would not go is no failure of this delete: the next listing says so.
+    let _ = sweep_if_empty(d);
+    r
+}
+
+/// Restore one item to `dest`, or to where it came from when `dest` is empty. The same
+/// order as [`delete`]: info checked, payload moved by `run`, info removed.
+///
+/// The item's own path is foreign data even when a client sends it back (`g_file_move`
+/// always does, respelled): on a volume trash, a destination on that volume is walked
+/// from the volume's top component by component ([`restore_parent`]) and the move made
+/// there; only a destination elsewhere is the user's own choice.
+///
+/// # Errors
+/// [`ItemError`]; `run`'s own error comes back as [`ItemError::Step`].
+pub fn restore<E>(
+    d: &TrashDir,
+    uid: u32,
+    entry: &[u8],
+    dest: &[u8],
+    run: impl FnOnce(Step) -> Result<(), E>,
+) -> Result<(), ItemError<E>> {
+    if !sound(d, uid) {
+        return Err(ItemError::Os(libc::ENOTDIR));
+    }
+    let pins = d.pins().map_err(|e| os_of(&e))?;
+    let item = item_in(d, &pins, entry);
+    let inside = Path::new(OsStr::from_bytes(dest)).starts_with(&d.top);
+    let foreign = !d.home && (dest.is_empty() || inside);
+    let to = if dest.is_empty() {
+        item.orig
+    } else {
+        dest.to_vec()
+    };
+    // One spelling per place (SEC H-007): `inside` above is a lexical test, and a `..`
+    // could climb back onto the volume past it and its checks.
+    if !canonical_abs(&to) {
+        return Err(ItemError::BadRequest);
+    }
+    // The check is the descriptor: what was checked is where the file lands.
+    let dest_at = if foreign {
+        let parent = restore_parent(d, &to).ok_or(ItemError::Os(libc::EACCES))?;
+        let leaf = to.rsplit(|&b| b == b'/').next().unwrap_or_default();
+        Some(at(parent, leaf).map_err(|()| ItemError::BadRequest)?)
+    } else {
+        None
+    };
+    check_info_removable_at(&pins.info, entry).map_err(ItemError::Os)?;
+    let src_at = at(pins.files, entry).map_err(|()| ItemError::BadRequest)?;
+    run(Step::Move {
+        src: item.target,
+        src_at,
+        dest: to,
+        dest_at,
+    })
+    .map_err(ItemError::Step)?;
+    remove_info_at(d, &pins.info, entry).map_err(|e| os_of(&e))
 }
 
 /// `m`, within `wait`.
@@ -1155,6 +1272,52 @@ mod tests {
         }
     }
 
+    fn me() -> u32 {
+        // SAFETY: plain getter.
+        unsafe { libc::geteuid() }
+    }
+
+    /// What the op engine would do with a step, done in place, recorded in `log`.
+    fn engine(log: &std::cell::RefCell<Vec<String>>) -> impl FnOnce(Step) -> Result<(), i32> {
+        move |s| {
+            match s {
+                Step::DeleteTree { src_at, .. } => {
+                    let p = fd_path(&src_at.dir).join(OsStr::from_bytes(src_at.leaf.as_bytes()));
+                    log.borrow_mut()
+                        .push(format!("delete {}", src_at.leaf.to_string_lossy()));
+                    if p.is_dir() {
+                        fs::remove_dir_all(p)
+                    } else {
+                        fs::remove_file(p)
+                    }
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                }
+                Step::Move {
+                    src_at,
+                    dest,
+                    dest_at,
+                    ..
+                } => {
+                    let from = fd_path(&src_at.dir).join(OsStr::from_bytes(src_at.leaf.as_bytes()));
+                    let to = match &dest_at {
+                        Some(a) => fd_path(&a.dir).join(OsStr::from_bytes(a.leaf.as_bytes())),
+                        None => PathBuf::from(OsStr::from_bytes(&dest)),
+                    };
+                    log.borrow_mut().push(format!("move {}", dest_at.is_some()));
+                    fs::rename(from, to).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn untouched(log: &std::cell::RefCell<Vec<String>>) -> impl FnOnce(Step) -> Result<(), i32> {
+        move |s| {
+            log.borrow_mut().push(format!("{s:?}"));
+            Ok(())
+        }
+    }
+
     fn item(d: &TrashDir, e: &str, path: &str) {
         fs::write(d.files().join(e), b"data").unwrap();
         let text = format!("[Trash Info]\nPath={path}\nDeletionDate=2026-10-31T10:00:00\n");
@@ -1272,13 +1435,114 @@ mod tests {
     fn a_directory_at_the_info_path_is_checked_before_the_payload() {
         let t = T::new("infodir");
         let d = t.trash();
+        fs::write(d.files().join("e"), b"data").unwrap();
         fs::create_dir(d.info().join("e.trashinfo")).unwrap();
-        assert_eq!(check_info_removable(&d, b"e"), Ok(()));
         fs::write(d.info().join("e.trashinfo/x"), b"x").unwrap();
-        assert_eq!(check_info_removable(&d, b"e"), Err(libc::ENOTEMPTY));
+        let log = std::cell::RefCell::default();
+        assert_eq!(
+            delete(&d, me(), b"e", untouched(&log)),
+            Err(ItemError::Os(libc::ENOTEMPTY))
+        );
+        assert!(log.borrow().is_empty(), "the payload was never handed on");
+        assert!(d.files().join("e").exists());
         fs::remove_file(d.info().join("e.trashinfo/x")).unwrap();
-        remove_info(&d, b"e").unwrap();
+        delete(&d, me(), b"e", engine(&log)).unwrap();
         assert!(!d.info().join("e.trashinfo").exists());
+        assert!(!d.files().join("e").exists());
+    }
+
+    /// The order of a delete: info checked, payload removed, info removed last. A failed
+    /// payload step leaves the item listed and retryable.
+    #[test]
+    fn a_failed_delete_keeps_the_item() {
+        let t = T::new("del-fail");
+        let d = t.trash();
+        item(&d, "a", "/x/a");
+        let r = delete(&d, me(), b"a", |_| Err(libc::EIO));
+        assert_eq!(r, Err(ItemError::Step(libc::EIO)));
+        assert!(d.info().join("a.trashinfo").exists());
+        assert_eq!(scan(&d).unwrap().len(), 1, "still listed");
+        let log = std::cell::RefCell::default();
+        delete(&d, me(), b"a", engine(&log)).unwrap();
+        assert_eq!(*log.borrow(), ["delete a"]);
+        assert!(scan(&d).unwrap().is_empty());
+        assert!(!d.info().join("a.trashinfo").exists());
+    }
+
+    #[test]
+    fn deleting_a_missing_payload_is_not_found() {
+        let t = T::new("del-missing");
+        let d = t.trash();
+        let log = std::cell::RefCell::default();
+        assert_eq!(
+            delete(&d, me(), b"nope", untouched(&log)),
+            Err(ItemError::NotFound)
+        );
+        assert!(log.borrow().is_empty());
+    }
+
+    /// The home trash restores to the original path through the engine's own walk; the
+    /// info goes only once the payload has moved.
+    #[test]
+    fn a_home_item_is_restored_to_its_path() {
+        let t = T::new("restore-home");
+        let d = t.trash();
+        // A restore takes only canonical paths, and the scratch base has a `..` in it.
+        let back = fs::canonicalize(&t.0).unwrap().join("back");
+        item(&d, "r", back.to_str().unwrap());
+        let log = std::cell::RefCell::default();
+        restore(&d, me(), b"r", b"", engine(&log)).unwrap();
+        assert_eq!(*log.borrow(), ["move false"]);
+        assert_eq!(fs::read(&back).unwrap(), b"data");
+        assert!(!d.info().join("r.trashinfo").exists());
+    }
+
+    /// On a volume, a destination on that volume is walked from its top: the step gets a
+    /// held parent, never a path to walk again.
+    #[test]
+    fn a_volume_item_is_restored_through_a_held_parent() {
+        let t = T::new("restore-vol");
+        let top = fs::canonicalize(&t.0).unwrap();
+        let d = TrashDir {
+            dir: top.join(".Trash-1"),
+            top,
+            home: false,
+        };
+        fs::create_dir_all(d.files()).unwrap();
+        fs::create_dir_all(d.info()).unwrap();
+        fs::create_dir(t.0.join("dir")).unwrap();
+        item(&d, "v", "dir/v");
+        let log = std::cell::RefCell::default();
+        restore(&d, me(), b"v", b"", engine(&log)).unwrap();
+        assert_eq!(*log.borrow(), ["move true"]);
+        assert_eq!(fs::read(t.0.join("dir/v")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn a_restore_destination_has_one_spelling() {
+        let t = T::new("restore-spell");
+        let d = t.trash();
+        item(&d, "s", "/x/s");
+        let log = std::cell::RefCell::default();
+        for bad in [&b"/a/../b"[..], b"rel", b"/a/", b"/", b"/a//b"] {
+            assert_eq!(
+                restore(&d, me(), b"s", bad, untouched(&log)),
+                Err(ItemError::BadRequest)
+            );
+        }
+        assert!(log.borrow().is_empty());
+        assert!(d.info().join("s.trashinfo").exists());
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_item() {
+        let t = T::new("restore-fail");
+        let d = t.trash();
+        item(&d, "f", "/x/f");
+        let r = restore(&d, me(), b"f", b"", |_| Err(libc::EXDEV));
+        assert_eq!(r, Err(ItemError::Step(libc::EXDEV)));
+        assert!(d.info().join("f.trashinfo").exists());
+        assert!(d.files().join("f").exists());
     }
 
     #[test]
@@ -1390,8 +1654,14 @@ mod tests {
         fs::write(&bait, b"precious").unwrap();
         fs::rename(d.info(), t.0.join("old")).unwrap();
         symlink(&other, d.info()).unwrap();
-        assert!(remove_info(&d, b"x").is_err());
-        assert_eq!(check_info_removable(&d, b"x"), Err(libc::ENOTDIR));
+        fs::write(d.files().join("x"), b"x").unwrap();
+        let log = std::cell::RefCell::default();
+        assert!(matches!(
+            delete(&d, me(), b"x", untouched(&log)),
+            Err(ItemError::Os(_))
+        ));
+        assert!(log.borrow().is_empty());
+        assert!(d.files().join("x").exists());
         assert_eq!(remove_orphans(&d), 0);
         assert!(bait.exists());
     }
@@ -1627,7 +1897,8 @@ mod tests {
         let t = T::new("link-item");
         let d = t.trash();
         symlink("/some/where", d.files().join("l")).unwrap();
-        assert_eq!(read_item(&d, b"l").link, b"/some/where");
+        let pins = d.pins().unwrap();
+        assert_eq!(item_in(&d, &pins, b"l").link, b"/some/where");
     }
 
     /// Another device right below a root is found; the same device and skips are not.
@@ -1779,7 +2050,10 @@ mod tests {
         let t = T::new("sizes");
         let d = t.trash();
         fs::write(d.dir.join("directorysizes"), b"1 2 a%20b\n3 4 c\n").unwrap();
-        remove_info(&d, b"a b").unwrap();
+        fs::write(d.dir.join("files/c"), b"c").unwrap();
+        item(&d, "a b", "/x/a b");
+        let log = std::cell::RefCell::default();
+        delete(&d, me(), b"a b", engine(&log)).unwrap();
         assert_eq!(fs::read(d.dir.join("directorysizes")).unwrap(), b"3 4 c\n");
     }
 }

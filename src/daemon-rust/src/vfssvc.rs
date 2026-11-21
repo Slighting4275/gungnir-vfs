@@ -22,12 +22,9 @@
 //! remain, else 4 (suspect mount) naming the skipped volumes.
 
 use std::{
-    ffi::{CString, OsStr},
+    ffi::OsStr,
     fs,
-    os::{
-        fd::OwnedFd,
-        unix::ffi::{OsStrExt, OsStringExt},
-    },
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, PoisonError,
@@ -39,6 +36,7 @@ use std::{
 
 use crate::{
     btrfs,
+    fsid::{self, MountEntry},
     ipc::{Handler, Msg, PAYLOAD_MAX, Port, Session},
     md::{
         MSG_MD_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT,
@@ -212,6 +210,46 @@ impl Wait {
     }
 }
 
+/// Everything the service takes from its surroundings, read once.
+pub struct SvcConfig {
+    /// `$XDG_DATA_HOME`, where the home trash and the recent list live.
+    pub xdg_data: Option<std::ffi::OsString>,
+    /// `$HOME`, whose subvolumes hold trash as well.
+    pub home: Option<std::ffi::OsString>,
+    /// Whose trash directories these are.
+    pub uid: u32,
+    /// Volumes beyond the mount table.
+    pub extra_tops: Vec<PathBuf>,
+    /// Search the host's btrfs mounts for subvolumes.
+    pub host_subvols: bool,
+    pub mounts: Box<dyn MountTable>,
+}
+
+impl SvcConfig {
+    /// The daemon's: the environment, its euid, procfs. In `test-hooks` builds
+    /// [`TEST_TOP_ENV`] adds a volume, and the host's btrfs mounts are left alone so a
+    /// test daemon keeps to its own volumes.
+    #[must_use]
+    pub fn from_env() -> Self {
+        #[cfg(feature = "test-hooks")]
+        let extra_tops = std::env::var_os(TEST_TOP_ENV)
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        #[cfg(not(feature = "test-hooks"))]
+        let extra_tops = Vec::new();
+        Self {
+            xdg_data: std::env::var_os("XDG_DATA_HOME"),
+            home: std::env::var_os("HOME"),
+            // SAFETY: plain getter.
+            uid: unsafe { libc::geteuid() },
+            extra_tops,
+            host_subvols: cfg!(not(feature = "test-hooks")),
+            mounts: Box::new(ProcMounts),
+        }
+    }
+}
+
 /// What the service works on.
 pub struct Svc {
     ops: Arc<Ops>,
@@ -225,6 +263,7 @@ pub struct Svc {
     host_subvols: bool,
     /// Volumes beyond the mount table (the test hook).
     extra_tops: Vec<PathBuf>,
+    mounts: Box<dyn MountTable>,
     in_flight: AtomicUsize,
     /// Every running job: when it started, and whether it has ended.
     jobs: Mutex<Vec<(Instant, Arc<AtomicBool>)>>,
@@ -248,21 +287,33 @@ const NO_TRASH_TYPES: [&str; 13] = [
     "mqueue",
 ];
 
-/// Mount points of a `/proc/self/mountinfo` text that could hold a trash directory.
-fn mount_points(text: &str) -> Vec<PathBuf> {
+/// Where the service reads the mount table: procfs in the daemon, a fixture in tests.
+pub trait MountTable: Send + Sync {
+    /// The table as it is now.
+    ///
+    /// # Errors
+    /// It could not be read; a listing then says it may be incomplete.
+    fn read(&self) -> std::io::Result<Vec<MountEntry>>;
+}
+
+/// `/proc/self/mountinfo`, read as bytes: a mount point is any bytes, not UTF-8.
+pub struct ProcMounts;
+
+impl MountTable for ProcMounts {
+    fn read(&self) -> std::io::Result<Vec<MountEntry>> {
+        Ok(fsid::parse_mountinfo(&fs::read("/proc/self/mountinfo")?))
+    }
+}
+
+fn is_type(e: &MountEntry, names: &[&str]) -> bool {
+    names.iter().any(|n| n.as_bytes() == e.fstype.as_slice())
+}
+
+/// Mount points of a mount table that could hold a trash directory.
+fn mount_points(table: &[MountEntry]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for line in text.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let Some(raw) = left.split(' ').nth(4) else {
-            continue;
-        };
-        let fstype = right.split(' ').next().unwrap_or("");
-        if NO_TRASH_TYPES.contains(&fstype) {
-            continue;
-        }
-        let p = PathBuf::from(std::ffi::OsString::from_vec(unescape(raw.as_bytes())));
+    for e in table.iter().filter(|e| !is_type(e, &NO_TRASH_TYPES)) {
+        let p = e.mount_point_path();
         if !out.contains(&p) {
             out.push(p);
         }
@@ -278,21 +329,14 @@ fn mount_of<'a>(tops: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
         .max_by_key(|t| t.components().count())
 }
 
-/// The mount points of a `/proc/self/mountinfo` text whose topmost mount is FUSE: a FUSE
-/// mount found gone has lost its server for good (a remount is a new mount), so it can
-/// hold no trash anyone can reach again.
-fn fuse_mounts(text: &str) -> Vec<PathBuf> {
+/// The mount points of a mount table whose topmost mount is FUSE: a FUSE mount found
+/// gone has lost its server for good (a remount is a new mount), so it can hold no trash
+/// anyone can reach again.
+fn fuse_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
     let mut top: Vec<(PathBuf, bool)> = Vec::new();
-    for line in text.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let Some(raw) = left.split(' ').nth(4) else {
-            continue;
-        };
-        let fstype = right.split(' ').next().unwrap_or("");
-        let fuse = fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.");
-        let p = PathBuf::from(std::ffi::OsString::from_vec(unescape(raw.as_bytes())));
+    for e in table {
+        let fuse = is_type(e, &["fuse", "fuseblk"]) || e.fstype.starts_with(b"fuse.");
+        let p = e.mount_point_path();
         // A later line mounted over the same point: it is what the path reaches now.
         top.retain(|(q, _)| *q != p);
         top.push((p, fuse));
@@ -303,41 +347,14 @@ fn fuse_mounts(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The mount points of a `/proc/self/mountinfo` text that are btrfs: opening anything
-/// else to find out would touch mounts that may hang.
-fn btrfs_mounts(text: &str) -> Vec<PathBuf> {
+/// The mount points of a mount table that are btrfs: opening anything else to find out
+/// would touch mounts that may hang.
+fn btrfs_mounts(table: &[MountEntry]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for line in text.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        if right.split(' ').next() != Some("btrfs") {
-            continue;
-        }
-        if let Some(raw) = left.split(' ').nth(4) {
-            let p = PathBuf::from(std::ffi::OsString::from_vec(unescape(raw.as_bytes())));
-            if !out.contains(&p) {
-                out.push(p);
-            }
-        }
-    }
-    out
-}
-
-/// mountinfo's octal escapes.
-fn unescape(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'\\'
-            && let Some(o) = s.get(i + 1..i + 4)
-            && let Ok(v) = u8::from_str_radix(std::str::from_utf8(o).unwrap_or("x"), 8)
-        {
-            out.push(v);
-            i += 4;
-        } else {
-            out.push(s[i]);
-            i += 1;
+    for e in table.iter().filter(|e| is_type(e, &["btrfs"])) {
+        let p = e.mount_point_path();
+        if !out.contains(&p) {
+            out.push(p);
         }
     }
     out
@@ -369,30 +386,23 @@ impl Svc {
         )
     }
 
-    /// A service with paths from the environment's values.
+    /// A service over `ops`, as `cfg` says.
     #[must_use]
-    pub fn new(ops: Arc<Ops>, xdg_data: Option<&OsStr>, home: Option<&OsStr>) -> Arc<Self> {
-        let trash_home = trash::home_dir(xdg_data, home);
+    pub fn new(ops: Arc<Ops>, cfg: SvcConfig) -> Arc<Self> {
+        let trash_home = trash::home_dir(cfg.xdg_data.as_deref(), cfg.home.as_deref());
         let xbel = trash_home
             .as_ref()
             .map(|d| d.top.join("recently-used.xbel"));
-        #[cfg(feature = "test-hooks")]
-        let extra_tops = std::env::var_os(TEST_TOP_ENV)
-            .map(PathBuf::from)
-            .into_iter()
-            .collect();
-        #[cfg(not(feature = "test-hooks"))]
-        let extra_tops = Vec::new();
         Arc::new(Self {
             ops,
             home: trash_home,
-            home_root: home.map(PathBuf::from),
+            home_root: cfg.home.map(PathBuf::from),
             subvols: Arc::default(),
-            host_subvols: cfg!(not(feature = "test-hooks")),
+            host_subvols: cfg.host_subvols,
             xbel,
-            // SAFETY: plain getter.
-            uid: unsafe { libc::geteuid() },
-            extra_tops,
+            uid: cfg.uid,
+            extra_tops: cfg.extra_tops,
+            mounts: cfg.mounts,
             in_flight: AtomicUsize::new(0),
             jobs: Mutex::new(Vec::new()),
             draining: AtomicBool::new(false),
@@ -480,7 +490,12 @@ impl Svc {
                 dirs.push(h.clone());
             }
         }
-        let table = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        // A table that cannot be read hides every volume: the listing says it may not be
+        // all, never that the volumes have no trash.
+        let (table, readable) = match self.mounts.read() {
+            Ok(t) => (t, true),
+            Err(_) => (Vec::new(), false),
+        };
         let mut tops = mount_points(&table);
         tops.extend(self.extra_tops.iter().cloned());
         let mut roots = if self.host_subvols {
@@ -540,7 +555,7 @@ impl Svc {
         Dirs {
             dirs,
             skipped,
-            complete,
+            complete: complete && readable,
         }
     }
 
@@ -719,38 +734,9 @@ impl Svc {
         }
     }
 
-    /// Delete one item: the info entry is checked first and removed last, so a failure
-    /// leaves it listed and retryable.
+    /// Delete one item ([`trash::delete`]), its payload through the M8 engine.
     fn delete_item(&self, d: &TrashDir, entry: &[u8], ctx: &Ctx) -> Result<(), Failure> {
-        if !trash::sound(d, self.uid) {
-            return Err(Failure::os(libc::ENOTDIR));
-        }
-        let pins = d.pins().map_err(|e| io_failure(&e))?;
-        trash::check_info_removable_at(&pins.info, entry).map_err(Failure::os)?;
-        let payload = d.files().join(OsStr::from_bytes(entry));
-        match trash::stat_payload(&pins.files, entry) {
-            Ok(()) => self.run(
-                OpRequest {
-                    kind: OpKind::DeleteTree,
-                    flags: 0,
-                    timeout_ms: 0,
-                    src: payload.as_os_str().as_bytes().to_vec(),
-                    dest: Vec::new(),
-                    src_at: Some(anchor(pins.files, entry)?),
-                    dest_at: None,
-                },
-                ctx,
-            )?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Failure::st(ST_NOT_FOUND));
-            }
-            Err(e) => return Err(io_failure(&e)),
-        }
-        let r = trash::remove_info_at(d, &pins.info, entry).map_err(|e| io_failure(&e));
-        // Real clients empty a trash by deleting its items one by one. An orphan that would
-        // not go is no failure of this delete: the next listing says so.
-        let _ = trash::sweep_if_empty(d);
-        r
+        trash::delete(d, self.uid, entry, |s| self.run(op_request(s), ctx)).map_err(item_failure)
     }
 
     fn delete(&self, scheme: u8, name: &[u8], ctx: &Ctx) -> Result<(), Failure> {
@@ -780,49 +766,10 @@ impl Svc {
     fn restore(&self, name: &[u8], dest: &[u8], ctx: &Ctx) -> Result<(), Failure> {
         let found = self.dirs();
         let (d, entry) = trash::resolve(&found.dirs, name).ok_or_else(|| self.unresolved(name))?;
-        if !trash::sound(d, self.uid) {
-            return Err(Failure::os(libc::ENOTDIR));
-        }
-        let pins = d.pins().map_err(|e| io_failure(&e))?;
-        let item = trash::item_in(d, &pins, &entry);
-        // The item's own path is foreign data even when a client sends it back, and
-        // g_file_move always does, respelled. Anything landing on the volume goes through
-        // the volume's own checks; only a destination elsewhere is the user's own choice.
-        let inside = Path::new(OsStr::from_bytes(dest)).starts_with(&d.top);
-        let foreign = !d.home && (dest.is_empty() || inside);
-        let to = if dest.is_empty() {
-            item.orig
-        } else {
-            dest.to_vec()
-        };
-        // One spelling per place (SEC H-007): `inside` above is a lexical test, and a
-        // `..` could climb back onto the volume past it and its checks.
-        if !canonical_abs(&to) {
-            return Err(Failure::st(ST_BAD_REQUEST));
-        }
-        // The check is the descriptor: what was checked is where the file lands.
-        let dest_at = if foreign {
-            let parent = trash::restore_parent(d, &to).ok_or(Failure::os(libc::EACCES))?;
-            let leaf = to.rsplit(|&b| b == b'/').next().unwrap_or_default();
-            Some(anchor(parent, leaf)?)
-        } else {
-            None
-        };
-        trash::check_info_removable_at(&pins.info, &entry).map_err(Failure::os)?;
-        self.run(
-            OpRequest {
-                kind: OpKind::Move,
-                flags: 0,
-                timeout_ms: 0,
-                src: item.target,
-                dest: to,
-                src_at: Some(anchor(pins.files, &entry)?),
-                dest_at,
-            },
-            ctx,
-        )
-        .map_err(restore_failure)?;
-        trash::remove_info_at(d, &pins.info, &entry).map_err(|e| io_failure(&e))
+        trash::restore(d, self.uid, &entry, dest, |s| {
+            self.run(op_request(s), ctx).map_err(restore_failure)
+        })
+        .map_err(item_failure)
     }
 
     /// Empty what can be reached. Returns the reply status and body.
@@ -895,16 +842,46 @@ impl Svc {
     }
 }
 
-/// An absolute path in its one canonical spelling: no empty, `.` or `..` component, no
-/// trailing slash, not `/` itself. What GIO sends (`g_file_get_path`) always is.
-fn canonical_abs(p: &[u8]) -> bool {
-    let Some(rest) = p.strip_prefix(b"/") else {
-        return false;
+/// A trash step as the M8 engine's request; the held places are set only by the daemon.
+fn op_request(s: trash::Step) -> OpRequest {
+    let anchor = |a: trash::At| Anchor {
+        dir: Arc::new(a.dir),
+        leaf: a.leaf,
     };
-    !rest.is_empty()
-        && rest
-            .split(|&b| b == b'/')
-            .all(|c| !c.is_empty() && c != b"." && c != b"..")
+    match s {
+        trash::Step::DeleteTree { src, src_at } => OpRequest {
+            kind: OpKind::DeleteTree,
+            flags: 0,
+            timeout_ms: 0,
+            src,
+            dest: Vec::new(),
+            src_at: Some(anchor(src_at)),
+            dest_at: None,
+        },
+        trash::Step::Move {
+            src,
+            src_at,
+            dest,
+            dest_at,
+        } => OpRequest {
+            kind: OpKind::Move,
+            flags: 0,
+            timeout_ms: 0,
+            src,
+            dest,
+            src_at: Some(anchor(src_at)),
+            dest_at: dest_at.map(anchor),
+        },
+    }
+}
+
+fn item_failure(e: trash::ItemError<Failure>) -> Failure {
+    match e {
+        trash::ItemError::Os(errno) => Failure::os(errno),
+        trash::ItemError::NotFound => Failure::st(ST_NOT_FOUND),
+        trash::ItemError::BadRequest => Failure::st(ST_BAD_REQUEST),
+        trash::ItemError::Step(f) => f,
+    }
 }
 
 /// Nothing in a restore is a mount in an item to unmount: say what it is.
@@ -939,14 +916,6 @@ fn missing_or(e: &std::io::Error) -> Failure {
     } else {
         io_failure(e)
     }
-}
-
-/// `leaf` under the held-open `dir`.
-fn anchor(dir: OwnedFd, leaf: &[u8]) -> Result<Anchor, Failure> {
-    Ok(Anchor {
-        dir: Arc::new(dir),
-        leaf: CString::new(leaf).map_err(|_| Failure::st(ST_BAD_REQUEST))?,
-    })
 }
 
 /// What an empty reports: never success while anything may remain.
@@ -1305,7 +1274,7 @@ mod tests {
             4 1 0:4 / /mnt/x rw - fuse dead rw\n\
             5 4 0:5 / /mnt/x rw - ext4 /dev/sdb1 rw\n\
             6 1 0:6 / /m\\040n rw - fuseblk /dev/sdc1 rw\n";
-        let got = fuse_mounts(table);
+        let got = fuse_mounts(&fsid::parse_mountinfo(table.as_bytes()));
         assert_eq!(
             got,
             [
@@ -1334,7 +1303,7 @@ mod tests {
                      37 1 0:33 / /mnt/my\\040disk rw shared:1 - btrfs /dev/b rw\n\
                      38 1 0:34 / /mnt/nfs rw - nfs4 s:/x rw\n";
         assert_eq!(
-            btrfs_mounts(table),
+            btrfs_mounts(&fsid::parse_mountinfo(table.as_bytes())),
             vec![PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
         );
     }
@@ -1354,17 +1323,8 @@ mod tests {
     /// A search stuck under a hung mount holds nobody up, and says it is not complete.
     #[test]
     fn a_stuck_subvolume_search_costs_only_itself() {
-        use crate::ops::{NoGate, NoMeta, OpsConfig, io::EngineKind};
-        let ops = Arc::new(
-            Ops::start(
-                OpsConfig::default(),
-                EngineKind::Threads,
-                Arc::new(NoGate),
-                Arc::new(NoMeta),
-            )
-            .unwrap(),
-        );
-        let svc = Svc::new(ops, None, None);
+        let t = Dir::new("stuck-subvols");
+        let svc = svc(&t.0.join("home"), Fixture(Some(Vec::new())));
         {
             let mut g = svc.subvols.0.lock().unwrap();
             g.done = Some((
@@ -1514,8 +1474,104 @@ mod tests {
                  24 22 0:23 / /mnt/my\\040disk rw shared:1 - vfat /dev/sdb1 rw\n\
                  garbage line\n";
         assert_eq!(
-            mount_points(t),
+            mount_points(&fsid::parse_mountinfo(t.as_bytes())),
             [PathBuf::from("/"), PathBuf::from("/mnt/my disk")]
         );
+    }
+
+    /// A fixed mount table, or a table that cannot be read.
+    struct Fixture(Option<Vec<u8>>);
+
+    impl MountTable for Fixture {
+        fn read(&self) -> std::io::Result<Vec<MountEntry>> {
+            self.0
+                .as_deref()
+                .map(fsid::parse_mountinfo)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EACCES))
+        }
+    }
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.build/tmp")
+                .join(format!("vs-{tag}-{}-{n}", std::process::id()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn me() -> u32 {
+        // SAFETY: plain getter.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A service over a scratch home and the given mount table, no daemon, no socket.
+    fn svc(home: &Path, mounts: Fixture) -> Arc<Svc> {
+        let ops = Ops::start(
+            crate::ops::OpsConfig::default(),
+            crate::ops::io::EngineKind::Threads,
+            Arc::new(crate::ops::NoGate),
+            Arc::new(crate::ops::NoMeta),
+        )
+        .expect("ops");
+        Svc::new(
+            Arc::new(ops),
+            SvcConfig {
+                xdg_data: Some(home.join("data").into_os_string()),
+                home: Some(home.as_os_str().to_owned()),
+                uid: me(),
+                extra_tops: Vec::new(),
+                host_subvols: false,
+                mounts: Box::new(mounts),
+            },
+        )
+    }
+
+    fn table_line(mnt: &[u8]) -> Vec<u8> {
+        let mut l = b"30 1 0:99 / ".to_vec();
+        l.extend_from_slice(mnt);
+        l.extend_from_slice(b" rw - ext4 /dev/x rw\n");
+        l
+    }
+
+    /// One mount point that is not UTF-8 must not hide the others: their trash is still
+    /// listed (the old text parser read the whole table as a string and lost it all).
+    #[test]
+    fn a_non_utf8_mount_point_hides_no_volume() {
+        let t = Dir::new("nonutf8");
+        let vol = t.0.join("vol");
+        fs::create_dir_all(vol.join(format!(".Trash-{}/files", me()))).unwrap();
+        fs::create_dir_all(vol.join(format!(".Trash-{}/info", me()))).unwrap();
+        let mut table = table_line(b"/mnt/caf\xe9");
+        table.extend(table_line(vol.as_os_str().as_bytes()));
+        let s = svc(&t.0.join("home"), Fixture(Some(table)));
+        let found = s.dirs_as_of(false);
+        assert!(
+            found.dirs.iter().any(|d| d.top == vol),
+            "the volume trash is listed: {:?}",
+            found.dirs
+        );
+        assert!(found.complete);
+    }
+
+    /// A table that cannot be read gives a listing that says it may not be everything.
+    #[test]
+    fn an_unreadable_mount_table_is_no_complete_listing() {
+        let t = Dir::new("notable");
+        let s = svc(&t.0.join("home"), Fixture(None));
+        assert!(!s.dirs_as_of(false).complete);
+        let (_, partial) = s.snapshot_trash();
+        assert!(partial);
     }
 }
