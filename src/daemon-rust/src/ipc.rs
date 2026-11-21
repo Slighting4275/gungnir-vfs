@@ -1077,14 +1077,10 @@ pub fn remember_startup_exe() {
     }
 }
 
-fn upgrade_exe() -> io::Result<PathBuf> {
-    #[cfg(feature = "test-hooks")]
-    if let Some(p) = env::var_os(UPGRADE_EXE_ENV) {
-        eprintln!(
-            "gungnird: TEST HOOK: live upgrade re-execs {}",
-            Path::new(&p).display()
-        );
-        return Ok(PathBuf::from(p));
+fn upgrade_exe(instead: Option<&Path>) -> io::Result<PathBuf> {
+    // Only a test-hooks build is ever handed one ([`crate::hooks::Hooks::upgrade_exe`]).
+    if let Some(p) = instead {
+        return Ok(p.to_path_buf());
     }
     match STARTUP_EXE.get() {
         Some(p) => Ok(p.clone()),
@@ -1105,11 +1101,17 @@ fn cstring(b: &[u8]) -> io::Result<CString> {
 /// go into its own environment block, never into this process's environment (which
 /// other threads read). The caller keeps serving (BC-HC-F02).
 ///
+/// `exe` replaces the binary the daemon started from (the test hook only).
+///
 /// # Errors
 /// Always, when it returns: why the socket could not be prepared or `execve` failed.
-pub fn perform_live_upgrade(listener: &Listener, store_lock: Option<RawFd>) -> Result<()> {
+pub fn perform_live_upgrade(
+    listener: &Listener,
+    store_lock: Option<RawFd>,
+    exe: Option<&Path>,
+) -> Result<()> {
     const SD_LISTEN_FDS_START: i32 = 3;
-    let exe = upgrade_exe()?;
+    let exe = upgrade_exe(exe)?;
     let c_exe = cstring(exe.as_os_str().as_bytes())?;
     let args = env::args_os()
         .map(|a| cstring(a.as_bytes()))

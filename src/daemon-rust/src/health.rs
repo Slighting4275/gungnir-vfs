@@ -1253,27 +1253,12 @@ impl Session for HealthSession {
 // ---------------------------------------------------------------------------------------
 // Test hook: a fake hung mount, for the integration tests of the GIO module
 
-/// Mount points from [`FAKE_HUNG_ENV`] (one absolute path) in `test-hooks` builds;
-/// otherwise empty, with a warning if the variable is set.
-#[must_use]
-pub fn fake_hung_from_env() -> Vec<Vec<u8>> {
-    let Some(v) = std::env::var_os(FAKE_HUNG_ENV) else {
-        return Vec::new();
-    };
-    // A compile-time gate (not `cfg!`): without the feature none of the hook's code or
-    // strings are in the binary, whatever the environment says.
-    #[cfg(not(feature = "test-hooks"))]
-    {
-        drop(v);
-        eprintln!("gungnird: {FAKE_HUNG_ENV} ignored (built without the test-hooks feature)");
-        Vec::new()
-    }
-    #[cfg(feature = "test-hooks")]
-    fake_hung_path(v)
-}
-
+/// The fake mount [`FAKE_HUNG_ENV`] names (one absolute path below `/`), read by
+/// [`crate::hooks::Hooks`]. A compile-time gate (not `cfg!`): without the feature none of
+/// the hook's code or strings are in the binary, whatever the environment says.
 #[cfg(feature = "test-hooks")]
-fn fake_hung_path(v: std::ffi::OsString) -> Vec<Vec<u8>> {
+#[must_use]
+pub fn fake_hung_path(v: std::ffi::OsString) -> Vec<Vec<u8>> {
     let p = lexical(&std::os::unix::ffi::OsStringExt::into_vec(v));
     if p == b"/" {
         eprintln!("gungnird: {FAKE_HUNG_ENV} must name a directory below /");

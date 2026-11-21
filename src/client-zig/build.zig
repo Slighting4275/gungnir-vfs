@@ -15,25 +15,9 @@ pub fn build(b: *std.Build) void {
     translate.linkSystemLibrary("gio-2.0", .{}); // include paths + link flags via pkg-config
     const c_mod = translate.createModule();
 
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mod.addImport("c", c_mod);
-    mod.linkSystemLibrary("gio-2.0", .{});
-    // The wire protocol table both sides test against (proto.zig, and the daemon's proto.rs).
-    mod.addAnonymousImport("wire.txt", .{ .root_source_file = b.path("../../protocol/wire.txt") });
-
-    const lib = b.addLibrary(.{
-        .name = "giogungnir", // -> libgiogungnir.so
-        .linkage = .dynamic,
-        .root_module = mod,
-    });
-    // No C sources are compiled, so the UBSan runtime is dead weight; bundling it
-    // also exports ~34 weak __ubsan_handle_* symbols from a library dlopen()ed into GTK hosts.
-    lib.bundle_ubsan_rt = false;
+    // The shipped library: no test hooks compiled in.
+    const mod = moduleOf(b, target, optimize, c_mod, false);
+    const lib = libraryOf(b, mod);
     b.installArtifact(lib);
 
     const unit_tests = b.addTest(.{ .root_module = mod });
@@ -53,8 +37,11 @@ pub fn build(b: *std.Build) void {
     });
     itest_exe.root_module.linkSystemLibrary("gio-2.0", .{});
     itest_exe.bundle_ubsan_rt = false;
+    // The integration test loads its own copy, built with the test hooks (vfsfile.zig's
+    // read deadline); it is never installed.
+    const hooks_lib = libraryOf(b, moduleOf(b, target, optimize, c_mod, true));
     const module_dir = b.addWriteFiles();
-    _ = module_dir.addCopyFile(lib.getEmittedBin(), "libgiogungnir.so");
+    _ = module_dir.addCopyFile(hooks_lib.getEmittedBin(), "libgiogungnir.so");
 
     // Sockets and test databases live in the repo's .build/tmp (AGENTS.md §3), each itest
     // run in a fresh private (0700) directory of its own that itest.zig creates there.
@@ -106,4 +93,34 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit.step);
     test_step.dependOn(itest);
+}
+
+/// The GIO module's root module; `test_hooks` compiles in the integration test's hooks.
+fn moduleOf(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, c_mod: *std.Build.Module, test_hooks: bool) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("c", c_mod);
+    mod.linkSystemLibrary("gio-2.0", .{});
+    // The wire protocol table both sides test against (proto.zig, and the daemon's proto.rs).
+    mod.addAnonymousImport("wire.txt", .{ .root_source_file = b.path("../../protocol/wire.txt") });
+    const options = b.addOptions();
+    options.addOption(bool, "test_hooks", test_hooks);
+    mod.addOptions("build_options", options);
+    return mod;
+}
+
+fn libraryOf(b: *std.Build, mod: *std.Build.Module) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .name = "giogungnir", // -> libgiogungnir.so
+        .linkage = .dynamic,
+        .root_module = mod,
+    });
+    // No C sources are compiled, so the UBSan runtime is dead weight; bundling it
+    // also exports ~34 weak __ubsan_handle_* symbols from a library dlopen()ed into GTK hosts.
+    lib.bundle_ubsan_rt = false;
+    return lib;
 }

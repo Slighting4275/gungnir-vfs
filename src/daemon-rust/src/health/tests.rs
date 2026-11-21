@@ -831,8 +831,7 @@ fn fake_hung_mounts_need_the_feature() {
     let e = fake_entries(&[b"/x/y".to_vec()]);
     assert_eq!(e[0].mnt_id, u64::MAX - 1);
     assert!(is_probed(&e[0].fstype));
-    // Not set in the test environment: nothing.
-    if std::env::var_os(FAKE_HUNG_ENV).is_none() {
-        assert!(fake_hung_from_env().is_empty());
-    }
+    // Without the feature the variable is ignored, whatever it says.
+    let h = crate::hooks::Hooks::from_vars(|k| (k == FAKE_HUNG_ENV).then(|| "/x/y".into()));
+    assert_eq!(h.fake_hung.is_empty(), cfg!(not(feature = "test-hooks")));
 }

@@ -211,18 +211,12 @@ pub struct SvcConfig {
 }
 
 impl SvcConfig {
-    /// The daemon's: the environment, its euid, procfs. In `test-hooks` builds
-    /// [`TEST_TOP_ENV`] adds a volume, and the host's btrfs mounts are left alone so a
-    /// test daemon keeps to its own volumes.
+    /// The daemon's: the environment, its euid, procfs, and the volume the
+    /// [`TEST_TOP_ENV`] hook adds. A `test-hooks` build leaves the host's btrfs mounts
+    /// alone so a test daemon keeps to its own volumes.
     #[must_use]
-    pub fn from_env() -> Self {
-        #[cfg(feature = "test-hooks")]
-        let extra_tops = std::env::var_os(TEST_TOP_ENV)
-            .map(PathBuf::from)
-            .into_iter()
-            .collect();
-        #[cfg(not(feature = "test-hooks"))]
-        let extra_tops = Vec::new();
+    pub fn from_env(hooks: &crate::hooks::Hooks) -> Self {
+        let extra_tops = hooks.trash_top.iter().cloned().collect();
         Self {
             xdg_data: std::env::var_os("XDG_DATA_HOME"),
             home: std::env::var_os("HOME"),

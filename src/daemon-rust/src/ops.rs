@@ -685,6 +685,9 @@ pub struct OpsConfig {
     /// Tests: skip FICLONE / copy_file_range, to exercise the read/write path.
     pub no_clone: bool,
     pub no_cfr: bool,
+    /// Test hook: the first worker with an op loses its ring, and the sandbox's ring
+    /// pool holds only the first workers' rings ([`Self::sandbox_rings`]).
+    pub ring_loss: bool,
 }
 
 impl Default for OpsConfig {
@@ -709,49 +712,44 @@ impl Default for OpsConfig {
             fsync_delay: Duration::ZERO,
             no_clone: false,
             no_cfr: false,
+            ring_loss: false,
         }
     }
 }
 
 impl OpsConfig {
-    /// The defaults plus the test hook from the environment (`test-hooks` builds).
+    /// This configuration with what the test hooks ask of file ops (nothing, outside
+    /// `test-hooks` builds: [`crate::hooks::Hooks`] is then the default).
     #[must_use]
-    pub fn from_env() -> Self {
-        #[cfg(feature = "test-hooks")]
-        let mut cfg = Self::default();
-        #[cfg(not(feature = "test-hooks"))]
-        let cfg = Self::default();
-
-        #[cfg(feature = "test-hooks")]
-        if let Some(v) = std::env::var_os(SLOW_OPS_ENV) {
-            let ms = v.to_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            eprintln!("gungnird: TEST HOOK: file ops sleep {ms} ms per chunk");
-            cfg.slow = Duration::from_millis(ms);
+    pub fn with_hooks(mut self, h: &crate::hooks::Hooks) -> Self {
+        if let Some(slow) = h.slow_ops {
+            self.slow = slow;
             // A reflink has no chunks to slow down: on btrfs a "slow" copy would finish at
             // once and tests that interrupt it would find nothing left to stop.
-            cfg.no_clone = true;
+            self.no_clone = true;
         }
-        #[cfg(not(feature = "test-hooks"))]
-        if std::env::var_os(SLOW_OPS_ENV).is_some() {
-            eprintln!("gungnird: {SLOW_OPS_ENV} ignored (built without the test-hooks feature)");
-        }
-        #[cfg(feature = "test-hooks")]
-        if std::env::var_os(RING_LOSS_ENV).is_some() {
-            eprintln!("gungnird: TEST HOOK: the first worker with an op loses its ring");
-            RING_LOSS.store(true, Ordering::SeqCst);
-        }
-        #[cfg(feature = "test-hooks")]
-        if let Some(v) = std::env::var_os(PAUSE_AT_ENV) {
-            cfg.pause_at = v.to_str().and_then(PausePoint::parse);
-            eprintln!("gungnird: TEST HOOK: file ops pause at {:?}", cfg.pause_at);
+        if let Some(p) = h.pause_at {
+            self.pause_at = Some(p);
             // A reflink finishes in one call: mid-copy needs the chunked path.
-            cfg.no_clone = true;
+            self.no_clone = true;
         }
-        #[cfg(not(feature = "test-hooks"))]
-        if std::env::var_os(PAUSE_AT_ENV).is_some() {
-            eprintln!("gungnird: {PAUSE_AT_ENV} ignored (built without the test-hooks feature)");
+        self.ring_loss = h.ring_loss;
+        self
+    }
+
+    /// Restricted io_uring rings to create before a sandbox goes in (the filter then
+    /// refuses `io_uring_setup`, BC-A2-F01): twice the workers covers replacements of
+    /// stuck ones, and [`io::GRAVEYARD_MAX`] more cover the rings still waiting for the
+    /// kernel. With the ring-loss hook, only the first workers' (an exhausted pool on
+    /// demand, A2-MGR-03).
+    #[must_use]
+    pub fn sandbox_rings(&self) -> usize {
+        let workers = self.workers.max(1);
+        if cfg!(feature = "test-hooks") && self.ring_loss {
+            workers
+        } else {
+            workers * 2 + io::GRAVEYARD_MAX
         }
-        cfg
     }
 }
 
@@ -824,6 +822,10 @@ impl Ops {
         meta: Arc<dyn MetaHooks>,
     ) -> std::io::Result<Self> {
         let workers = cfg.workers.max(1);
+        #[cfg(feature = "test-hooks")]
+        if cfg.ring_loss {
+            RING_LOSS.store(true, Ordering::SeqCst);
+        }
         let sh = Arc::new(Shared {
             cfg,
             engine,

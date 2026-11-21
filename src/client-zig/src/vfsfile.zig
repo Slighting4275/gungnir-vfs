@@ -19,6 +19,7 @@ const ipc = @import("ipc.zig");
 const md = @import("md.zig");
 const proto = @import("proto.zig");
 const gioerr = @import("gioerr.zig");
+const build_options = @import("build_options");
 
 const msg_list = proto.msg_vfs_list;
 const msg_delete = proto.msg_vfs_delete;
@@ -1233,10 +1234,14 @@ fn boundedStream(inner: [*c]c.GFileInputStream, err: [*c][*c]c.GError) [*c]c.GFi
     const s: *GungnirStream = @ptrCast(@alignCast(raw));
     s.timeout_us = stream_timeout_us;
     s.seekable = c.g_seekable_can_seek(@ptrCast(@alignCast(inner)));
-    if (envValue("GUNGNIR_TEST_READ_TIMEOUT_MS")) |v| {
-        if (std.fmt.parseInt(i64, v, 10)) |ms| {
-            s.timeout_us = std.math.clamp(ms, 1, 3_600_000) * std.time.us_per_ms;
-        } else |_| {}
+    // Test hook, compiled in only for the integration test's copy of the module (build
+    // option `test_hooks`): the shipped library never reads it.
+    if (build_options.test_hooks) {
+        if (envValue("GUNGNIR_TEST_READ_TIMEOUT_MS")) |v| {
+            if (std.fmt.parseInt(i64, v, 10)) |ms| {
+                s.timeout_us = std.math.clamp(ms, 1, 3_600_000) * std.time.us_per_ms;
+            } else |_| {}
+        }
     }
     const j: *StreamIo = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(StreamIo))));
     j.* = .{ .inner = inner, .buf = @ptrCast(c.g_malloc(stream_chunk)) };

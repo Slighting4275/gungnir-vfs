@@ -254,6 +254,12 @@ zig:build:
       echo "exported: $syms"
       test "$syms" = "g_io_module_load g_io_module_query g_io_module_unload "
     - |
+      # The installed module never carries the itest's hooks (build option test_hooks).
+      if grep -a -q 'GUNGNIR_TEST_' .build/zig-out/lib/libgiogungnir.so; then
+        echo "installed libgiogungnir.so contains a test hook" >&2
+        exit 1
+      fi
+    - |
       rm -rf .build/gio-querymodules && mkdir -p .build/gio-querymodules
       cp .build/zig-out/lib/libgiogungnir.so .build/gio-querymodules/
       gio-querymodules .build/gio-querymodules

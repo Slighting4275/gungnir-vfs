@@ -3,6 +3,7 @@ use std::{fmt, io, path::PathBuf};
 pub mod btrfs;
 pub mod fsid;
 pub mod health;
+pub mod hooks;
 pub mod ipc;
 pub mod md;
 pub mod mdsvc;

@@ -4,6 +4,7 @@ use gungnird::{
     Error, Result,
     fsid::{Resolver, ResolverConfig, SysBackend},
     health::{self, FakeHung, Gated, HealthConfig, HealthService, Monitor, StatfsProber},
+    hooks::Hooks,
     ipc, mdsvc,
     ops::{self, Ops, OpsConfig},
     opsvc::{DbMeta, MonitorGate, OpsService},
@@ -194,6 +195,7 @@ fn run() -> Result<()> {
     // after the threads exist, so it cannot be checked before the bind.
     let mut fresh = FreshStore::default();
     let mut store_lock = None;
+    let hooks = Hooks::from_env();
     let r = serve_daemon(
         &listener,
         opts.db_path,
@@ -202,6 +204,7 @@ fn run() -> Result<()> {
         &mut fresh,
         &mut store_lock,
         carried_store_lock,
+        &hooks,
     );
     if r.is_err() {
         listener.cleanup();
@@ -215,6 +218,7 @@ fn run() -> Result<()> {
 }
 
 /// Steps 2 to 7 of [`run`], after the bind.
+#[allow(clippy::too_many_arguments)]
 fn serve_daemon(
     listener: &ipc::Listener,
     db_path: Option<PathBuf>,
@@ -223,6 +227,7 @@ fn serve_daemon(
     fresh: &mut FreshStore,
     store_lock: &mut Option<store::StoreLock>,
     carried_store_lock: Option<std::os::fd::RawFd>,
+    hooks: &Hooks,
 ) -> Result<()> {
     // 2. Open metadata database in WAL mode, as the only daemon on it (DIR-C1-F02): the
     // store lock comes before anything reads or writes the store, its temp ledger
@@ -245,7 +250,7 @@ fn serve_daemon(
     eprintln!("gungnird: metadata db ready at {}", db_path.display());
 
     // 3. Mount health (milestone 7)
-    let fake = health::fake_hung_from_env();
+    let fake = hooks.fake_hung.clone();
     let monitor = Monitor::start(
         HealthConfig::default(),
         Arc::new(FakeHung::new(StatfsProber, fake.clone())),
@@ -264,30 +269,23 @@ fn serve_daemon(
         .or_else(seccomp_from_env)
         .unwrap_or(SeccompMode::Disabled);
     let (mut engine, why) = ops::choose_engine(env::var_os(ops::NO_URING_ENV).as_deref());
-    let ops_cfg = OpsConfig::from_env();
+    let ops_cfg = OpsConfig::default().with_hooks(hooks);
     let workers = ops_cfg.workers.max(1);
     // The filter refuses io_uring_setup. Every worker ring, the first workers' included,
     // is created and restricted here, before Ops::start spawns them: a worker creating
-    // its own ring raced the filter install and fell back to syscalls (BC-A2-F01).
-    // Twice the workers covers replacements of stuck ones; GRAVEYARD_MAX more cover the
-    // rings still waiting for the kernel. If the rings cannot be made, every worker uses
-    // the thread engine, said once here (D-044 item 1), never a per-worker mix.
-    if seccomp_mode != SeccompMode::Disabled && engine == ops::io::EngineKind::Uring {
-        let n = workers * 2 + ops::io::GRAVEYARD_MAX;
-        // An exhausted pool on demand, for the refusal path (A2-MGR-03).
-        #[cfg(feature = "test-hooks")]
-        let n = if env::var_os(ops::RING_LOSS_ENV).is_some() {
-            workers
-        } else {
-            n
-        };
-        if let Err(e) = ops::io::prepare_sandbox_rings(n) {
-            eprintln!(
-                "gungnird: restricted io_uring rings for the sandbox failed ({e}): \
-                 thread engine for every worker"
-            );
-            engine = ops::io::EngineKind::Threads;
-        }
+    // its own ring raced the filter install and fell back to syscalls (BC-A2-F01). How
+    // many is the engine's own knowledge (OpsConfig::sandbox_rings). If the rings cannot
+    // be made, every worker uses the thread engine, said once here (D-044 item 1), never
+    // a per-worker mix.
+    if seccomp_mode != SeccompMode::Disabled
+        && engine == ops::io::EngineKind::Uring
+        && let Err(e) = ops::io::prepare_sandbox_rings(ops_cfg.sandbox_rings())
+    {
+        eprintln!(
+            "gungnird: restricted io_uring rings for the sandbox failed ({e}): \
+             thread engine for every worker"
+        );
+        engine = ops::io::EngineKind::Threads;
     }
     eprintln!("gungnird: file ops engine: {engine:?} ({why})");
     let ops = Arc::new(Ops::start(
@@ -300,9 +298,8 @@ fn serve_daemon(
         // Every first worker has its ring before the filter goes in; a worker on plain
         // syscalls under a uring engine would be a silent fallback: refuse to start.
         let (made, uring) = ops.wait_workers_ready(workers, Duration::from_secs(5));
-        #[cfg(feature = "test-hooks")]
-        let uring = if env::var_os("GUNGNIR_TEST_MIXED_RINGS").is_some() {
-            // Fault injection for the mixed-engine refusal (DIR-A2-F01).
+        // Fault injection for the mixed-engine refusal (DIR-A2-F01).
+        let uring = if hooks.mixed_rings {
             uring.saturating_sub(1)
         } else {
             uring
@@ -319,7 +316,7 @@ fn serve_daemon(
     }
 
     // 5. Wire handlers
-    let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::from_env());
+    let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::from_env(hooks));
     let ops_for_ledger = Arc::clone(&ops);
     let services: Vec<Arc<dyn ipc::Service>> = vec![
         Arc::new(vfssvc::VfsService::new(vfs)),
@@ -334,7 +331,7 @@ fn serve_daemon(
     // Milestone 12: Apply Seccomp BPF Sandbox
     if seccomp_mode != SeccompMode::Disabled {
         eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
-        seccomp::apply_sandbox(seccomp_mode)?;
+        seccomp::apply_sandbox_with(seccomp_mode, hooks.tsync_fail)?;
     }
     // From here the store is in use: an error no longer removes it.
     *fresh = FreshStore::default();
@@ -395,7 +392,7 @@ fn serve_daemon(
                     "gungnird: signal {sig} received; live upgrade under seccomp: \
                      draining, then exiting for the service manager to start the new binary"
                 );
-                let cut = drain(handler.as_ref());
+                let cut = drain(handler.as_ref(), hooks.drain.unwrap_or(UPGRADE_DRAIN_MAX));
                 if let Err(e) = db.flush_and_checkpoint() {
                     eprintln!("gungnird: database checkpoint before upgrade exit failed: {e}");
                 }
@@ -414,7 +411,9 @@ fn serve_daemon(
                     eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
                 }
                 let store_fd = store_lock.as_ref().map(store::StoreLock::fd);
-                if let Err(e) = ipc::perform_live_upgrade(listener, store_fd) {
+                if let Err(e) =
+                    ipc::perform_live_upgrade(listener, store_fd, hooks.upgrade_exe.as_deref())
+                {
                     eprintln!("gungnird: live upgrade failed, still serving: {e}");
                 }
             }
@@ -510,31 +509,17 @@ const UPGRADE_DRAIN_MAX: Duration = Duration::from_secs(30);
 /// How long cancelled ops get to remove their temp files and report before the exit.
 const CANCEL_WAIT: Duration = Duration::from_secs(2);
 
-/// The drain bound: [`UPGRADE_DRAIN_MAX`], or `GUNGNIR_TEST_DRAIN_MS` in a test-hooks
-/// build.
-fn drain_max() -> Duration {
-    #[cfg(feature = "test-hooks")]
-    if let Some(ms) = env::var("GUNGNIR_TEST_DRAIN_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        eprintln!("gungnird: TEST HOOK: drain bound {ms} ms");
-        return Duration::from_millis(ms);
-    }
-    UPGRADE_DRAIN_MAX
-}
-
 /// Drain before an upgrade exit (D-044 item 2, BC-A2-F03): new ops are refused at once
-/// (a); running ones get until the bound to finish (b), and a SIGTERM or SIGINT ends
-/// the wait early (c). Whatever still runs then is cancelled: each op removes its temp
-/// file and sends its Cancelled done event, within [`CANCEL_WAIT`]. Returns why the
-/// exit is not clean (ops cancelled, or still stuck after the cancel), or None.
-fn drain(handler: &dyn ipc::Handler) -> Option<String> {
+/// (a); running ones get until `max` to finish (b, [`UPGRADE_DRAIN_MAX`] unless the
+/// drain hook says otherwise), and a SIGTERM or SIGINT ends the wait early (c). Whatever
+/// still runs then is cancelled: each op removes its temp file and sends its Cancelled
+/// done event, within [`CANCEL_WAIT`]. Returns why the exit is not clean (ops
+/// cancelled, or still stuck after the cancel), or None.
+fn drain(handler: &dyn ipc::Handler, max: Duration) -> Option<String> {
     handler.begin_drain();
     let stop = ipc::stop_signal_fd()
         .map_err(|e| eprintln!("gungnird: no stop signal during the drain: {e}"))
         .ok();
-    let max = drain_max();
     let t0 = std::time::Instant::now();
     let mut stopped = None;
     while handler.is_busy() && t0.elapsed() < max && stopped.is_none() {

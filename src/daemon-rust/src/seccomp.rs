@@ -627,7 +627,22 @@ fn tsync_result(ret: libc::c_long, err: io::Error) -> io::Result<()> {
 }
 
 /// Apply the seccomp BPF sandbox to the current process.
+///
+/// # Errors
+/// See [`apply_sandbox_with`].
 pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
+    apply_sandbox_with(mode, false)
+}
+
+/// [`apply_sandbox`], failing as if the kernel had no TSYNC when `fail_tsync` is set in a
+/// `test-hooks` build (the refusal path's fault injection, DIR-A2-F01); other builds
+/// ignore it.
+///
+/// # Errors
+/// The filter could not be built or installed on every thread.
+pub fn apply_sandbox_with(mode: SeccompMode, fail_tsync: bool) -> io::Result<()> {
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = fail_tsync;
     if mode == SeccompMode::Disabled {
         return Ok(());
     }
@@ -669,7 +684,7 @@ pub fn apply_sandbox(mode: SeccompMode) -> io::Result<()> {
     // its workers, monitor and DB threads exist. No single-thread fallback: if any thread
     // cannot be synchronized, or the kernel lacks TSYNC, fail closed (SEC-R-011).
     #[cfg(feature = "test-hooks")]
-    if std::env::var_os("GUNGNIR_TEST_TSYNC_FAIL").is_some() {
+    if fail_tsync {
         // Fault injection for the refusal path (DIR-A2-F01): as if TSYNC were missing.
         return tsync_result(-1, io::Error::from_raw_os_error(libc::EINVAL));
     }
