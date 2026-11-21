@@ -4,10 +4,9 @@
 # same pinned archlinux image, from the same Arch Linux Archive day (./check rules keeps
 # both in step with .gitlab-ci.yml).
 #
-# Runs on every push to the mirror and by hand (Actions > CI > Run workflow), where
-# `mirrors: live` installs from the live Arch mirrors instead of the archive (for when
-# archive.archlinux.org is down; that run gets the day's packages, not the pinned ones)
-# and `perf: true` adds the 50k-event benchmark.
+# Runs on pushes to the mirror if GitLab has no visible successful pipeline for
+# the commit. An unavailable archive switches the whole run to live Arch mirrors.
+# Manual runs always check on GitHub, can choose the mirror, and can add the benchmark.
 
 name: CI
 
@@ -16,10 +15,10 @@ on:
   workflow_dispatch:
     inputs:
       mirrors:
-        description: "archive: the pinned Arch Linux Archive day; live: today's mirrors"
+        description: "auto: use live mirrors if the pinned archive is unavailable"
         type: choice
-        options: [archive, live]
-        default: archive
+        options: [auto, archive, live]
+        default: auto
       perf:
         description: "Also run the 50k-event benchmark (./check perf)"
         type: boolean
@@ -39,26 +38,64 @@ env:
   CARGO_TERM_COLOR: "never"
   GUNGNIR_ALLOW_MISSING: "1"
 
-# Every job: the pinned image (defined at rust-lint), as root. Docker's default seccomp profile refuses
-# io_uring_setup, and the io_uring engine tests must run in CI (D-061: ./check requires
-# io_uring whenever CI is set), so the container runs without it.
+# Every build/test job uses the pinned Arch image. Test containers need io_uring
+# (blocked by Docker's default seccomp profile) and private test mounts (blocked
+# by docker-default AppArmor). These jobs run on disposable GitHub-hosted VMs.
 jobs:
+  route:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      provider: ${{ steps.provider.outputs.provider }}
+      snapshot: ${{ steps.archive.outputs.snapshot }}
+    steps:
+      - id: provider
+        env:
+          GITLAB_PROJECT_ID: '87989401'
+        run: |
+          pipeline=$(curl -fsS --connect-timeout 5 --max-time 15 \
+            "https://gitlab.com/api/v4/projects/$GITLAB_PROJECT_ID/pipelines?sha=$GITHUB_SHA&per_page=20" |
+            jq -r --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" '
+              first(.[] | select(.sha == $sha and
+                ((.source == "push" and .ref == $ref) or .source == "merge_request_event"))) |
+              select(.status == "success") | .web_url') || pipeline=
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ -n "$pipeline" ]; then
+            echo 'provider=gitlab' >>"$GITHUB_OUTPUT"
+            printf 'GitLab CI passed for %s: %s\n' "$GITHUB_SHA" "$pipeline" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo 'provider=github' >>"$GITHUB_OUTPUT"
+            printf 'Running CI on GitHub for %s.\n' "$GITHUB_SHA" >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.provider.outputs.provider == 'github'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: archive
+        if: steps.provider.outputs.provider == 'github'
+        env:
+          MIRROR_MODE: ${{ inputs.mirrors || 'auto' }}
+        run: tools/ci-archive "$ARCH_SNAPSHOT_PINNED" "$MIRROR_MODE"
+
   rust-lint:
+    needs: route
+    if: needs.route.outputs.provider == 'github'
     runs-on: ubuntu-24.04
     # archlinux:base-20261108.0.623074, pinned by digest (the tag alone can be re-pushed).
     container: &container
-      image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
-      options: --security-opt seccomp=unconfined
+      image: &arch-image archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
     timeout-minutes: 20
     steps:
       - &checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - &env
         name: Job environment
+        env:
+          SNAPSHOT: ${{ needs.route.outputs.snapshot }}
         run: |
-          if [ "${{ inputs.mirrors }}" = live ]; then snap=; else snap=$ARCH_SNAPSHOT_PINNED; fi
           {
-            echo "ARCH_SNAPSHOT=$snap"
+            echo "ARCH_SNAPSHOT=$SNAPSHOT"
             echo "CARGO_HOME=$GITHUB_WORKSPACE/.build/cargo-home"
             echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.build/zig-global-cache"
           } >>"$GITHUB_ENV"
@@ -76,6 +113,8 @@ jobs:
       - run: ./check rust-static
 
   zig-lint:
+    needs: route
+    if: needs.route.outputs.provider == 'github'
     runs-on: ubuntu-24.04
     container: *container
     timeout-minutes: 20
@@ -90,7 +129,7 @@ jobs:
 
   # Only this job saves the cargo cache; every other job only restores it.
   rust-build:
-    needs: rust-lint
+    needs: [route, rust-lint]
     runs-on: ubuntu-24.04
     container: *container
     timeout-minutes: 20
@@ -107,7 +146,7 @@ jobs:
           path: *cargo-paths
 
   zig-build:
-    needs: zig-lint
+    needs: [route, zig-lint]
     runs-on: ubuntu-24.04
     container: *container
     timeout-minutes: 20
@@ -121,9 +160,11 @@ jobs:
 
   # The tests run as the unprivileged `tester` (tools/ci-setup tester says why).
   rust-test:
-    needs: rust-build
+    needs: [route, rust-build]
     runs-on: ubuntu-24.04
-    container: *container
+    container: &test-container
+      image: *arch-image
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/fuse
     timeout-minutes: 25
     steps:
       - *checkout
@@ -137,9 +178,9 @@ jobs:
   # The test-hooks build's tests, then the cross-user tests again as root, which drops to
   # `nobody` for its second user: no opt-out, they must run or fail.
   rust-test-hooks:
-    needs: rust-build
+    needs: [route, rust-build]
     runs-on: ubuntu-24.04
-    container: *container
+    container: *test-container
     timeout-minutes: 25
     steps:
       - *checkout
@@ -154,9 +195,9 @@ jobs:
 
   # The thread-pool fallback engine, forced (D-048, RC-F022).
   rust-test-no-uring:
-    needs: rust-build
+    needs: [route, rust-build]
     runs-on: ubuntu-24.04
-    container: *container
+    container: *test-container
     timeout-minutes: 25
     steps:
       - *checkout
@@ -170,9 +211,9 @@ jobs:
   # GitLab hands rust:build's gungnird to this job as an artifact; here it is rebuilt
   # (incrementally, from the restored cache) before the itest checks it carries no hook.
   zig-test:
-    needs: [zig-build, rust-build]
+    needs: [route, zig-build, rust-build]
     runs-on: ubuntu-24.04
-    container: *container
+    container: *test-container
     timeout-minutes: 25
     steps:
       - *checkout
@@ -188,9 +229,9 @@ jobs:
   # noisy (D-055); when it runs, a missed SLO fails the run.
   rust-perf:
     if: github.event_name == 'workflow_dispatch' && inputs.perf
-    needs: rust-build
+    needs: [route, rust-build]
     runs-on: ubuntu-24.04
-    container: *container
+    container: *test-container
     timeout-minutes: 25
     steps:
       - *checkout
