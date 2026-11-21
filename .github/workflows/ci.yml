@@ -40,7 +40,8 @@ env:
 
 # Every build/test job uses the pinned Arch image. Test containers need io_uring
 # (blocked by Docker's default seccomp profile) and private test mounts (blocked
-# by docker-default AppArmor). These jobs run on disposable GitHub-hosted VMs.
+# by docker-default AppArmor). The test host uses Ubuntu 22.04 because Ubuntu
+# 24.04 also restricts capabilities within unprivileged user namespaces.
 jobs:
   route:
     runs-on: ubuntu-24.04
@@ -164,7 +165,7 @@ jobs:
   # The tests run as the unprivileged `tester` (tools/ci-setup tester says why).
   rust-test:
     needs: [route, rust-build]
-    runs-on: ubuntu-24.04
+    runs-on: &test-runner ubuntu-22.04
     container: &test-container
       image: *arch-image
       options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/fuse
@@ -182,7 +183,7 @@ jobs:
   # `nobody` for its second user: no opt-out, they must run or fail.
   rust-test-hooks:
     needs: [route, rust-build]
-    runs-on: ubuntu-24.04
+    runs-on: *test-runner
     container: *test-container
     timeout-minutes: 25
     steps:
@@ -199,7 +200,7 @@ jobs:
   # The thread-pool fallback engine, forced (D-048, RC-F022).
   rust-test-no-uring:
     needs: [route, rust-build]
-    runs-on: ubuntu-24.04
+    runs-on: *test-runner
     container: *test-container
     timeout-minutes: 25
     steps:
@@ -215,7 +216,7 @@ jobs:
   # (incrementally, from the restored cache) before the itest checks it carries no hook.
   zig-test:
     needs: [route, zig-build, rust-build]
-    runs-on: ubuntu-24.04
+    runs-on: *test-runner
     container: *test-container
     timeout-minutes: 25
     steps:
@@ -233,7 +234,7 @@ jobs:
   rust-perf:
     if: github.event_name == 'workflow_dispatch' && inputs.perf
     needs: [route, rust-build]
-    runs-on: ubuntu-24.04
+    runs-on: *test-runner
     container: *test-container
     timeout-minutes: 25
     steps:
