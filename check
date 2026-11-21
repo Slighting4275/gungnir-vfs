@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# The project's gate: what CI runs (AGENTS.md §4), in one command, quiet on success.
+#   ./check              everything: static checks, then cargo test (default, test-hooks,
+#                        GUNGNIR_NO_URING=1), then ./zb test
+#   ./check --fast       static checks only (fmt, clippy both feature sets, -D warnings
+#                        check, zig fmt + ast-check, rules): seconds; the pre-commit hook
+#   ./check rules        the grep rules only (CI's rust:lint runs these)
+#   ./check --snapshot [--fast]
+#                        copy the working tree (uncommitted changes included) to
+#                        .build/snapshot and run there, so editing can go on meanwhile.
+#                        The copy keeps its own build cache: later runs are incremental.
+#   ./check --install-hook
+#                        point this clone's git hooks at .githooks (pre-commit: --fast)
+# Each gate prints one line, "ok <gate>" or "FAIL <gate>" followed by the lines that
+# matter (for ./zb test: the Build Summary and real errors, not Zig's "failed command"
+# echo of every step that wrote to stderr). Exit status: number of failed gates.
+root=$(cd "$(dirname "$0")" && pwd) || exit 1
+cd "$root" || exit 1
+mkdir -p .build/check
+failed=0
+
+gate() { # gate <name> <command...>: run quietly, keep the log, report one line
+    local name=$1 log=".build/check/${1//[^a-zA-Z0-9]/-}.log"
+    shift
+    if "$@" >"$log" 2>&1; then
+        echo "ok   $name"
+    else
+        echo "FAIL $name (full log: $log)"
+        # The lines that say why; a log without compiler-style lines is shown whole.
+        local why
+        why=$(grep -E '^(error|warning)|panicked|FAILED|^test result: F|^---- ' "$log" | head -40)
+        if [ -n "$why" ]; then echo "$why"; else tail -40 "$log"; fi
+        failed=$((failed + 1))
+    fi
+}
+
+zig_test() { # ./zb test, judged by its Build Summary, not by "failed command" lines
+    local log=.build/check/zig-test.log
+    ./zb test --summary all >"$log" 2>&1
+    local st=$?
+    local summary
+    summary=$(grep -E '^Build Summary' "$log")
+    if [ $st -eq 0 ]; then
+        echo "ok   zig test: ${summary#Build Summary: }"
+    else
+        echo "FAIL zig test (full log: $log): ${summary#Build Summary: }"
+        grep -E 'error:|^error|panicked|expected .* found|failed with' "$log" | grep -v '^failed command' | head -40
+        failed=$((failed + 1))
+    fi
+}
+
+rules() { # mechanical rules that lint cannot express; each prints offending lines
+    local bad=0 hits
+    # Protocol numbers live only in proto.rs / proto.zig (protocol/wire.txt tests both).
+    hits=$(grep -rnE '^\s*pub const (MSG|ST)_[A-Z0-9_]+: u(8|16|32) = [0-9]' src/daemon-rust/src \
+        --include='*.rs' | grep -v '^src/daemon-rust/src/proto\.rs:')
+    hits+=$(grep -rnE '^\s*(pub )?const (msg|st)_[a-z0-9_]+: u(8|16|32) = [0-9]' src/client-zig/src \
+        --include='*.zig' | grep -vE '^src/client-zig/src/(proto|itest)\.zig:')
+    if [ -n "$hits" ]; then
+        echo "protocol numbers outside proto.rs/proto.zig (define them there, re-export):"
+        echo "$hits"
+        bad=1
+    fi
+    # Test hooks are read only by hooks::Hooks (testenv in lib.rs reads its own knobs).
+    hits=$(grep -rnE 'env::var(_os)?\([^)]*(GUNGNIR_TEST_|FAKE_HUNG_ENV|SLOW_OPS_ENV|PAUSE_AT_ENV|RING_LOSS_ENV|MIXED_RINGS_ENV|DRAIN_MS_ENV|TSYNC_FAIL_ENV|UPGRADE_EXE_ENV|TEST_TOP_ENV)' \
+        src/daemon-rust/src --include='*.rs' |
+        grep -vE '^src/daemon-rust/src/(hooks|lib)\.rs:|/tests\.rs:')
+    if [ -n "$hits" ]; then
+        echo "a test hook read outside hooks.rs (add it to hooks::Hooks):"
+        echo "$hits"
+        bad=1
+    fi
+    return $bad
+}
+
+static() {
+    gate "cargo fmt" cargo fmt --all --check
+    gate "cargo check -D warnings" env RUSTFLAGS="-D warnings" cargo check --release
+    gate "clippy" cargo clippy --release --all-targets -- -D warnings
+    gate "clippy test-hooks" cargo clippy --release --all-targets --features test-hooks -- -D warnings
+    # No unwrap/expect outside tests (AGENTS.md §1.B): non-test targets only.
+    gate "clippy no unwrap" cargo clippy --release --lib --bins --features test-hooks -- \
+        -D clippy::unwrap_used -D clippy::expect_used
+    gate "zig fmt" zig fmt --check src/client-zig
+    gate "zig ast-check" sh -c "find src/client-zig -name '*.zig' -not -path '*/.zig-cache/*' -print0 | xargs -0 -n1 zig ast-check"
+    gate "rules" rules
+}
+
+case "$1" in
+--install-hook)
+    git config core.hooksPath .githooks && echo "git hooks: .githooks (pre-commit runs ./check --fast)"
+    exit $?
+    ;;
+--snapshot)
+    shift
+    snap=.build/snapshot
+    mkdir -p "$snap"
+    # The snapshot's own .build (its target dirs, caches) survives between runs.
+    rsync -a --delete --exclude=/.build --exclude=/.git ./ "$snap/" || exit 1
+    echo "snapshot of the working tree in $snap"
+    exec "$snap/check" "$@"
+    ;;
+rules)
+    gate "rules" rules
+    ;;
+--fast)
+    static
+    ;;
+"")
+    static
+    gate "cargo test" cargo test --release --no-fail-fast
+    gate "cargo test test-hooks" cargo test --release --features test-hooks --no-fail-fast
+    gate "cargo test no-uring" env GUNGNIR_NO_URING=1 cargo test --release --no-fail-fast
+    zig_test
+    ;;
+*)
+    sed -n '2,17p' "$0"
+    exit 2
+    ;;
+esac
+exit $failed

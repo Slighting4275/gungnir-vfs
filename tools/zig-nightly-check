@@ -1,0 +1,28 @@
+#!/bin/sh
+# Does the client still build on the Zig nightly installed this morning? Run by a user
+# timer after the nightly update (see AGENTS.md §1.A). It builds in caches of its own
+# (.build/nightly-*), so it never touches a tree someone is working in. The result, one
+# line plus the errors, goes to ~/.cache/gungnir/zig-nightly.log; a failure also raises a
+# desktop notification and, if Pulse is up, a spoken one.
+root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
+log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gungnir"
+mkdir -p "$log_dir"
+log="$log_dir/zig-nightly.log"
+out=$(cd "$root/src/client-zig" &&
+    zig build --prefix "$root/.build/nightly-out" --cache-dir "$root/.build/nightly-cache" 2>&1)
+st=$?
+ver=$(zig version 2>/dev/null)
+if [ $st -eq 0 ]; then
+    printf '%s ok: libgiogungnir.so builds on zig %s\n' "$(date -Is)" "$ver" >"$log"
+    exit 0
+fi
+{
+    printf '%s FAIL: libgiogungnir.so does not build on zig %s\n' "$(date -Is)" "$ver"
+    printf '%s\n' "$out" | grep -E 'error|note' | head -20
+} >"$log"
+msg="gungnir-vfs no longer builds on tonight's Zig nightly ($ver). See $log"
+notify-send -u critical "Gungnir: Zig nightly broke the build" "$msg" 2>/dev/null
+curl -s -m 3 -X POST http://localhost:31337/notify -H 'Content-Type: application/json' \
+    -d '{"message": "Gungnir no longer builds on tonight'"'"'s Zig nightly.", "voice_enabled": true}' \
+    >/dev/null 2>&1
+exit 1

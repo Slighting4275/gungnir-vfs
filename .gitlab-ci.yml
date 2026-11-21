@@ -205,6 +205,11 @@ rust:lint:
     - cargo fmt --all --check
     - RUSTFLAGS="-D warnings" cargo check --release
     - cargo clippy --release --all-targets -- -D warnings
+    - cargo clippy --release --all-targets --features test-hooks -- -D warnings
+    # No unwrap/expect outside tests (AGENTS.md §1.B), on the non-test targets.
+    - cargo clippy --release --lib --bins --features test-hooks -- -D clippy::unwrap_used -D clippy::expect_used
+    # Protocol numbers only in proto.rs/proto.zig; test hooks read only by hooks.rs.
+    - ./check rules
 
 zig:lint:
   stage: lint
