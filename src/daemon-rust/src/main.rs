@@ -200,7 +200,11 @@ fn run() -> Result<()> {
     // Every refusal or error from here on leaves no socket and, when this start created
     // the store, no store either (DIR-A2-F01, DIR-HC-O1): the sandbox can only go in
     // after the threads exist, so it cannot be checked before the bind.
-    daemon::run(&listener, &cfg, &sandbox)
+    let ports = daemon::Ports {
+        sandbox: &sandbox,
+        exec: &ipc::Execve,
+    };
+    daemon::run(&listener, &cfg, &ports)
 }
 
 fn main() -> ExitCode {

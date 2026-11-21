@@ -145,8 +145,9 @@ fn tighten_sidecars(path: &Path) -> Result<()> {
 /// daemons on different sockets sharing a store would each sweep the other's live temp
 /// files and move its temp ledger aside. The lock file is never removed while another
 /// daemon could be waiting on it, only by a failed start that created the store and
-/// still holds it (see `FreshStore` in main.rs). Closed on exec, so a live upgrade
-/// (an `execve` of the same process) takes it again.
+/// still holds it (see `FreshStore` in daemon.rs). A live upgrade carries the open lock
+/// into the new image ([`crate::ipc::Handoff::store_lock`]), which adopts it without
+/// reopening, so the store is never unlocked across the `execve` (BC-CM-D02).
 pub type StoreLock = crate::lockfile::LockFile;
 
 /// Take the store's lock (see [`StoreLock`]), creating its directory as
@@ -165,10 +166,7 @@ pub fn lock_store(db: &Path, carried: Option<std::os::fd::RawFd>) -> Result<Opti
     let mut path = db.as_os_str().to_os_string();
     path.push(".lock");
     let path = PathBuf::from(path);
-    if let Some(fd) = carried {
-        return Ok(Some(StoreLock::adopt(fd, path)?));
-    }
-    StoreLock::take(path.clone())
+    StoreLock::acquire(path.clone(), carried)
         .map(Some)
         .map_err(|e| match e {
             LockError::Held => Error::StoreInUse(db.to_path_buf()),

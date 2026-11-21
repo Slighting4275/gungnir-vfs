@@ -37,10 +37,8 @@ use std::{
 use crate::{
     btrfs,
     fsid::{self, MountEntry},
-    ipc::{self, Msg, PAYLOAD_MAX, Port, Service, Session},
-    ops::{
-        Anchor, Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink,
-    },
+    ipc::{self, Drain, Msg, PAYLOAD_MAX, Port, Service, Session},
+    ops::{Done, OpError, OpKind, OpRequest, Ops, Progress, ST_CANCELLED, ST_OS_ERROR, Sink},
     proto::{
         MSG_REPLY, ST_BAD_REQUEST, ST_BUSY, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, ST_SUSPECT_MOUNT,
         ST_TIMEOUT, reply_payload,
@@ -211,11 +209,12 @@ pub struct SvcConfig {
 }
 
 impl SvcConfig {
-    /// The daemon's: the environment, its euid, procfs, and the volume the
-    /// [`TEST_TOP_ENV`] hook adds. A `test-hooks` build leaves the host's btrfs mounts
-    /// alone so a test daemon keeps to its own volumes.
+    /// The daemon's: `$XDG_DATA_HOME` and `$HOME`, its euid, procfs, and what the test
+    /// hooks ask for (one more volume, [`TEST_TOP_ENV`]; the host's btrfs subvolumes left
+    /// out, [`crate::hooks::NO_HOST_SUBVOLS_ENV`]). With no hook set, a `test-hooks`
+    /// build behaves as a release build.
     #[must_use]
-    pub fn from_env(hooks: &crate::hooks::Hooks) -> Self {
+    pub fn daemon(hooks: &crate::hooks::Hooks) -> Self {
         let extra_tops = hooks.trash_top.iter().cloned().collect();
         Self {
             xdg_data: std::env::var_os("XDG_DATA_HOME"),
@@ -223,7 +222,7 @@ impl SvcConfig {
             // SAFETY: plain getter.
             uid: unsafe { libc::geteuid() },
             extra_tops,
-            host_subvols: cfg!(not(feature = "test-hooks")),
+            host_subvols: !hooks.no_host_subvols,
             mounts: Box::new(ProcMounts),
         }
     }
@@ -832,10 +831,6 @@ impl Svc {
 
 /// A trash step as the M8 engine's request; the held places are set only by the daemon.
 fn op_request(s: trash::Step) -> OpRequest {
-    let anchor = |a: trash::At| Anchor {
-        dir: Arc::new(a.dir),
-        leaf: a.leaf,
-    };
     match s {
         trash::Step::DeleteTree { src, src_at } => OpRequest {
             kind: OpKind::DeleteTree,
@@ -843,7 +838,7 @@ fn op_request(s: trash::Step) -> OpRequest {
             timeout_ms: 0,
             src,
             dest: Vec::new(),
-            src_at: Some(anchor(src_at)),
+            src_at: Some(src_at),
             dest_at: None,
         },
         trash::Step::Move {
@@ -857,8 +852,8 @@ fn op_request(s: trash::Step) -> OpRequest {
             timeout_ms: 0,
             src,
             dest,
-            src_at: Some(anchor(src_at)),
-            dest_at: dest_at.map(anchor),
+            src_at: Some(src_at),
+            dest_at,
         },
     }
 }
@@ -1042,7 +1037,9 @@ impl Service for VfsService {
             gone: Arc::new(AtomicBool::new(false)),
         })
     }
+}
 
+impl Drain for VfsService {
     fn is_busy(&self) -> bool {
         self.svc.in_flight.load(Ordering::SeqCst) > 0
     }

@@ -14,7 +14,7 @@ use std::{
 use crate::{
     fsid::{Backend, Resolver, Target},
     health::{EVENT_RESERVE, Monitor},
-    ipc::{self, Msg, Port, Service, Session},
+    ipc::{self, Drain, Msg, Port, Service, Session},
     md::Ident,
     ops::{
         Done, Gate, MSG_OP_CANCEL, MSG_OP_DONE, MSG_OP_PROGRESS, MSG_OP_START, MetaHooks, OpCtl,
@@ -205,7 +205,10 @@ impl Service for OpsService {
             active: Vec::new(),
         })
     }
+}
 
+/// The service's drain is its engine's.
+impl Drain for OpsService {
     fn is_busy(&self) -> bool {
         self.ops.is_busy()
     }

@@ -31,9 +31,9 @@ const msg_stamp = proto.msg_vfs_stamp;
 const scheme_trash = proto.scheme_trash;
 const scheme_recent = proto.scheme_recent;
 
-const kind_file: u8 = 1;
-const kind_dir: u8 = 2;
-const kind_symlink: u8 = 3;
+const kind_file = proto.kind_file;
+const kind_dir = proto.kind_dir;
+const kind_symlink = proto.kind_symlink;
 
 const connect_timeout_ms = 500;
 const list_timeout_ms = 5_000;

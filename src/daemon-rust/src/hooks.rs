@@ -17,9 +17,13 @@ pub const MIXED_RINGS_ENV: &str = "GUNGNIR_TEST_MIXED_RINGS";
 pub const DRAIN_MS_ENV: &str = "GUNGNIR_TEST_DRAIN_MS";
 /// Installing the seccomp filter fails as if the kernel had no TSYNC: the refusal path.
 pub const TSYNC_FAIL_ENV: &str = "GUNGNIR_TEST_TSYNC_FAIL";
+/// The trash service leaves the host's btrfs subvolumes out, so a test daemon's listings
+/// hold only the test's own volumes.
+pub const NO_HOST_SUBVOLS_ENV: &str = "GUNGNIR_TEST_NO_HOST_SUBVOLS";
 
 /// Every hook variable, for the warning in builds without the feature.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 10] = [
+    NO_HOST_SUBVOLS_ENV,
     health::FAKE_HUNG_ENV,
     ops::SLOW_OPS_ENV,
     ops::PAUSE_AT_ENV,
@@ -53,6 +57,8 @@ pub struct Hooks {
     pub upgrade_exe: Option<PathBuf>,
     /// [`vfssvc::TEST_TOP_ENV`]: one more trash volume.
     pub trash_top: Option<PathBuf>,
+    /// [`NO_HOST_SUBVOLS_ENV`].
+    pub no_host_subvols: bool,
 }
 
 impl Hooks {
@@ -76,14 +82,15 @@ impl Hooks {
         }
         #[cfg(feature = "test-hooks")]
         {
+            // A value that is no number of ms is no hook: said once, then left unset, never
+            // read as 0 (a zero drain bound would cancel every op at once).
             let ms = |name: &str| {
-                get(name).map(|v| {
-                    Duration::from_millis(
-                        v.to_str()
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(0),
-                    )
-                })
+                let v = get(name)?;
+                let n = v.to_str().and_then(|s| s.trim().parse::<u64>().ok());
+                if n.is_none() {
+                    eprintln!("gungnird: {name}={v:?} is not a number of ms; ignored");
+                }
+                n.map(Duration::from_millis)
             };
             let h = Self {
                 fake_hung: get(health::FAKE_HUNG_ENV)
@@ -98,6 +105,7 @@ impl Hooks {
                 tsync_fail: get(TSYNC_FAIL_ENV).is_some(),
                 upgrade_exe: get(ipc::UPGRADE_EXE_ENV).map(PathBuf::from),
                 trash_top: get(vfssvc::TEST_TOP_ENV).map(PathBuf::from),
+                no_host_subvols: get(NO_HOST_SUBVOLS_ENV).is_some(),
             };
             if h != Self::default() {
                 eprintln!("gungnird: TEST HOOKS: {h:?}");
@@ -141,8 +149,22 @@ mod tests {
         assert_eq!(h.drain, Some(Duration::from_millis(250)));
         assert_eq!(h.fake_hung, [b"/y/hung".to_vec()]);
         assert_eq!(h.trash_top, Some(PathBuf::from("/vol")));
+        assert!(
+            !h.no_host_subvols,
+            "a test-hooks build keeps host subvolumes unless asked"
+        );
+        assert!(with(&[(NO_HOST_SUBVOLS_ENV, "1")]).no_host_subvols);
         // A fake mount at the root would hang everything: refused.
         assert!(with(&[(health::FAKE_HUNG_ENV, "/")]).fake_hung.is_empty());
+    }
+
+    /// A malformed bound is no hook: never a zero drain bound that cancels everything.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn a_malformed_ms_value_is_ignored_not_zero() {
+        let h = with(&[(DRAIN_MS_ENV, "soon"), (ops::SLOW_OPS_ENV, "")]);
+        assert_eq!(h.drain, None);
+        assert_eq!(h.slow_ops, None);
     }
 
     #[cfg(not(feature = "test-hooks"))]

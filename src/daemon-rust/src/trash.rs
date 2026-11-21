@@ -36,6 +36,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::ops::Anchor;
+
 /// Longest `.trashinfo` read; anything bigger is listed degraded.
 const INFO_MAX: u64 = 64 * 1024;
 /// Longest `Path=` taken: no real path is longer, and a volume could ship thousands of
@@ -79,10 +81,7 @@ pub struct TrashDir {
 }
 
 /// Kinds of payload, as on the wire.
-pub const KIND_FILE: u8 = 1;
-pub const KIND_DIR: u8 = 2;
-pub const KIND_SYMLINK: u8 = 3;
-pub const KIND_SPECIAL: u8 = 4;
+pub use crate::proto::{KIND_DIR, KIND_FILE, KIND_SPECIAL, KIND_SYMLINK};
 
 /// One listed item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,26 +985,20 @@ fn remove_info_at(d: &TrashDir, dir: &OwnedFd, entry: &[u8]) -> io::Result<()> {
     r
 }
 
-/// A place an op works at, held open: a directory and a name in it. The op acts on that
-/// directory's entry, never on a path walked again, so it stays in the trash it checked.
-#[derive(Debug)]
-pub struct At {
-    pub dir: OwnedFd,
-    pub leaf: CString,
-}
-
 /// The payload step of an item's delete or restore, for the caller's op engine to run.
+/// Each place is an [`Anchor`], held open: the op acts on that directory's entry, never on
+/// a path walked again, so it stays in the trash it checked.
 #[derive(Debug)]
 pub enum Step {
     /// Remove the payload, whatever it holds.
-    DeleteTree { src: Vec<u8>, src_at: At },
+    DeleteTree { src: Vec<u8>, src_at: Anchor },
     /// Move the payload to `dest`. `dest_at` is set when the destination is on the trash's
     /// own volume, walked and checked from its top.
     Move {
         src: Vec<u8>,
-        src_at: At,
+        src_at: Anchor,
         dest: Vec<u8>,
-        dest_at: Option<At>,
+        dest_at: Option<Anchor>,
     },
 }
 
@@ -1026,11 +1019,20 @@ fn os_of<E>(e: &io::Error) -> ItemError<E> {
     ItemError::Os(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
-fn at(dir: OwnedFd, leaf: &[u8]) -> Result<At, ()> {
-    Ok(At {
-        dir,
-        leaf: CString::new(leaf).map_err(|_| ())?,
+/// `leaf` under the held `dir`; a name with a NUL in it names nothing.
+fn anchor<E>(dir: OwnedFd, leaf: &[u8]) -> Result<Anchor, ItemError<E>> {
+    Ok(Anchor {
+        dir: std::sync::Arc::new(dir),
+        leaf: CString::new(leaf).map_err(|_| ItemError::BadRequest)?,
     })
+}
+
+/// A sound trash's two directories, pinned for one item's operation.
+fn pinned<E>(d: &TrashDir, uid: u32) -> Result<Pins, ItemError<E>> {
+    if !sound(d, uid) {
+        return Err(ItemError::Os(libc::ENOTDIR));
+    }
+    d.pins().map_err(|e| os_of(&e))
 }
 
 /// An absolute path in its one canonical spelling: no empty, `.` or `..` component, no
@@ -1058,15 +1060,12 @@ pub fn delete<E>(
     entry: &[u8],
     run: impl FnOnce(Step) -> Result<(), E>,
 ) -> Result<(), ItemError<E>> {
-    if !sound(d, uid) {
-        return Err(ItemError::Os(libc::ENOTDIR));
-    }
-    let pins = d.pins().map_err(|e| os_of(&e))?;
+    let pins = pinned(d, uid)?;
     check_info_removable_at(&pins.info, entry).map_err(ItemError::Os)?;
     match stat_payload(&pins.files, entry) {
         Ok(()) => {
             let src = d.payload(entry).into_os_string().into_vec();
-            let src_at = at(pins.files, entry).map_err(|()| ItemError::BadRequest)?;
+            let src_at = anchor(pins.files, entry)?;
             run(Step::DeleteTree { src, src_at }).map_err(ItemError::Step)?;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ItemError::NotFound),
@@ -1095,10 +1094,7 @@ pub fn restore<E>(
     dest: &[u8],
     run: impl FnOnce(Step) -> Result<(), E>,
 ) -> Result<(), ItemError<E>> {
-    if !sound(d, uid) {
-        return Err(ItemError::Os(libc::ENOTDIR));
-    }
-    let pins = d.pins().map_err(|e| os_of(&e))?;
+    let pins = pinned(d, uid)?;
     let item = item_in(d, &pins, entry);
     let inside = Path::new(OsStr::from_bytes(dest)).starts_with(&d.top);
     let foreign = !d.home && (dest.is_empty() || inside);
@@ -1116,12 +1112,12 @@ pub fn restore<E>(
     let dest_at = if foreign {
         let parent = restore_parent(d, &to).ok_or(ItemError::Os(libc::EACCES))?;
         let leaf = to.rsplit(|&b| b == b'/').next().unwrap_or_default();
-        Some(at(parent, leaf).map_err(|()| ItemError::BadRequest)?)
+        Some(anchor(parent, leaf)?)
     } else {
         None
     };
     check_info_removable_at(&pins.info, entry).map_err(ItemError::Os)?;
-    let src_at = at(pins.files, entry).map_err(|()| ItemError::BadRequest)?;
+    let src_at = anchor(pins.files, entry)?;
     run(Step::Move {
         src: item.target,
         src_at,

@@ -80,6 +80,12 @@ status not_empty 18
 scheme trash 0
 scheme recent 1
 
+# What a listed trash or recent item is (the kind u8 of a list entry).
+item file 1
+item dir 2
+item symlink 3
+item special 4
+
 # Encoded frames: magic | version | kind | status | shm_size, little-endian.
 frame hello 474e4752020001000000000000000000
 frame ack 474e4752020002000000000000100400

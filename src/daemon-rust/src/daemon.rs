@@ -13,9 +13,10 @@
 //! 7. only then, past the last refusal, the temp ledger is swept and opened (a refused
 //!    start leaves the store as it found it, BC-CM-D01), and the daemon serves.
 //!
-//! Everything a test may want to replace is behind a parameter: the sandbox is a seam
-//! with two adapters (seccomp in the daemon, a recording fake in tests), and the test
-//! hooks come in as [`Hooks`].
+//! Everything a test may want to replace is behind a parameter: the kernel-level steps
+//! are [`Ports`] (the sandbox, and the live upgrade's exec), each with two adapters (the
+//! real one in the daemon, a recording fake in tests), and the test hooks come in as
+//! [`Hooks`].
 
 use std::{
     ffi::OsString,
@@ -77,6 +78,14 @@ impl Sandbox for SeccompSandbox {
     }
 }
 
+/// The steps that act on the whole process at kernel level, for [`run`] to take.
+#[derive(Clone, Copy)]
+pub struct Ports<'a> {
+    pub sandbox: &'a dyn Sandbox,
+    /// The live upgrade's re-exec ([`ipc::Execve`] in the daemon).
+    pub exec: &'a dyn ipc::Exec,
+}
+
 /// Start on the bound `listener` and serve until a shutdown. A start refused or failed
 /// anywhere leaves no socket and, when it created the store, no store; both locks are
 /// released only after that cleanup, so another daemon can never take a store this
@@ -84,10 +93,10 @@ impl Sandbox for SeccompSandbox {
 ///
 /// # Errors
 /// Why the start was refused or the daemon stopped badly.
-pub fn run(listener: &ipc::Listener, cfg: &StartConfig, sandbox: &dyn Sandbox) -> Result<()> {
+pub fn run(listener: &ipc::Listener, cfg: &StartConfig, ports: &Ports<'_>) -> Result<()> {
     let mut fresh = FreshStore::default();
     let mut store_lock = None;
-    let r = serve(listener, cfg, sandbox, &mut fresh, &mut store_lock);
+    let r = serve(listener, cfg, ports, &mut fresh, &mut store_lock);
     if r.is_err() {
         listener.cleanup();
         fresh.remove();
@@ -101,7 +110,7 @@ pub fn run(listener: &ipc::Listener, cfg: &StartConfig, sandbox: &dyn Sandbox) -
 fn serve(
     listener: &ipc::Listener,
     cfg: &StartConfig,
-    sandbox: &dyn Sandbox,
+    ports: &Ports<'_>,
     fresh: &mut FreshStore,
     store_lock: &mut Option<store::StoreLock>,
 ) -> Result<()> {
@@ -191,7 +200,7 @@ fn serve(
     }
 
     // 5. The services and their router.
-    let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::from_env(hooks));
+    let vfs = vfssvc::Svc::new(Arc::clone(&ops), vfssvc::SvcConfig::daemon(hooks));
     let ops_for_ledger = Arc::clone(&ops);
     let services: Vec<Arc<dyn ipc::Service>> = vec![
         Arc::new(vfssvc::VfsService::new(vfs)),
@@ -199,15 +208,12 @@ fn serve(
         Arc::new(HealthService::new(monitor)),
         Arc::new(mdsvc::MdService::new(resolver, db.clone())),
     ];
-    let handler: Arc<dyn ipc::Handler> =
-        Arc::new(ipc::Router::new(services).map_err(|kind| {
-            io::Error::other(format!("two services answer message kind {kind}"))
-        })?);
+    let handler: Arc<dyn ipc::Handler> = Arc::new(ipc::Router::new(services)?);
 
     // 6. The sandbox (milestone 12), every thread existing by now.
     if seccomp_mode != SeccompMode::Disabled {
         eprintln!("gungnird: applying seccomp BPF sandbox ({seccomp_mode})");
-        sandbox.install(seccomp_mode)?;
+        ports.sandbox.install(seccomp_mode)?;
     }
     // From here the store is in use: an error no longer removes it.
     *fresh = FreshStore::default();
@@ -241,22 +247,24 @@ fn serve(
 
     // Lifecycle shutdown or live in-place upgrade. A failed upgrade exec leaves
     // everything as it was: log it and keep serving (BC-HC-F02).
+    // Every way out persists the store first; `when` names the moment in the log.
+    let persist = |when: &str| {
+        if let Err(e) = db.flush_and_checkpoint() {
+            eprintln!("gungnird: database checkpoint {when} failed: {e}");
+        }
+    };
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         match ipc::serve_counting(&listener.socket, ipc_cfg, &handler, &active)? {
             ipc::ShutdownReason::Signal(sig) => {
                 eprintln!("gungnird: signal {sig} received; persisting state and shutting down");
-                if let Err(e) = db.flush_and_checkpoint() {
-                    eprintln!("gungnird: database checkpoint on shutdown failed: {e}");
-                }
+                persist("on shutdown");
                 listener.cleanup();
                 break;
             }
             ipc::ShutdownReason::IdleTimeout => {
                 eprintln!("gungnird: idle timeout elapsed; persisting state and shutting down");
-                if let Err(e) = db.flush_and_checkpoint() {
-                    eprintln!("gungnird: database checkpoint on idle shutdown failed: {e}");
-                }
+                persist("on idle shutdown");
                 listener.cleanup();
                 break;
             }
@@ -269,9 +277,7 @@ fn serve(
                      draining, then exiting for the service manager to start the new binary"
                 );
                 let cut = drain(handler.as_ref(), hooks.drain.unwrap_or(UPGRADE_DRAIN_MAX));
-                if let Err(e) = db.flush_and_checkpoint() {
-                    eprintln!("gungnird: database checkpoint before upgrade exit failed: {e}");
-                }
+                persist("before upgrade exit");
                 listener.cleanup();
                 if let Some(why) = cut {
                     // Not a clean upgrade exit: some ops were cancelled (BC-A2-F03b/c).
@@ -283,13 +289,14 @@ fn serve(
                 eprintln!(
                     "gungnird: signal {sig} received; persisting state and performing live upgrade"
                 );
-                if let Err(e) = db.flush_and_checkpoint() {
-                    eprintln!("gungnird: database checkpoint before upgrade failed: {e}");
-                }
+                persist("before upgrade");
                 let store_fd = store_lock.as_ref().map(store::StoreLock::fd);
-                if let Err(e) =
-                    ipc::perform_live_upgrade(listener, store_fd, hooks.upgrade_exe.as_deref())
-                {
+                if let Err(e) = ipc::perform_live_upgrade(
+                    listener,
+                    store_fd,
+                    hooks.upgrade_exe.as_deref(),
+                    ports.exec,
+                ) {
                     eprintln!("gungnird: live upgrade failed, still serving: {e}");
                 }
             }
@@ -432,6 +439,27 @@ mod tests {
     use crate::testdir::TestDir;
     use std::sync::Mutex;
 
+    /// An exec that never replaces the test process.
+    struct NoExec;
+
+    impl ipc::Exec for NoExec {
+        fn exec(
+            &self,
+            _: &std::ffi::CStr,
+            _: &[std::ffi::CString],
+            _: &[std::ffi::CString],
+        ) -> io::Error {
+            io::Error::from_raw_os_error(libc::ENOEXEC)
+        }
+    }
+
+    fn ports(sandbox: &dyn Sandbox) -> Ports<'_> {
+        Ports {
+            sandbox,
+            exec: &NoExec,
+        }
+    }
+
     /// What the sandbox saw when it was asked in, and whether it refused.
     #[derive(Default)]
     struct Recording {
@@ -480,7 +508,7 @@ mod tests {
             no_uring: Some("1".into()),
             ..StartConfig::default()
         };
-        let r = run(&listener, &cfg, &sandbox);
+        let r = run(&listener, &cfg, &ports(&sandbox));
         assert!(r.is_err(), "the start was refused");
         assert_eq!(
             *sandbox.seen.lock().unwrap(),
@@ -516,7 +544,7 @@ mod tests {
             idle_timeout: Some(Duration::from_millis(300)),
             ..StartConfig::default()
         };
-        run(&listener, &cfg, &sandbox)?;
+        run(&listener, &cfg, &ports(&sandbox))?;
         assert!(sandbox.seen.lock().unwrap().is_empty());
         Ok(())
     }

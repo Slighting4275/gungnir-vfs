@@ -2743,6 +2743,9 @@ pub export fn main(argc: c_int, argv: [*c][*c]u8) c_int {
     c.g_unsetenv("GIO_EXTRA_MODULES");
     // Only the volmon mode opts in to the volume monitor; an inherited value must not.
     c.g_unsetenv("GIO_USE_VOLUME_MONITOR");
+    // Every gungnird started here keeps to the test's own trash volumes: the host's btrfs
+    // subvolumes (and the trash in them) stay out of its listings (hooks::Hooks).
+    if (c.g_setenv("GUNGNIR_TEST_NO_HOST_SUBVOLS", "1", 1) == 0) return fail("g_setenv GUNGNIR_TEST_NO_HOST_SUBVOLS");
 
     if (std.mem.eql(u8, mode, "volmon-count") and argc == 4) return runVolmonCount(std.mem.span(argv[3]));
     if (std.mem.eql(u8, mode, "volmon-installed") and argc == 4) {

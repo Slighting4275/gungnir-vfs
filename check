@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
-# The project's gate: what CI runs (AGENTS.md §4), in one command, quiet on success.
-#   ./check              everything: static checks, then cargo test (default, test-hooks,
-#                        GUNGNIR_NO_URING=1), then ./zb test
-#   ./check --fast       static checks only (fmt, clippy both feature sets, -D warnings
-#                        check, zig fmt + ast-check, rules): seconds; the pre-commit hook
-#   ./check rules        the grep rules only (CI's rust:lint runs these)
-#   ./check --snapshot [--fast]
+# The project's gate (AGENTS.md §4): the one copy of every check CI runs. Each CI job
+# calls one subcommand below with its own environment (the tester user, the skip
+# opt-outs), so a check changes here and nowhere else. Quiet on success.
+#   ./check              everything a push pipeline runs: rust-static, zig-static,
+#                        release-hooks, zig-artifacts, test (all three) and zig-test.
+#                        Not here: rust:test-hooks' rerun of the cross-user tests as root
+#                        (it needs root), and the scheduled `perf` job.
+#   ./check --fast       rust-static and zig-static, in seconds: the pre-commit hook
+#   ./check rust-static  fmt, -D warnings check, clippy with and without test-hooks, the
+#                        no-unwrap/expect pass on the non-test targets, the grep rules
+#   ./check zig-static   zig fmt, zig ast-check
+#   ./check rules        the grep rules only
+#   ./check test [default|hooks|no-uring]
+#                        cargo test --release, plain / --features test-hooks /
+#                        GUNGNIR_NO_URING=1; no argument runs all three. SKIP lines shown.
+#   ./check zig-test     ./zb test, judged by its Build Summary
+#   ./check release-hooks  build the release gungnird; it must carry no test hook
+#   ./check zig-artifacts  build libgiogungnir.so: exactly the three GIO exports, no test
+#                        hook, indexed by gio-querymodules as a VFS and volume monitor
+#   ./check perf         the 50k-event SLO benchmark (scheduled in CI, not per push)
+#   ./check --snapshot [subcommand]
 #                        copy the working tree (uncommitted changes included) to
-#                        .build/snapshot and run there, so editing can go on meanwhile.
-#                        The copy keeps its own build cache: later runs are incremental.
-#   ./check --install-hook
-#                        point this clone's git hooks at .githooks (pre-commit: --fast)
-# Each gate prints one line, "ok <gate>" or "FAIL <gate>" followed by the lines that
-# matter (for ./zb test: the Build Summary and real errors, not Zig's "failed command"
-# echo of every step that wrote to stderr). Exit status: number of failed gates.
+#                        .build/snapshot and run there, so editing can go on meanwhile;
+#                        the copy keeps its build caches between runs
+#   ./check --install-hook  point this clone's git hooks at .githooks (pre-commit: --fast)
+# Each gate prints one line, "ok <gate>" or "FAIL <gate>" and why (with CI set, the whole
+# log). Exit status: the number of failed gates.
 root=$(cd "$(dirname "$0")" && pwd) || exit 1
 cd "$root" || exit 1
 mkdir -p .build/check
@@ -24,12 +36,18 @@ gate() { # gate <name> <command...>: run quietly, keep the log, report one line
     shift
     if "$@" >"$log" 2>&1; then
         echo "ok   $name"
+        # What a test run skipped is part of its result (AGENTS.md: no silent skip).
+        grep '^SKIP' "$log"
     else
         echo "FAIL $name (full log: $log)"
-        # The lines that say why; a log without compiler-style lines is shown whole.
-        local why
-        why=$(grep -E '^(error|warning)|panicked|FAILED|^test result: F|^---- ' "$log" | head -40)
-        if [ -n "$why" ]; then echo "$why"; else tail -40 "$log"; fi
+        if [ -n "$CI" ]; then
+            cat "$log"
+        else
+            # The lines that say why; a log without compiler-style lines is shown whole.
+            local why
+            why=$(grep -E '^(error|warning)|panicked|FAILED|^test result: F|^---- ' "$log" | head -40)
+            if [ -n "$why" ]; then echo "$why"; else tail -40 "$log"; fi
+        fi
         failed=$((failed + 1))
     fi
 }
@@ -44,27 +62,33 @@ zig_test() { # ./zb test, judged by its Build Summary, not by "failed command" l
         echo "ok   zig test: ${summary#Build Summary: }"
     else
         echo "FAIL zig test (full log: $log): ${summary#Build Summary: }"
-        grep -E 'error:|^error|panicked|expected .* found|failed with' "$log" | grep -v '^failed command' | head -40
+        if [ -n "$CI" ]; then
+            cat "$log"
+        else
+            grep -E 'error:|^error|panicked|expected .* found|failed with' "$log" | grep -v '^failed command' | head -40
+        fi
         failed=$((failed + 1))
     fi
 }
 
-rules() { # mechanical rules that lint cannot express; each prints offending lines
+rules() { # mechanical rules lint cannot express; each prints offending lines
     local bad=0 hits
-    # Protocol numbers live only in proto.rs / proto.zig (protocol/wire.txt tests both).
-    hits=$(grep -rnE '^\s*pub const (MSG|ST)_[A-Z0-9_]+: u(8|16|32) = [0-9]' src/daemon-rust/src \
-        --include='*.rs' | grep -v '^src/daemon-rust/src/proto\.rs:')
-    hits+=$(grep -rnE '^\s*(pub )?const (msg|st)_[a-z0-9_]+: u(8|16|32) = [0-9]' src/client-zig/src \
-        --include='*.zig' | grep -vE '^src/client-zig/src/(proto|itest)\.zig:')
+    # Protocol numbers are defined as constants only in proto.rs / proto.zig (both tested
+    # against protocol/wire.txt): any visibility, any width, any literal (decimal, 0x, 0b).
+    # Not caught: a bare number written straight into a match arm or a call.
+    hits=$(grep -rnE '^\s*(pub(\([a-z]+\))? )?const (MSG|ST|KIND|STATUS|SCHEME)_[A-Z0-9_]+\s*:\s*u(8|16|32|64)\s*=\s*[0-9]' \
+        src/daemon-rust/src --include='*.rs' | grep -v '^src/daemon-rust/src/proto\.rs:')
+    hits+=$'\n'$(grep -rnE '^\s*(pub )?const (msg|st|kind|status|scheme)_[a-z0-9_]+(\s*:\s*u(8|16|32|64))?\s*=\s*[0-9]' \
+        src/client-zig/src --include='*.zig' | grep -v '^src/client-zig/src/proto\.zig:')
+    hits=$(printf '%s\n' "$hits" | sed '/^$/d')
     if [ -n "$hits" ]; then
         echo "protocol numbers outside proto.rs/proto.zig (define them there, re-export):"
         echo "$hits"
         bad=1
     fi
-    # Test hooks are read only by hooks::Hooks (testenv in lib.rs reads its own knobs).
-    hits=$(grep -rnE 'env::var(_os)?\([^)]*(GUNGNIR_TEST_|FAKE_HUNG_ENV|SLOW_OPS_ENV|PAUSE_AT_ENV|RING_LOSS_ENV|MIXED_RINGS_ENV|DRAIN_MS_ENV|TSYNC_FAIL_ENV|UPGRADE_EXE_ENV|TEST_TOP_ENV)' \
-        src/daemon-rust/src --include='*.rs' |
-        grep -vE '^src/daemon-rust/src/(hooks|lib)\.rs:|/tests\.rs:')
+    # Test hooks are read only by hooks::Hooks.
+    hits=$(grep -rnE 'env::var(_os)?\([^)]*(GUNGNIR_TEST_|FAKE_HUNG_ENV|SLOW_OPS_ENV|PAUSE_AT_ENV|RING_LOSS_ENV|MIXED_RINGS_ENV|DRAIN_MS_ENV|TSYNC_FAIL_ENV|UPGRADE_EXE_ENV|TEST_TOP_ENV|NO_HOST_SUBVOLS_ENV)' \
+        src/daemon-rust/src --include='*.rs' | grep -vE '^src/daemon-rust/src/hooks\.rs:|/tests\.rs:')
     if [ -n "$hits" ]; then
         echo "a test hook read outside hooks.rs (add it to hooks::Hooks):"
         echo "$hits"
@@ -73,17 +97,67 @@ rules() { # mechanical rules that lint cannot express; each prints offending lin
     return $bad
 }
 
-static() {
+rust_static() {
     gate "cargo fmt" cargo fmt --all --check
     gate "cargo check -D warnings" env RUSTFLAGS="-D warnings" cargo check --release
     gate "clippy" cargo clippy --release --all-targets -- -D warnings
     gate "clippy test-hooks" cargo clippy --release --all-targets --features test-hooks -- -D warnings
-    # No unwrap/expect outside tests (AGENTS.md §1.B): non-test targets only.
-    gate "clippy no unwrap" cargo clippy --release --lib --bins --features test-hooks -- \
+    # No unwrap/expect outside tests (AGENTS.md §1.B): the non-test targets, both builds.
+    gate "clippy no unwrap" cargo clippy --release --lib --bins -- \
         -D clippy::unwrap_used -D clippy::expect_used
+    gate "clippy no unwrap test-hooks" cargo clippy --release --lib --bins --features test-hooks -- \
+        -D clippy::unwrap_used -D clippy::expect_used
+    gate "rules" rules
+}
+
+zig_static() {
     gate "zig fmt" zig fmt --check src/client-zig
     gate "zig ast-check" sh -c "find src/client-zig -name '*.zig' -not -path '*/.zig-cache/*' -print0 | xargs -0 -n1 zig ast-check"
-    gate "rules" rules
+}
+
+release_hooks() { # the shipped daemon never carries the test hooks (milestone 7)
+    cargo build --release || return 1
+    test -x .build/target/release/gungnird || return 1
+    if grep -q 'TEST HOOK' .build/target/release/gungnird; then
+        echo "release gungnird contains TEST HOOK code"
+        return 1
+    fi
+}
+
+zig_artifacts() {
+    ./zb || return 1
+    local so=.build/zig-out/lib/libgiogungnir.so syms
+    # Exactly the three GIO module entry points may be exported.
+    syms=$(nm -D --defined-only "$so" | awk '{print $3}' | sort | tr '\n' ' ')
+    echo "exported: $syms"
+    [ "$syms" = "g_io_module_load g_io_module_query g_io_module_unload " ] || return 1
+    # The installed module never carries the itest's hooks (build option test_hooks).
+    if grep -a -q 'GUNGNIR_TEST_' "$so"; then
+        echo "installed libgiogungnir.so contains a test hook"
+        return 1
+    fi
+    rm -rf .build/gio-querymodules && mkdir -p .build/gio-querymodules
+    cp "$so" .build/gio-querymodules/
+    gio-querymodules .build/gio-querymodules || return 1
+    cat .build/gio-querymodules/giomodule.cache
+    grep -qx 'libgiogungnir.so: gio-vfs,gio-native-volume-monitor' .build/gio-querymodules/giomodule.cache
+}
+
+tests() { # tests [default|hooks|no-uring]...
+    local which
+    for which in "${@:-default hooks no-uring}"; do
+        for w in $which; do
+            case "$w" in
+            default) gate "cargo test" cargo test --release --no-fail-fast ;;
+            hooks) gate "cargo test test-hooks" cargo test --release --features test-hooks --no-fail-fast ;;
+            no-uring) gate "cargo test no-uring" env GUNGNIR_NO_URING=1 cargo test --release --no-fail-fast ;;
+            *)
+                echo "unknown test set '$w' (default, hooks, no-uring)"
+                failed=$((failed + 1))
+                ;;
+            esac
+        done
+    done
 }
 
 case "$1" in
@@ -100,21 +174,35 @@ case "$1" in
     echo "snapshot of the working tree in $snap"
     exec "$snap/check" "$@"
     ;;
-rules)
-    gate "rules" rules
-    ;;
+rules) gate "rules" rules ;;
 --fast)
-    static
+    rust_static
+    zig_static
     ;;
+rust-static) rust_static ;;
+zig-static) zig_static ;;
+release-hooks) gate "release gungnird has no test hook" release_hooks ;;
+zig-artifacts) gate "libgiogungnir.so exports, hooks, giomodule.cache" zig_artifacts ;;
+test)
+    shift
+    tests "$@"
+    ;;
+zig-test)
+    zig_test
+    # The itest's test-hooks daemon lives in .build/target-hooks, never over the release one.
+    gate "release gungnird still has no test hook" sh -c "! grep -q 'TEST HOOK' .build/target/release/gungnird"
+    ;;
+perf) gate "50k-event benchmark" cargo test --release --test stress_throughput -- --ignored --nocapture ;;
 "")
-    static
-    gate "cargo test" cargo test --release --no-fail-fast
-    gate "cargo test test-hooks" cargo test --release --features test-hooks --no-fail-fast
-    gate "cargo test no-uring" env GUNGNIR_NO_URING=1 cargo test --release --no-fail-fast
+    rust_static
+    zig_static
+    gate "release gungnird has no test hook" release_hooks
+    gate "libgiogungnir.so exports, hooks, giomodule.cache" zig_artifacts
+    tests
     zig_test
     ;;
 *)
-    sed -n '2,17p' "$0"
+    sed -n '2,29p' "$0"
     exit 2
     ;;
 esac

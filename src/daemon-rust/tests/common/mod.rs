@@ -80,8 +80,9 @@ impl Drop for Reaped {
     }
 }
 
-/// gungnird with its home, data directory and store inside `d`, no inherited sandbox
-/// choice, stdin and stdout closed and stderr to `<d>/log`. Callers add the socket,
+/// gungnird with its home, data directory and store inside `d`, the host's btrfs
+/// subvolumes out of its trash, no inherited sandbox choice, stdin and stdout closed and
+/// stderr to `<d>/log`. Callers add the socket,
 /// options and environment of their test.
 ///
 /// # Errors
@@ -90,6 +91,9 @@ pub fn gungnird(d: &Dir) -> R<Command> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gungnird"));
     cmd.env("HOME", &d.0)
         .env("XDG_DATA_HOME", d.join("data"))
+        // The trash service keeps to the test's own volumes (test-hooks builds; a
+        // release build only notes the variable and ignores it).
+        .env(gungnird::hooks::NO_HOST_SUBVOLS_ENV, "1")
         .env_remove("GUNGNIR_SECCOMP")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

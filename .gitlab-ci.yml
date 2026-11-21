@@ -1,6 +1,8 @@
 # GitLab CI for Gungnir: Zig GIO module (src/client-zig) + Rust daemon (src/daemon-rust).
-# Mirrors the gates in AGENTS.md §4, plus `cargo fmt --check` and `zig fmt --check`. All
-# output stays under .build/ (AGENTS.md §3).
+# Each job runs one `./check` subcommand (the gates of AGENTS.md §4 live there, once);
+# a job adds only its environment: the tester user, the skip opt-outs. The one CI-only
+# step is rust:test-hooks' rerun of the cross-user tests as root. All output stays under
+# .build/ (AGENTS.md §3).
 #
 # Reproducible base: the archlinux image is pinned by tag AND digest, and pacman installs
 # from the Arch Linux Archive snapshot of the same day (ARCH_SNAPSHOT), so every run gets
@@ -201,15 +203,9 @@ default:
 rust:lint:
   stage: lint
   extends: .rust
+  # Every job calls one ./check subcommand: the commands themselves live only there.
   script:
-    - cargo fmt --all --check
-    - RUSTFLAGS="-D warnings" cargo check --release
-    - cargo clippy --release --all-targets -- -D warnings
-    - cargo clippy --release --all-targets --features test-hooks -- -D warnings
-    # No unwrap/expect outside tests (AGENTS.md §1.B), on the non-test targets.
-    - cargo clippy --release --lib --bins --features test-hooks -- -D clippy::unwrap_used -D clippy::expect_used
-    # Protocol numbers only in proto.rs/proto.zig; test hooks read only by hooks.rs.
-    - ./check rules
+    - ./check rust-static
 
 zig:lint:
   stage: lint
@@ -219,8 +215,7 @@ zig:lint:
     - <<: *zig-cache
       policy: pull-push
   script:
-    - zig fmt --check src/client-zig
-    - find src/client-zig -name '*.zig' -not -path '*/.zig-cache/*' -print0 | xargs -0 -n1 zig ast-check
+    - ./check zig-static
 
 # ---- build ------------------------------------------------------------------
 
@@ -232,16 +227,8 @@ rust:build:
     - <<: *cargo-cache
       policy: pull-push
   script:
-    - cargo build --release
-    - test -x .build/target/release/gungnird
-    # The shipped daemon must never carry the test hooks (milestone 7). An explicit exit:
-    # errexit ignores a `!`-negated command, so `! grep` would stop gating as soon as a
-    # line followed it (RC-F021).
-    - |
-      if grep -q 'TEST HOOK' .build/target/release/gungnird; then
-        echo "release gungnird contains TEST HOOK code" >&2
-        exit 1
-      fi
+    # Builds the release gungnird; the shipped daemon must never carry the test hooks.
+    - ./check release-hooks
   artifacts:
     name: gungnird
     paths: [.build/target/release/gungnird]
@@ -252,24 +239,8 @@ zig:build:
   extends: .zig
   needs: ["zig:lint"]
   script:
-    - ./zb
-    - |
-      # Exactly the three GIO module entry points may be exported.
-      syms=$(nm -D --defined-only .build/zig-out/lib/libgiogungnir.so | awk '{print $3}' | sort | tr '\n' ' ')
-      echo "exported: $syms"
-      test "$syms" = "g_io_module_load g_io_module_query g_io_module_unload "
-    - |
-      # The installed module never carries the itest's hooks (build option test_hooks).
-      if grep -a -q 'GUNGNIR_TEST_' .build/zig-out/lib/libgiogungnir.so; then
-        echo "installed libgiogungnir.so contains a test hook" >&2
-        exit 1
-      fi
-    - |
-      rm -rf .build/gio-querymodules && mkdir -p .build/gio-querymodules
-      cp .build/zig-out/lib/libgiogungnir.so .build/gio-querymodules/
-      gio-querymodules .build/gio-querymodules
-      cat .build/gio-querymodules/giomodule.cache
-      grep -qx 'libgiogungnir.so: gio-vfs,gio-native-volume-monitor' .build/gio-querymodules/giomodule.cache
+    # Builds the module: three GIO exports only, no test hook, indexed by gio-querymodules.
+    - ./check zig-artifacts
   artifacts:
     name: libgiogungnir
     paths: [.build/zig-out/lib/libgiogungnir.so]
@@ -291,8 +262,8 @@ rust:test:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
-    # --no-fail-fast: one failing test binary must not hide the results of the others.
-    - runuser -u tester -- cargo test --release --no-fail-fast
+    # --no-fail-fast (inside ./check): one failing test binary must not hide the others.
+    - runuser -u tester -- ./check test default
 
 # The tests that need the test-hooks build (AGENTS.md: cargo test must also pass with
 # --features test-hooks): about 20 more, among them the cross-user security tests (another
@@ -308,12 +279,8 @@ rust:test-hooks:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
-    - |
-      set -o pipefail
-      runuser -u tester -- cargo test --release --features test-hooks --no-fail-fast 2>&1 | tee .build/test-hooks.log
-    # What did not run here, one line each (or that nothing was skipped).
-    - |
-      grep '^SKIP' .build/test-hooks.log || echo "No SKIP lines: every test-hooks test ran."
+    # Prints what did not run here, one SKIP line each.
+    - runuser -u tester -- ./check test hooks
     # The cross-user tests need a second user. As tester they cannot have one here (the
     # container's newuidmap cannot map a range), so they run again as root, which drops to
     # `nobody` (testenv::as_other_user): no opt-out, they must run or fail.
@@ -331,11 +298,10 @@ rust:test-no-uring:
   timeout: 25 minutes
   needs: ["rust:build"]
   variables:
-    GUNGNIR_NO_URING: "1"
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
-    - runuser -u tester -- cargo test --release --no-fail-fast
+    - runuser -u tester -- ./check test no-uring
 
 zig:test:
   stage: test
@@ -347,13 +313,8 @@ zig:test:
     GUNGNIR_ALLOW_MISSING: "1"
   script:
     - *as-tester
-    - runuser -u tester -- ./zb test --summary all
-    # The itest's test-hooks daemon lives in .build/target-hooks, never over the artifact.
-    - |
-      if grep -q 'TEST HOOK' .build/target/release/gungnird; then
-        echo "release gungnird was overwritten by a TEST HOOK build" >&2
-        exit 1
-      fi
+    # Also checks the itest's test-hooks daemon never landed over the release artifact.
+    - runuser -u tester -- ./check zig-test
 
 # The 50k-event stress benchmark (AGENTS.md §4) with its wall-clock, p99 and peak-RSS
 # SLO asserts unchanged. Not a per-push correctness gate (shared runners make the timing
@@ -369,4 +330,4 @@ rust:perf:
     # An API-started pipeline asks for it by name (PR-F014); plain API pipelines do not.
     - if: $CI_PIPELINE_SOURCE == "api" && $RUN_PERF == "1"
   script:
-    - cargo test --release --test stress_throughput -- --ignored --nocapture
+    - ./check perf

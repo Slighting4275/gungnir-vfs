@@ -84,6 +84,12 @@ pub const st_not_empty: u32 = 18;
 pub const scheme_trash: u8 = 0;
 pub const scheme_recent: u8 = 1;
 
+// What a listed trash or recent item is (the `kind u8` of a list entry).
+pub const kind_file: u8 = 1;
+pub const kind_dir: u8 = 2;
+pub const kind_symlink: u8 = 3;
+pub const kind_special: u8 = 4;
+
 /// The errno of an `st_os_error` reply body (after its status), EIO when it is missing.
 pub fn osErrno(body: []const u8) i32 {
     if (body.len < 4) return 5;
@@ -155,6 +161,10 @@ const ours = [_]struct { group: []const u8, name: []const u8, value: u64 }{
     .{ .group = "status", .name = "not_empty", .value = st_not_empty },
     .{ .group = "scheme", .name = "trash", .value = scheme_trash },
     .{ .group = "scheme", .name = "recent", .value = scheme_recent },
+    .{ .group = "item", .name = "file", .value = kind_file },
+    .{ .group = "item", .name = "dir", .value = kind_dir },
+    .{ .group = "item", .name = "symlink", .value = kind_symlink },
+    .{ .group = "item", .name = "special", .value = kind_special },
 };
 
 const Line = struct { group: []const u8, name: []const u8, value: []const u8 };

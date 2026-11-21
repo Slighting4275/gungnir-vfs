@@ -61,7 +61,7 @@ use std::{
 
 use crate::{
     fsid::{self, Backend, FileIdentity, FsidError, MountEntry, MountHint, Resolver, Target},
-    ipc::{self, MAX_INFLIGHT, Msg, PAYLOAD_MAX, Port, Service, Session},
+    ipc::{self, Drain, MAX_INFLIGHT, Msg, PAYLOAD_MAX, Port, Service, Session},
     proto::{MSG_REPLY, ST_BAD_REQUEST, ST_IO_ERROR, ST_NOT_FOUND, ST_OK, reply_payload},
 };
 
@@ -1165,6 +1165,9 @@ impl HealthService {
         Self { monitor }
     }
 }
+
+/// Nothing to drain: subscriptions end with their connection.
+impl Drain for HealthService {}
 
 impl Service for HealthService {
     fn kinds(&self) -> &'static [u32] {

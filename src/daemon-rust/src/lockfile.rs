@@ -36,6 +36,18 @@ fn euid() -> u32 {
 }
 
 impl LockFile {
+    /// The lock at `path` for this process: the one a live upgrade carried (`carried`,
+    /// adopted, see [`Self::adopt`]), else taken fresh ([`Self::take`]).
+    ///
+    /// # Errors
+    /// [`LockError`]; a carried fd that is not this lock is [`LockError::Io`].
+    pub fn acquire(path: PathBuf, carried: Option<RawFd>) -> Result<Self, LockError> {
+        match carried {
+            Some(fd) => Self::adopt(fd, path).map_err(LockError::Io),
+            None => Self::take(path),
+        }
+    }
+
     /// Take the lock at `path`, creating the file (0600) if there is none. Never follows
     /// a symlink there.
     ///

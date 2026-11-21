@@ -90,6 +90,12 @@ pub const ST_NOT_EMPTY: u32 = 18;
 pub const SCHEME_TRASH: u8 = 0;
 pub const SCHEME_RECENT: u8 = 1;
 
+// What a listed trash or recent item is (the `kind u8` of a list entry).
+pub const KIND_FILE: u8 = 1;
+pub const KIND_DIR: u8 = 2;
+pub const KIND_SYMLINK: u8 = 3;
+pub const KIND_SPECIAL: u8 = 4;
+
 /// Reply payload: `status u32 | body`.
 #[must_use]
 pub fn reply_payload(status: u32, body: &[u8]) -> Vec<u8> {
@@ -175,6 +181,10 @@ mod tests {
             ("status", "not_empty", ST_NOT_EMPTY.into()),
             ("scheme", "trash", SCHEME_TRASH.into()),
             ("scheme", "recent", SCHEME_RECENT.into()),
+            ("item", "file", KIND_FILE.into()),
+            ("item", "dir", KIND_DIR.into()),
+            ("item", "symlink", KIND_SYMLINK.into()),
+            ("item", "special", KIND_SPECIAL.into()),
         ]
     }
 
@@ -232,7 +242,7 @@ mod tests {
     /// No two kinds share a number, and no two statuses do.
     #[test]
     fn kinds_and_statuses_are_distinct() {
-        for group in ["kind", "status", "scheme"] {
+        for group in ["kind", "status", "scheme", "item"] {
             let mut seen: Vec<u64> = ours()
                 .into_iter()
                 .filter(|(g, _, _)| *g == group)

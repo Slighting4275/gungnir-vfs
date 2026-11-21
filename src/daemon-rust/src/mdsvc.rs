@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     fsid::{Backend, FsidError, Resolver, Target},
-    ipc::{Msg, Port, Service, Session},
+    ipc::{Drain, Msg, Port, Service, Session},
     md::{Ident, MdError, Request, put_ident},
     proto::{
         MSG_MD_GET, MSG_MD_IDENTIFY, MSG_MD_LIST, MSG_MD_MOVED, MSG_MD_REMOVED, MSG_MD_SET,
@@ -34,6 +34,9 @@ impl<B: Backend> MdService<B> {
         Self { resolver, db }
     }
 }
+
+/// Nothing to drain: every database job answers within its own short bounds.
+impl<B: Backend> Drain for MdService<B> {}
 
 impl<B: Backend> Service for MdService<B> {
     fn kinds(&self) -> &'static [u32] {

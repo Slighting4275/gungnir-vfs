@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::{CString, OsStr, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     fs,
     io::{self, Read, Write},
     mem,
@@ -527,22 +527,26 @@ pub trait Session: Send {
     fn request(&mut self, port: &Arc<Port>, msg: &Msg);
 }
 
-/// Creates a [`Session`] per connection.
-pub trait Handler: Send + Sync + 'static {
-    fn session(&self) -> Box<dyn Session>;
-
-    /// Whether any background or async operations are active on behalf of this handler.
+/// The drain before an exit, for anything with background work: a [`Handler`] and each
+/// [`Service`] behind it. The defaults say there is none.
+pub trait Drain {
+    /// Whether work is under way.
     fn is_busy(&self) -> bool {
         false
     }
 
-    /// Refuse new background work from now on (the drain before an exit, BC-A2-F03a).
+    /// Refuse new work from now on (BC-A2-F03a).
     fn begin_drain(&self) {}
 
-    /// Cancel all background work; how many operations were asked to stop (BC-A2-F03b).
+    /// Cancel the work under way; how many operations were asked to stop (BC-A2-F03b).
     fn cancel_all(&self) -> usize {
         0
     }
+}
+
+/// Creates a [`Session`] per connection.
+pub trait Handler: Drain + Send + Sync + 'static {
+    fn session(&self) -> Box<dyn Session>;
 }
 
 /// Answer `msg` with [`crate::proto::ST_UNSUPPORTED`]: no service here speaks its kind.
@@ -565,6 +569,8 @@ impl Session for NoSession {
     }
 }
 
+impl Drain for NoService {}
+
 impl Handler for NoService {
     fn session(&self) -> Box<dyn Session> {
         Box::new(NoSession)
@@ -573,23 +579,28 @@ impl Handler for NoService {
 
 /// One service on the ring: the kinds it answers, a session per connection, and its share
 /// of the drain. Services are combined by a [`Router`]; none knows about the others.
-pub trait Service: Send + Sync + 'static {
+pub trait Service: Drain + Send + Sync + 'static {
     /// The request kinds this service answers. No two services of a router share one.
     fn kinds(&self) -> &'static [u32];
 
     fn session(&self) -> Box<dyn Session>;
+}
 
-    /// Whether this service has work under way.
-    fn is_busy(&self) -> bool {
-        false
+/// Two services claim one message kind, or a service claims one of the transport's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateKind(pub u32);
+
+impl std::fmt::Display for DuplicateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "message kind {} is claimed twice", self.0)
     }
+}
 
-    /// Refuse new work from now on (the drain before an exit, BC-A2-F03a).
-    fn begin_drain(&self) {}
+impl std::error::Error for DuplicateKind {}
 
-    /// Cancel this service's work; how many operations were asked to stop (BC-A2-F03b).
-    fn cancel_all(&self) -> usize {
-        0
+impl From<DuplicateKind> for Error {
+    fn from(e: DuplicateKind) -> Self {
+        Error::Io(io::Error::other(e))
     }
 }
 
@@ -606,12 +617,12 @@ impl Router {
     ///
     /// # Errors
     /// A kind two services both claim, or one of the transport's own (ping, pong).
-    pub fn new(services: Vec<Arc<dyn Service>>) -> std::result::Result<Self, u32> {
+    pub fn new(services: Vec<Arc<dyn Service>>) -> std::result::Result<Self, DuplicateKind> {
         let mut route = HashMap::new();
         for (i, s) in services.iter().enumerate() {
             for &k in s.kinds() {
                 if k == MSG_PING || k == MSG_PONG || route.insert(k, i).is_some() {
-                    return Err(k);
+                    return Err(DuplicateKind(k));
                 }
             }
         }
@@ -629,7 +640,9 @@ impl Handler for Router {
             route: Arc::clone(&self.route),
         })
     }
+}
 
+impl Drain for Router {
     fn is_busy(&self) -> bool {
         self.services.iter().any(|s| s.is_busy())
     }
@@ -892,10 +905,7 @@ fn lock_socket(path: &Path, carried: Option<RawFd>) -> Result<LockFile> {
     let mut lock_path = OsString::from(path.as_os_str());
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
-    if let Some(fd) = carried {
-        return Ok(LockFile::adopt(fd, lock_path)?);
-    }
-    LockFile::take(lock_path.clone()).map_err(|e| match e {
+    LockFile::acquire(lock_path.clone(), carried).map_err(|e| match e {
         LockError::Held => Error::AlreadyRunning(path.to_path_buf()),
         LockError::Foreign => Error::InsecureSocketDir(lock_path),
         LockError::Io(e) => e.into(),
@@ -1092,6 +1102,7 @@ pub fn perform_live_upgrade(
     listener: &Listener,
     store_lock: Option<RawFd>,
     exe: Option<&Path>,
+    exec: &dyn Exec,
 ) -> Result<()> {
     const SD_LISTEN_FDS_START: i32 = 3;
     let exe = upgrade_exe(exe)?;
@@ -1099,8 +1110,6 @@ pub fn perform_live_upgrade(
     let args = env::args_os()
         .map(|a| cstring(a.as_bytes()))
         .collect::<io::Result<Vec<_>>>()?;
-    let mut argv: Vec<*const libc::c_char> = args.iter().map(|s| s.as_ptr()).collect();
-    argv.push(ptr::null());
 
     let raw_fd = listener.socket.as_raw_fd();
     // What fd 3 is now (if it is not the listener): a copy to put back, and its flags.
@@ -1163,8 +1172,6 @@ pub fn perform_live_upgrade(
             format!("{UPGRADE_BOUND_SOCKET_ENV}={dev}:{ino}").as_bytes(),
         )?);
     }
-    let mut envp: Vec<*const libc::c_char> = envs.iter().map(|s| s.as_ptr()).collect();
-    envp.push(ptr::null());
 
     // From here on, every change is undone if the exec fails. The lock fds stay open
     // across the exec (no FD_CLOEXEC): the locks are never released, so no other daemon
@@ -1198,10 +1205,7 @@ pub fn perform_live_upgrade(
     }
 
     eprintln!("gungnird: live upgrade: re-execing {}...", exe.display());
-    // SAFETY: NUL-terminated argv/envp of CStrings that outlive the call; on success the
-    // process image is replaced and nothing here runs again.
-    unsafe { libc::execve(c_exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    let err = io::Error::last_os_error();
+    let err = exec.exec(&c_exe, &args, &envs);
 
     // Back to how it was: the listener at its own fd (CLOEXEC), fd 3 what it was, the
     // lock fds close-on-exec again.
@@ -1221,6 +1225,36 @@ pub fn perform_live_upgrade(
         err.kind(),
         format!("execve {}: {err}", exe.display()),
     )))
+}
+
+/// The live upgrade's last step: replace the process image. The daemon's adapter is
+/// [`Execve`]; a test's records what the new image would be handed and fails, so the
+/// handover and the undo after a failed exec run in process.
+pub trait Exec {
+    /// Run `exe` with `args` and `env`. Returns only if that failed, with why.
+    fn exec(&self, exe: &CStr, args: &[CString], env: &[CString]) -> io::Error;
+}
+
+/// `execve(2)`.
+pub struct Execve;
+
+impl Exec for Execve {
+    fn exec(&self, exe: &CStr, args: &[CString], env: &[CString]) -> io::Error {
+        let argv: Vec<*const libc::c_char> = args
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(ptr::null()))
+            .collect();
+        let envp: Vec<*const libc::c_char> = env
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(ptr::null()))
+            .collect();
+        // SAFETY: NUL-terminated argv/envp of CStrings that outlive the call; on success
+        // the process image is replaced and nothing here runs again.
+        unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        io::Error::last_os_error()
+    }
 }
 
 fn restore_lock_flags(saved: &[(RawFd, i32)]) {
@@ -2207,6 +2241,9 @@ mod tests {
         fn session(&self) -> Box<dyn Session> {
             Box::new(TaggedSession(self.tag))
         }
+    }
+
+    impl Drain for Tagged {
         fn is_busy(&self) -> bool {
             self.busy.load(Ordering::SeqCst)
         }
@@ -2249,11 +2286,11 @@ mod tests {
     #[test]
     fn two_services_never_share_a_kind() {
         let r = Router::new(vec![Tagged::new(&[16], 1), Tagged::new(&[17, 16], 2)]);
-        assert_eq!(r.err(), Some(16));
+        assert_eq!(r.err(), Some(DuplicateKind(16)));
         let r = Router::new(vec![Tagged::new(&[MSG_PING], 1)]);
         assert_eq!(
             r.err(),
-            Some(MSG_PING),
+            Some(DuplicateKind(MSG_PING)),
             "the transport's own kinds are not a service's"
         );
     }
@@ -2273,5 +2310,105 @@ mod tests {
             assert_eq!(s.drained.load(Ordering::SeqCst), 1);
             assert_eq!(s.cancelled.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// `(st_dev, st_ino)` of an open fd, None if it is not open.
+    fn fd_id(fd: RawFd) -> Option<(u64, u64)> {
+        let mut st = mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat on an fd number; the buffer is read only on success.
+        (unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0).then(|| {
+            // SAFETY: fstat succeeded.
+            let st = unsafe { st.assume_init() };
+            (st.st_dev, st.st_ino)
+        })
+    }
+
+    fn cloexec(fd: RawFd) -> bool {
+        // SAFETY: fcntl on an fd number; no pointers.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    /// What the new image would have been handed, then a failed exec.
+    #[derive(Default)]
+    struct RecordedExec(Mutex<Vec<String>>);
+
+    impl Exec for RecordedExec {
+        fn exec(&self, _: &CStr, _: &[CString], env: &[CString]) -> io::Error {
+            let mut seen = self.0.lock().unwrap();
+            seen.push(format!("fd3 {:?}", fd_id(3)));
+            for kv in env {
+                let kv = kv.to_string_lossy().into_owned();
+                if let Some(fd) = kv
+                    .strip_prefix(&format!("{UPGRADE_SOCKET_LOCK_ENV}="))
+                    .or_else(|| kv.strip_prefix(&format!("{UPGRADE_STORE_LOCK_ENV}=")))
+                    .and_then(|v| v.parse::<RawFd>().ok())
+                {
+                    seen.push(format!("lock {fd} cloexec {}", cloexec(fd)));
+                }
+                if kv.starts_with("LISTEN_") || kv.starts_with("GUNGNIR_UPGRADE_") {
+                    seen.push(kv);
+                }
+            }
+            io::Error::from_raw_os_error(libc::ENOEXEC)
+        }
+    }
+
+    /// The live upgrade's handover, in process through a recording exec: fd 3 is the
+    /// listening socket, both locks stay open across the exec (no close-on-exec) and are
+    /// named in the environment with LISTEN_FDS/LISTEN_PID; after the failed exec every
+    /// fd is as it was and the socket still serves (BC-HC-F02, BC-CM-D02). It swaps fd 3
+    /// for the whole process, so it reruns itself alone in a single-threaded child.
+    #[test]
+    fn a_failed_live_upgrade_hands_over_then_undoes_everything() -> Result<()> {
+        const CHILD: &str = "GUNGNIR_UPGRADE_UNDO_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let st = std::process::Command::new(env::current_exe()?)
+                .args([
+                    "--exact",
+                    "ipc::tests::a_failed_live_upgrade_hands_over_then_undoes_everything",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()?;
+            assert!(st.success(), "the child run failed: {st}");
+            return Ok(());
+        }
+        let dir = TestDir::new("upgrade-undo")?;
+        let sock = dir.join("gungnird.sock");
+        let listener = bind(&sock)?;
+        let store = LockFile::take(dir.join("m.db.lock"))
+            .map_err(|e| Error::Io(io::Error::other(format!("{e:?}"))))?;
+        let socket_lock = listener
+            .lock_fd()
+            .ok_or(Error::Protocol("no socket lock"))?;
+        let fd3_before = fd_id(3);
+        let rec = RecordedExec::default();
+
+        let r = perform_live_upgrade(&listener, Some(store.fd()), None, &rec);
+
+        let err = r.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("execve"), "the failed exec is reported: {err}");
+        let seen = rec.0.lock().unwrap().clone();
+        let sock_id = fd_id(listener.socket.as_raw_fd());
+        assert_eq!(seen[0], format!("fd3 {sock_id:?}"), "fd 3 was the listener");
+        assert!(seen.contains(&"LISTEN_FDS=1".to_owned()), "{seen:?}");
+        assert!(
+            seen.contains(&format!("LISTEN_PID={}", std::process::id())),
+            "{seen:?}"
+        );
+        let locks: Vec<&String> = seen.iter().filter(|s| s.starts_with("lock ")).collect();
+        assert_eq!(locks.len(), 2, "both locks handed over: {seen:?}");
+        assert!(
+            locks.iter().all(|l| l.ends_with("cloexec false")),
+            "{seen:?}"
+        );
+
+        assert_eq!(fd_id(3), fd3_before, "fd 3 is what it was");
+        assert!(
+            cloexec(socket_lock) && cloexec(store.fd()),
+            "locks close-on-exec again"
+        );
+        UnixStream::connect(&sock)?;
+        Ok(())
     }
 }
