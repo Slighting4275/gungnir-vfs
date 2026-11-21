@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Run the kernel-dependent gates in the pinned Arch container on a GitHub VM.
+set -euo pipefail
+
+if [ "${1:-}" = --container ]; then
+    trap 'chown -R "$CHECKOUT_OWNER" "$PWD"' EXIT
+    case "$2" in
+    zig)
+        tools/ci-setup zig
+        export PATH="$PWD/.build/zig-dl/zig:$PATH"
+        tools/ci-setup tester
+        runuser -u tester -- ./check release-hooks
+        runuser -u tester -- ./check zig-test
+        ;;
+    default|hooks|no-uring)
+        tools/ci-setup rust
+        tools/ci-setup tester
+        runuser -u tester -- ./check test "$2"
+        if [ "$2" = hooks ]; then
+            chown -R root:root .build
+            ./check cross-user
+        fi
+        ;;
+    perf)
+        tools/ci-setup rust
+        ./check perf
+        ;;
+    *) exit 2 ;;
+    esac
+    exit
+fi
+
+profile=unconfined
+restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+if [ -r "$restriction" ] && [ "$(cat "$restriction")" = 1 ]; then
+    # Ubuntu's older runner kernel lacks FS_IOC_GETFSUUID on tmpfs. The newer
+    # kernel supports it and needs an explicit AppArmor userns rule for mounts.
+    # Load the rule for this test container while keeping the host policy intact.
+    profile=gungnir-ci-test
+    sudo apparmor_parser --replace <<'PROFILE'
+abi <abi/4.0>,
+profile gungnir-ci-test flags=(unconfined) {
+    userns,
+}
+PROFILE
+fi
+
+# Keep the container's workspace path aligned with the build jobs' cache.
+workspace=/__w/gungnir-vfs/gungnir-vfs
+docker run --rm \
+    --security-opt seccomp=unconfined --security-opt "apparmor=$profile" \
+    --device /dev/fuse \
+    --mount "type=bind,source=$GITHUB_WORKSPACE,target=$workspace" \
+    --workdir "$workspace" \
+    --env CI --env ARCH_SNAPSHOT --env CARGO_TERM_COLOR \
+    --env GUNGNIR_ALLOW_MISSING \
+    --env "CARGO_HOME=$workspace/.build/cargo-home" \
+    --env "ZIG_GLOBAL_CACHE_DIR=$workspace/.build/zig-global-cache" \
+    --env "CHECKOUT_OWNER=$(id -u):$(id -g)" \
+    "$CI_TEST_IMAGE" tools/github-test --container "$1"

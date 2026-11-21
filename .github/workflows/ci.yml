@@ -38,10 +38,8 @@ env:
   CARGO_TERM_COLOR: "never"
   GUNGNIR_ALLOW_MISSING: "1"
 
-# Every build/test job uses the pinned Arch image. Test containers need io_uring
-# (blocked by Docker's default seccomp profile) and private test mounts (blocked
-# by docker-default AppArmor). The test host uses Ubuntu 22.04 because Ubuntu
-# 24.04 also restricts capabilities within unprivileged user namespaces.
+# Every build/test job uses the pinned Arch image. Test jobs launch the container
+# through tools/github-test to set up io_uring and private test mounts on the VM.
 jobs:
   route:
     runs-on: ubuntu-24.04
@@ -165,81 +163,60 @@ jobs:
   # The tests run as the unprivileged `tester` (tools/ci-setup tester says why).
   rust-test:
     needs: [route, rust-build]
-    runs-on: &test-runner ubuntu-22.04
-    container: &test-container
-      image: *arch-image
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/fuse
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - *checkout
-      - *env
-      - *setup-rust
       - *cargo-restore
-      - run: |
-          tools/ci-setup tester
-          runuser -u tester -- ./check test default
+      - env: &test-env
+          ARCH_SNAPSHOT: ${{ needs.route.outputs.snapshot }}
+          CI_TEST_IMAGE: *arch-image
+        run: tools/github-test default
 
   # The test-hooks build's tests, then the cross-user tests again as root, which drops to
   # `nobody` for its second user: no opt-out, they must run or fail.
   rust-test-hooks:
     needs: [route, rust-build]
-    runs-on: *test-runner
-    container: *test-container
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - *checkout
-      - *env
-      - *setup-rust
       - *cargo-restore
-      - run: |
-          tools/ci-setup tester
-          runuser -u tester -- ./check test hooks
-          chown -R root:root .build
-          ./check cross-user
+      - env: *test-env
+        run: tools/github-test hooks
 
   # The thread-pool fallback engine, forced (D-048, RC-F022).
   rust-test-no-uring:
     needs: [route, rust-build]
-    runs-on: *test-runner
-    container: *test-container
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - *checkout
-      - *env
-      - *setup-rust
       - *cargo-restore
-      - run: |
-          tools/ci-setup tester
-          runuser -u tester -- ./check test no-uring
+      - env: *test-env
+        run: tools/github-test no-uring
 
   # GitLab hands rust:build's gungnird to this job as an artifact; here it is rebuilt
   # (incrementally, from the restored cache) before the itest checks it carries no hook.
   zig-test:
     needs: [route, zig-build, rust-build]
-    runs-on: *test-runner
-    container: *test-container
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - *checkout
-      - *env
-      - *setup-zig
       - *cargo-restore
-      - run: |
-          tools/ci-setup tester
-          runuser -u tester -- ./check release-hooks
-          runuser -u tester -- ./check zig-test
+      - env: *test-env
+        run: tools/github-test zig
 
   # The 50k-event benchmark (AGENTS.md §4): by hand only, shared runners make its timing
   # noisy (D-055); when it runs, a missed SLO fails the run.
   rust-perf:
     if: github.event_name == 'workflow_dispatch' && inputs.perf
     needs: [route, rust-build]
-    runs-on: *test-runner
-    container: *test-container
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - *checkout
-      - *env
-      - *setup-rust
       - *cargo-restore
-      - run: ./check perf
+      - env: *test-env
+        run: tools/github-test perf
